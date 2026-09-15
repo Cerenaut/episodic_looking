@@ -8,6 +8,10 @@ We show that on an image classification task, the resulting CLS model is resista
 
 ![alt text](/readme.png?raw=true)
 
+**Above:** Adding an episodic short-term memory (STM) to a baseline ResNet long-term memory (LTM) dramatically improves generalization and transfer performance in a continual learning task on the Cifar-100 dataset, while also gaining resistance to interference between earlier and later memories. In the image above, both models are sequentially exposed to fine-classes 3, 4, and 5 of a pair of Cifar-100 coarse classes. The grey vertical bars show when training shifts from fine-class 3 to fine-class 4 and then again when training shifts to fine-class 5. The proposed CLS/STM architecture (left) rapidly learns a generalized solution; it is unaffected by the transition from classes 3 to 4 or 4 to 5. The LTM-only model, without the STM, suffers significant interference when the training class changes, demonstrated by drops in evaluation accuracy on the classes not currently being trained.
+
+All experiments are online, with the model updated each step of each episode. Single-stream experiments also have minibatch size = 1, i.e. replicating the learning conditions of a single mobile robot who must continually learn about its changing world.
+
 Arxiv preprint: [https://TODO](https://TODO)
 
 ## Getting started
