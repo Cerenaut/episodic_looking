@@ -19,7 +19,7 @@ Download the Cifar-100 dataset from [https://cave.cs.toronto.edu/kriz/cifar.html
 * [cifar_main_ltm_fine_tuning.py](cifar_main_ltm_fine_tuning.py) - Fine-tune the LTM; continual learning, few-shot and single-stream settings
 * [cifar_main_stm_training.py](cifar_main_stm_training.py) - Pre-train and then fine-tune the STM (both are identical); continual learning, few-shot and single-stream settings
 
-### Environment
+### Key bits of code
 * [environment/cifar](environment/cifar) - Python code for the entire Cifar-100 dataset integration, RL Agent and RL Environment.
 * [agent/episodic_agent.py](agent/episodic_agent.py) - Base class that sets up the RL loop for this and other environments.
 * [model/sparse](model/sparse) - Sparse activation model being used in the Cifar-100 model as a STM.
