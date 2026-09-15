@@ -1,5 +1,4 @@
 # Episodic looking - using reinforcement learning to control perception enables continual, streaming, online learning without forgetting
-A Complementary Learning Systems (CLS) model with a sparse, episodic Short-Term Memory (STM) and a ResNet-18 Long-Term Memory, performing continual learning on Cifar-100 images.
 
 ## Abstract
 There is a fundamental contradiction between the desire for models that can generalize and models that can learn rapidly and effectively from a single thread of individual, real-world experience. Capture of statistical regularities creates entanglement between latent variables, causing destructive interference in continual or online, streaming learning settings. But without statistical regularities, generalization cannot occur, leaving the model unable to overcome input variance. This paper proposes a solution based on the Complementary Learning System architecture (CLS), in which a Short-Term Memory (STM) gives up generalization in exchange for continual learning without interference, working in a space of robust, generalized perceptions produced by a slow, statistical Long-Term Memory (LTM).
