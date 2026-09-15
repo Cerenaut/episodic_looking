@@ -14,7 +14,7 @@ All experiments are online, with the model updated each step of each episode. Si
 Arxiv preprint: [https://TODO](https://TODO)
 
 ## Getting started
-Download the Cifar-100 dataset from [https://cave.cs.toronto.edu/kriz/cifar.html](https://cave.cs.toronto.edu/kriz/cifar.html); it is required by the code.
+Download the Cifar-100 dataset from [https://cave.cs.toronto.edu/kriz/cifar.html](https://cave.cs.toronto.edu/kriz/cifar.html); it is required by the code. Set variables `data_file_path` and `CIFAR_DATA_FILE_PATH` to the location of the downloaded binary file.
 
 ### Entry points
 * [test_sparse_distributed_model.ipynb](test_sparse_distributed_model.ipynb) - Minimal unit test of the sparse distributed memory module (without RL bits) in case you want to use it elsewhere
