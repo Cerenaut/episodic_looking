@@ -10,6 +10,7 @@ from environment.cifar.cifar_dataset import Cifar100Dataset
 from environment.cifar.cifar_env import CifarEnv, CifarEnvConfig
 from environment.cifar.cifar_model import CifarModel, CifarModelConfig
 from environment.cifar.cifar_results import CifarResults
+from util.device import get_device
 from util.instrumentation import Instrumentation
 from util.log import create_run_path, get_run_path
 
@@ -100,7 +101,7 @@ def main():
     results_file = CifarResults(run_path = run_path, suffix=EXPERIMENT_TYPE)
     results_file.clear_file()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()  # cuda > mps > cpu; override with EPISODIC_DEVICE env var. Same choice CifarAgent makes internally.
     logger.info(f"Device: {device}")
 
     # We need a base dataset to initialize the model and environments.

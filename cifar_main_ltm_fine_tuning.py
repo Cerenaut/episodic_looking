@@ -11,6 +11,7 @@ from environment.cifar.cifar_classifier import CifarClassifier
 from environment.cifar.cifar_dataset import Cifar100Dataset
 from environment.cifar.cifar_results import CifarResults
 from model.resnet import ResNetConfig
+from util.device import get_device
 from util.instrumentation import Instrumentation
 from util.log import create_run_path, get_run_path
 
@@ -49,7 +50,7 @@ def main():
     results_file = CifarResults(run_path = run_path, suffix=EXPERIMENT_TYPE)
     results_file.clear_file()
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = get_device()  # cuda > mps > cpu; override with EPISODIC_DEVICE env var
     print(f"Device:{device}")
 
     MAX_STEPS_TRAINING = 0  # measure in epochs
