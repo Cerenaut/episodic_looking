@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 
@@ -6,7 +8,14 @@ def get_device():
     Use this function to explicitly try to store all tensors on the device. It assumes a 
     single GPU device. It will fall back to CPU if no GPU is available, e.g. for local 
     debugging.
+
+    Priority: cuda > mps > cpu. Set the environment variable EPISODIC_DEVICE (e.g. "cpu",
+    "mps", "cuda") to override the automatic choice without changing any code.
     """
+    override = os.environ.get("EPISODIC_DEVICE")
+    if override:
+        return torch.device(override)
+
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():

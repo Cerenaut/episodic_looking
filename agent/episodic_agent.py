@@ -233,7 +233,7 @@ class EpisodicAgent:
     def env_update(self):
         obs_2, rewards, terminated, truncated, infos = self.envs.step(self.state.actions)
         self.state.obs_2 = obs_2
-        self.state.rewards = torch.tensor(rewards).to(self.device).float()
+        self.state.rewards = torch.tensor(rewards).float().to(self.device)  # cast before .to(): MPS has no float64
         self.state.info_2 = infos
         self.state.terminated = torch.from_numpy(terminated).to(self.device).float()
         self.state.truncated = torch.from_numpy(truncated).to(self.device).float()
