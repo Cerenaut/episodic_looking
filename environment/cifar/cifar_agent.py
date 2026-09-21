@@ -85,9 +85,22 @@ class CifarAgent(EpisodicAgent):
         self.output_actor = self.model.do_actor(
             input = self.state.obs_1_history_tensor,
         )
-        self.set_bias(
-            self.output_actor.sample.detach().clone()
-        )
+        if self.model.is_actor_differentiable():
+            # Deterministic bias = policy mean. Keep the graph for the classifier pass on the resulting
+            # observation (observation_to_tensor picks it up), only while training.
+            self.set_bias(
+                self.output_actor.mean.detach().clone()
+            )
+            if self.instrumentation.is_mode_training():
+                self.bias_with_grad = self.output_actor.mean
+        elif self.model_config.eval_bias == "mean" and not self.instrumentation.is_mode_training():
+            self.set_bias(
+                self.output_actor.mean.detach().clone()
+            )
+        else:
+            self.set_bias(
+                self.output_actor.sample.detach().clone()
+            )
         return None  # no actions to env; only perceptual
 
     def copy_obs_final(
@@ -117,6 +130,10 @@ class CifarAgent(EpisodicAgent):
             class_distribution_targets = self.class_distribution_targets.detach(),
             reward_previous = self.reward_previous,
         )  # rewards for bias this step
+
+        if self.model.is_actor_differentiable():
+            self.model_update_differentiable()
+            return
 
         # Do A2C loss. First, critic
         self.advantage = self.model.get_advantage(
@@ -150,10 +167,37 @@ class CifarAgent(EpisodicAgent):
             optimize = optimize,
         )
 
+    def model_update_differentiable(self):
+        """
+        Differentiable actor: cross-entropy of the classifier logits produced with the actor's mean bias
+        (graph kept in observation_to_tensor), back-propagated through the frozen LTM into the actor.
+        No critic, no policy sampling. Rewards are still computed above for logging only.
+        """
+        optimize = self.instrumentation.is_mode_training()
+        batch_size = self.config.batch_size
+        self.advantage = torch.zeros(batch_size, device=self.device)  # logging only
+        self.advantage_normalized = self.advantage
+        self.previous_policy_data = None
+        self.current_policy_data = None
+
+        if optimize and self.classifier_logits_with_grad is not None:
+            self.model.update_differentiable_loss(
+                class_logits_with_grad = self.classifier_logits_with_grad,
+                class_distribution_targets = self.class_distribution_targets.detach(),
+            )
+            self.optimize(loss = self.model.get_total_loss(), optimize = True)
+        else:
+            self.model.loss_actor_scaled = torch.zeros((), device=self.device)
+            self.model.loss_critic_scaled = torch.zeros((), device=self.device)
+            self.optimize(loss = None, optimize = False)
+        self.classifier_logits_with_grad = None
+
     def reset(self):
         super().reset()
         self.previous_policy_data = None
         self.current_policy_data = None
+        self.bias_with_grad = None
+        self.classifier_logits_with_grad = None
         self.reset_reward_previous()
         self.reset_bias()
 
@@ -163,7 +207,10 @@ class CifarAgent(EpisodicAgent):
         super().state_update(reset_mask)
 
         # Clear any old state on episode reset
-        self.update_reward_previous(self.class_distribution_rewards)
+        # Carry the step's un-differenced reward forward. class_distribution_rewards is the IMPROVEMENT
+        # (r_t - r_{t-1}) for the improvement reward types; feeding it back made the next step's reward
+        # r_t - (r_{t-1} - r_{t-2}) from the third step of every episode.
+        self.update_reward_previous(self.model.get_reward_current())
         self.reset_reward_previous(reset_mask)  # reset obs_2 for complete episodes 
         self.reset_bias(reset_mask)
 
@@ -205,15 +252,28 @@ class CifarAgent(EpisodicAgent):
         """
         Observations are filtered by the current bias when they occur.
         """
-        with torch.no_grad():
-            key = CifarEnv.OBSERVATION_KEY_IMAGE
-            image_array = observation[key]
-            bias_detached = self.get_bias().detach()  # current bias
-            image_tensor = torch.from_numpy(image_array).to(self.device)
+        key = CifarEnv.OBSERVATION_KEY_IMAGE
+        image_array = observation[key]
+        bias_detached = self.get_bias().detach()  # current bias
+        image_tensor = torch.from_numpy(image_array).to(self.device)
+
+        bias_with_grad = getattr(self, "bias_with_grad", None)
+        if bias_with_grad is not None:
+            # Differentiable actor, training: this is the first classifier pass after model_actions(),
+            # i.e. on the observation that results from the bias just emitted. Keep the graph.
+            logits, encoding = self.model.do_classifier_with_grad(
+                image = image_tensor,
+                bias = bias_with_grad,
+            )
+            self.classifier_logits_with_grad = logits
+            self.bias_with_grad = None
+        else:
             logits, encoding = self.model.do_classifier(
                 image = image_tensor,
                 bias = bias_detached,
             )
+
+        with torch.no_grad():
             logits_detached = logits.detach()
             observation_and_bias = torch.cat(
                 [
