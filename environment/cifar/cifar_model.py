@@ -55,6 +55,11 @@ class CifarModelConfig:
     classifier_model_file:str = ""
     classifier_bias_stage:int = 1
     policy_std:float|None = None
+
+    # Variant: how the actor (bias policy) is trained. See CifarModel.ACTOR_TRAINING_*.
+    actor_training:str = "rl"
+    loss_differentiable_scale:float = 1.0
+    eval_bias:str = "sample"  # RL actor at evaluation: "sample" (paper) or "mean"
     
 
 class CifarModel:
@@ -80,10 +85,15 @@ class CifarModel:
     MODEL_ACTOR = "Actor"
     MODEL_CRITIC = "Critic"
 
+    # Actor training
+    ACTOR_TRAINING_RL = "rl"                        # paper: actor-critic on the classification reward
+    ACTOR_TRAINING_DIFFERENTIABLE = "differentiable"  # cross-entropy back-propagated through the frozen LTM
+
     def __init__(self, config:CifarModelConfig, device):
         super().__init__()
         self.config = config
         self.reward_default = None
+        self.reward_current = None  # per-sample reward of the latest step (before differencing), for reward_previous
         self.loss_actor_scaled = 0
         self.loss_critic_scaled = 0
         self.device = device
@@ -234,6 +244,13 @@ class CifarModel:
         logger.info(f"Loading conv. model from file: {self.config.classifier_model_file}")
         state_dict = torch.load(self.config.classifier_model_file, weights_only=True)
         self.model_class.load_state_dict(state_dict)
+        # The LTM is frozen: never in the optimizer, and no gradient buffers when the differentiable
+        # actor back-propagates through it (gradients still flow through to the bias input).
+        for parameter in self.model_class.parameters():
+            parameter.requires_grad_(False)
+
+    def is_actor_differentiable(self) -> bool:
+        return self.config.actor_training == CifarModel.ACTOR_TRAINING_DIFFERENTIABLE
 
     def do_classifier(
         self,
@@ -261,14 +278,47 @@ class CifarModel:
             config = self.policy_config, 
         )  # produce policy to reach g from x1
         policy_sample_one_hot = PolicyUtil.one_hot_validate(policy_sample)
+        policy_mean = PolicyUtil.get_policy_mean_continuous(
+            logits = PolicyUtil.clamp_logits(policy_logits, max_logit_magnitude=self.policy_config.max_logit_magnitude),
+            std = self.policy_config.policy_std,
+        )  # with grads
         output = PolicyModelOutput(
             logits = policy_logits,
             mask = mask,
             distribution = policy_distribution,
             sample = policy_sample,
             sample_one_hot = policy_sample_one_hot,
+            mean = policy_mean,
         )
         return output
+
+    def do_classifier_with_grad(
+        self,
+        image:torch.Tensor,
+        bias:torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Classifier forward pass that keeps the graph from the bias input (LTM parameters are frozen,
+        so only the actor receives gradients). Used by the differentiable actor.
+        """
+        logits, encoding = self.model_class(
+            x = image,
+            bias = bias,
+        )
+        return logits, encoding
+
+    def update_differentiable_loss(
+        self,
+        class_logits_with_grad:torch.Tensor,
+        class_distribution_targets:torch.Tensor,
+    ):
+        """
+        Differentiable actor: minimise the LTM's cross-entropy on the current image as a function of
+        the bias the actor emitted for it. Replaces the actor and critic RL losses.
+        """
+        loss = F.cross_entropy(class_logits_with_grad, class_distribution_targets)
+        self.loss_actor_scaled = loss * self.config.loss_differentiable_scale
+        self.loss_critic_scaled = torch.zeros((), device=self.device)
 
     def do_critic(
         self,
@@ -358,26 +408,36 @@ class CifarModel:
                 class_distribution_targets = class_distribution_targets,
                 reward_previous = reward_previous,
             )
-            self.reward_previous = reward_current  # no longer need reward_previous
+            self.reward_current = reward_current
         elif self.config.reward_type == CifarModel.REWARD_TYPE_ACCURACY:
             class_distribution_rewards = self.get_class_accuracy_reward(
                 class_distribution_logits = class_distribution_predicted_logits,  # No grads 
                 class_distribution_targets = class_distribution_targets,
             )
+            self.reward_current = class_distribution_rewards
         elif self.config.reward_type == CifarModel.REWARD_TYPE_ENTROPY:
             class_distribution_rewards = self.get_class_entropy_reward(
                 class_distribution_logits = class_distribution_predicted_logits,  # No grads
                 class_distribution = class_distribution_predicted,
             )
+            self.reward_current = class_distribution_rewards
         elif self.config.reward_type == CifarModel.REWARD_TYPE_ENTROPY_IMPROVEMENT:
             class_distribution_rewards, reward_current = self.get_class_entropy_improvement_reward(
                 class_distribution_logits = class_distribution_predicted_logits,  # No grads
                 class_distribution = class_distribution_predicted,
                 reward_previous = reward_previous,
             )
+            self.reward_current = reward_current
         else:
             raise ValueError("Reward type not recognized.")        
         return class_distribution_rewards
+
+    def get_reward_current(self) -> torch.Tensor:
+        """
+        The un-differenced reward of the latest step. This, not the improvement returned by
+        get_class_reward(), is what the next step's improvement must be measured against.
+        """
+        return self.reward_current
 
     def get_class_reward_default(self, batch_size:int) ->  torch.Tensor:
         return torch.zeros(batch_size, device = self.device)

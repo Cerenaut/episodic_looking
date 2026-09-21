@@ -1,3 +1,4 @@
+import copy
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -240,7 +241,10 @@ class EpisodicAgent:
         self.state.completed = terminated | truncated
 
     def get_obs_final(self):
-        self.state.obs_2_final = self.state.obs_2.copy()
+        # Deep copy: for a Dict observation, dict.copy() is shallow and the per-key arrays would be shared
+        # with obs_2, so copy_obs_final() below would overwrite the first observation of the NEW episode
+        # (obs_2, which becomes obs_1 of the next step) with the final observation of the ended one.
+        self.state.obs_2_final = copy.deepcopy(self.state.obs_2)
 
         self.episode_reward_mean = None
         self.episode_length_mean = None
