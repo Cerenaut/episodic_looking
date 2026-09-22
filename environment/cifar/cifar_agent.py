@@ -163,7 +163,10 @@ class CifarAgent(EpisodicAgent):
         super().state_update(reset_mask)
 
         # Clear any old state on episode reset
-        self.update_reward_previous(self.class_distribution_rewards)
+        # Carry the step's un-differenced reward forward. class_distribution_rewards is the IMPROVEMENT
+        # (r_t - r_{t-1}) for the improvement reward types; feeding it back made the next step's reward
+        # r_t - (r_{t-1} - r_{t-2}) from the third step of every episode.
+        self.update_reward_previous(self.model.get_reward_current())
         self.reset_reward_previous(reset_mask)  # reset obs_2 for complete episodes 
         self.reset_bias(reset_mask)
 

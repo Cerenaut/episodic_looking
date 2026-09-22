@@ -84,6 +84,7 @@ class CifarModel:
         super().__init__()
         self.config = config
         self.reward_default = None
+        self.reward_current = None  # per-sample reward of the latest step (before differencing), for reward_previous
         self.loss_actor_scaled = 0
         self.loss_critic_scaled = 0
         self.device = device
@@ -358,26 +359,36 @@ class CifarModel:
                 class_distribution_targets = class_distribution_targets,
                 reward_previous = reward_previous,
             )
-            self.reward_previous = reward_current  # no longer need reward_previous
+            self.reward_current = reward_current
         elif self.config.reward_type == CifarModel.REWARD_TYPE_ACCURACY:
             class_distribution_rewards = self.get_class_accuracy_reward(
                 class_distribution_logits = class_distribution_predicted_logits,  # No grads 
                 class_distribution_targets = class_distribution_targets,
             )
+            self.reward_current = class_distribution_rewards
         elif self.config.reward_type == CifarModel.REWARD_TYPE_ENTROPY:
             class_distribution_rewards = self.get_class_entropy_reward(
                 class_distribution_logits = class_distribution_predicted_logits,  # No grads
                 class_distribution = class_distribution_predicted,
             )
+            self.reward_current = class_distribution_rewards
         elif self.config.reward_type == CifarModel.REWARD_TYPE_ENTROPY_IMPROVEMENT:
             class_distribution_rewards, reward_current = self.get_class_entropy_improvement_reward(
                 class_distribution_logits = class_distribution_predicted_logits,  # No grads
                 class_distribution = class_distribution_predicted,
                 reward_previous = reward_previous,
             )
+            self.reward_current = reward_current
         else:
             raise ValueError("Reward type not recognized.")        
         return class_distribution_rewards
+
+    def get_reward_current(self) -> torch.Tensor:
+        """
+        The un-differenced reward of the latest step. This, not the improvement returned by
+        get_class_reward(), is what the next step's improvement must be measured against.
+        """
+        return self.reward_current
 
     def get_class_reward_default(self, batch_size:int) ->  torch.Tensor:
         return torch.zeros(batch_size, device = self.device)
