@@ -1,0 +1,49 @@
+# One job of the cloud seed round: one (variant, seed) pair = a seeded STM pre-training
+# plus its three continual orders. Launch ten of these, one per (variant, seed).
+#
+# The repo lands at ~/sky_workdir, so the code's hardcoded "../cifar-100-python" resolves
+# to ~/cifar-100-python. The data is mounted straight there. Do NOT symlink the repo to
+# ~/Dev/episodic_looking as the provisioning note suggests: bash `cd` keeps the logical
+# path but Python resolves relative paths against the physical cwd, so "../" would escape
+# to the wrong parent and the dataset would not be found.
+#
+#   sky launch -c smoke sky/stm_round.yaml --env VARIANT=ref_pt12 --env SEED=1
+name: stm-round
+
+resources:
+  infra: runpod
+  # Batch-16 bound workload: every card in this band performs within about 2x of the
+  # others, so let SkyPilot take whichever is cheapest and free. A bigger GPU buys nothing.
+  accelerators: {RTXA4000: 1, RTXA5000: 1, RTX3090: 1, A40: 1, L4: 1}
+  cpus: 4+
+  memory: 16+
+  disk_size: 60
+
+workdir: ~/Dev/episodic_looking
+
+file_mounts:
+  ~/cifar-100-python: ~/Dev/datasets/cifar-100-python
+  ~/cifar_100_pretrain/cifar_100_subclasses_12_e13.pth: ~/Dev/cifar_100_pretrain/cifar_100_subclasses_12_e13.pth
+
+envs:
+  VARIANT: ref_pt12
+  SEED: "1"
+  NPROC: "3"
+  SMOKE: "0"
+
+setup: |
+  set -e
+  echo "=== /dev/shm (needs >= 1G; the dataset uses multiprocessing.shared_memory) ==="
+  df -h /dev/shm | tail -1
+  echo "=== GPU ==="
+  nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+  cd ~/sky_workdir
+  python3 -m venv .venv
+  .venv/bin/pip install --quiet --upgrade pip
+  .venv/bin/pip install --quiet -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu126
+  .venv/bin/python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+
+run: |
+  cd ~/sky_workdir
+  export PY=.venv/bin/python
+  if [ "${SMOKE:-0}" = "1" ]; then ./sky/smoke.sh; else ./sky/run_seed.sh "$VARIANT" "$SEED"; fi
