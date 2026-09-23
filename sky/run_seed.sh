@@ -64,4 +64,9 @@ else
 fi
 
 if [ $rc -ne 0 ]; then step "JOB FAILED: $V seed $SEED"; exit 1; fi
+# Sentinel for the reaper. A file tested with `test -f` reports through ssh's exit code
+# and cannot be misparsed; grepping a log for a phrase can, and once did: `grep -c` on a
+# file that exists without a match prints 0 AND exits 1, so a `|| echo 0` fallback
+# produced "0\n0", which compared unequal to "0" and reaped four healthy pods.
+touch "$LOG/JOB_COMPLETE"
 step "JOB DONE: $V seed $SEED"
