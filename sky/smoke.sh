@@ -41,16 +41,18 @@ printf "%-6s %-10s %-14s %-10s\n" "procs" "seconds" "agg steps/s" "per-proc"
 for n in 1 2 4; do
   rm -rf "$OUT"/r_p* ; t0=$(date +%s)
   for i in $(seq 1 "$n"); do one_run "p${n}_$i" 1 & done
-  wait
+  if ! wait; then say "FATAL: a training process failed at n=$n; see $OUT/p${n}_*.log"; tail -15 "$OUT/p${n}_1.log"; exit 1; fi
   t1=$(date +%s); el=$((t1-t0)); [ "$el" -eq 0 ] && el=1
-  agg=$(echo "scale=1; $n*$STEPS/$el" | bc)
-  per=$(echo "scale=1; $STEPS/$el" | bc)
+  agg=$(awk -v n="$n" -v s="$STEPS" -v e="$el" 'BEGIN{printf "%.1f", n*s/e}')
+  per=$(awk -v s="$STEPS" -v e="$el" 'BEGIN{printf "%.1f", s/e}')
   printf "%-6s %-10s %-14s %-10s\n" "$n" "$el" "$agg" "$per"
   echo "$n $el $agg $per" >> "$OUT/throughput.txt"
 done
 
 say "=== 4. does --seed reproduce on CUDA? ==="
-one_run seedA 7; one_run seedB 7; one_run seedC 8
+one_run seedA 7 || { say "FATAL: seedA run failed"; tail -15 "$OUT/seedA.log"; exit 1; }
+one_run seedB 7 || { say "FATAL: seedB run failed"; exit 1; }
+one_run seedC 8 || { say "FATAL: seedC run failed"; exit 1; }
 A=$(find "$OUT/r_seedA" -name 'results_*.txt' | head -1)
 B=$(find "$OUT/r_seedB" -name 'results_*.txt' | head -1)
 C=$(find "$OUT/r_seedC" -name 'results_*.txt' | head -1)
