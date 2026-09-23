@@ -429,10 +429,18 @@ def main():
                 accuracy = accuracy_training,            
             )
 
-            if EVALUATE_INTERVAL_EPOCHS > 1 and (epoch % EVALUATE_INTERVAL_EPOCHS != 0):
+            is_last_epoch = (epoch == NUM_EPOCHS - 1)
+            if EVALUATE_INTERVAL_EPOCHS > 1 and (epoch % EVALUATE_INTERVAL_EPOCHS != 0) and not is_last_epoch:
                 continue  # Option to skip evals during pretraining, useful with small batch size
 
+            # Always evaluate on the final epoch, so the last measured point sits at the full
+            # training budget rather than at the last multiple of EVALUATE_INTERVAL_EPOCHS.
             do_evaluate_individual_fine_classes(epoch=epoch)
+
+        if args.stm_checkpoint_out is not None:
+            os.makedirs(os.path.dirname(os.path.abspath(args.stm_checkpoint_out)), exist_ok=True)
+            torch.save(agent.model.state_dict(), args.stm_checkpoint_out)
+            logger.info(f"Wrote STM after few-shot training to: {args.stm_checkpoint_out}")
 
     def do_continual_learning(class_fine:list[int], exclude_classes_fine_continual, start_epoch:int):
         dataset_training_continual = CifarEnv.create_dataset(
