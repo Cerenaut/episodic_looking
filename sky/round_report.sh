@@ -42,8 +42,16 @@ for seed in 1 2 3 4 5; do for v in pt40 pt12; do
 done; done
 
 echo "--- M3 single-stream (lands separately) ---"
+# Training and evaluation keep SEPARATE cumulative step counters, both logged as
+# "Step: N of M". Taking the last line regardless of M mixes them and can read as a
+# run that has restarted. Filter on the training denominator (8000).
+t0=$(date -j -f "%Y-%m-%d %H:%M:%S" "2026-09-23 14:38:37" +%s 2>/dev/null || echo 0)
+el=$(( $(date +%s) - t0 ))
 for c in 3 4 5; do
-  s=$(grep "^INFO:root:Step" runs_local/stream_full/c$c.log 2>/dev/null | tail -1 | grep -o '[0-9]*' | head -1)
+  s=$(grep "^INFO:root:Step" runs_local/stream_full/c$c.log 2>/dev/null | awk -F'of ' '$2 ~ /^8000/' | tail -1 | grep -o 'Step: [0-9]*' | grep -o '[0-9]*')
+  v=$(( $(grep -c "Evaluating @" runs_local/stream_full/c$c.log 2>/dev/null) / 4 ))
   n=$(grep -ci nan runs_local/stream_full/c$c.log 2>/dev/null)
-  printf "  class %s: %s/768000 training steps, nan lines %s\n" "$c" "${s:-?}" "${n:-?}"
+  awk -v c="$c" -v s="${s:-0}" -v v="$v" -v n="${n:-0}" -v e="$el" 'BEGIN{
+    if (s>0 && e>0) { r=s/e; printf "  class %s: %d/768000 steps (%.0f%%), %d/13 evals, %.1f st/s, %.1f h left, nan %s\n", c, s, 100*s/768000, v, r, (768000-s)/r/3600, n }
+    else printf "  class %s: %s steps, nan %s\n", c, s, n }'
 done
