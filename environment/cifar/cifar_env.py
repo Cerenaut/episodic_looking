@@ -21,6 +21,7 @@ class CifarEnvConfig:
     shared_memory_names_training:CifarSharedMemoryNames|None = None
     shared_memory_names_evaluate:CifarSharedMemoryNames|None = None
     exclude_classes_coarse:set[int]|None = field(default_factory=None)
+    exclude_classes_coarse_training:set[int]|None = None  # None: same as exclude_classes_coarse (evaluation)
     exclude_classes_fine_training:set[int]|None = field(default_factory=None)
     exclude_classes_fine_evaluate:set[int]|None = field(default_factory=None)
     max_instances_training:int|None = None
@@ -125,18 +126,22 @@ class CifarEnv(gym.Env):
         shared_memory_names = self.config.shared_memory_names_training
         exclude_classes_fine = self.config.exclude_classes_fine_training
         max_instances = self.config.max_instances_training
+        exclude_classes_coarse = self.config.exclude_classes_coarse_training
+        if exclude_classes_coarse is None:
+            exclude_classes_coarse = self.config.exclude_classes_coarse
         
         if self.mode == Instrumentation.MODE_EVALUATE:
             shared_memory_names = self.config.shared_memory_names_evaluate
             exclude_classes_fine = self.config.exclude_classes_fine_evaluate
             max_instances = self.config.max_instances_evaluate
+            exclude_classes_coarse = self.config.exclude_classes_coarse
 
         #logger.info(f"create_dataset(): shared mem.: {shared_memory_name} max. instances: {max_instances}")
         self.dataset = CifarEnv.create_dataset(
             data_file_path = self.config.data_file_path,
             mode = self.mode,
             shared_memory_names = shared_memory_names,
-            exclude_classes_coarse = self.config.exclude_classes_coarse,
+            exclude_classes_coarse = exclude_classes_coarse,
             exclude_classes_fine = exclude_classes_fine,
             max_instances = max_instances,
         )
