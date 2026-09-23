@@ -42,7 +42,7 @@ def main():
     run_root_path = f"cifar_100/{EXPERIMENT_NAME}"
     run_path = get_run_path(
         prefix = run_root_path, 
-        path = "./runs",
+        path = cifar_args.run_root,  # honour --run-root as the STM and head scripts do (default ./runs)
     )
     create_run_path(run_path)
     data_file_path = CIFAR_DATA_FILE_PATH
