@@ -20,22 +20,39 @@ LOG=runs_local/round
 mkdir -p "$LOG" runs_seed runs_local/seeds ../cifar_100_pretrain/variants
 say() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG/reap.log"; }
 
-verify_local() {  # $1 = job dir name, e.g. ref_pt12_s3
+# Two job shapes are reaped by this script and each has its own completeness test. A job
+# whose shape is not recognised must fail verification, never pass by default: an
+# unverifiable job is left running and its pod is not destroyed.
+verify_local() {  # $1 = job dir name (ref_pt12_s3, or s3 for a stream-seed job)
+  case "$1" in
+    ref_pt*)  verify_continual "$1" ;;
+    s[0-9]*)  verify_stream "$1" ;;
+    *)        return 1 ;;
+  esac
+}
+
+verify_continual() {  # seeded continual: 3 orders x 144 evaluate lines, plus a pre-training file
   local d="runs_seed/$1" n=0 bad=0
   [ -d "$d" ] || return 1
   while IFS= read -r -d '' f; do
     n=$((n+1)); [ "$(grep -c evaluate "$f")" = "144" ] || bad=1
   done < <(find "$d" -name 'results_continual.txt' -print0 2>/dev/null)
-  [ "$n" = "3" ] || return 1
-  [ "$bad" = "0" ] || return 1
-  find "$d" -name 'results_pretrain.txt' | grep -q . || return 1
-  return 0
+  [ "$n" = "3" ] && [ "$bad" = "0" ] && find "$d" -name 'results_pretrain.txt' | grep -q .
+}
+
+verify_stream() {  # seeded single-stream: 3 classes x 13 evaluation points x 4 test sets = 52 lines
+  local d="runs_stream_seed/$1" n=0 bad=0
+  [ -d "$d" ] || return 1
+  while IFS= read -r -d '' f; do
+    n=$((n+1)); [ "$(grep -c evaluate "$f")" = "52" ] || bad=1
+  done < <(find "$d" -name 'results_few-shot.txt' -print0 2>/dev/null)
+  [ "$n" = "3" ] && [ "$bad" = "0" ]
 }
 
 INTERVAL=${INTERVAL:-180}
 MAX_PASSES=${MAX_PASSES:-200}
 for pass in $(seq 1 "$MAX_PASSES"); do
-  live=$(sky status 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -E "^r-" | awk '{print $1}')
+  live=$(sky status 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -E "^(r-|ss-)" | awk '{print $1}')
   [ -z "$live" ] && { say "no round clusters left; reaper exiting"; exit 0; }
   for c in $live; do
     sky status "$c" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -qE "^$c .*UP" || continue
@@ -44,13 +61,15 @@ for pass in $(seq 1 "$MAX_PASSES"); do
         'test -f ~/sky_workdir/runs_local/seeds/JOB_COMPLETE' 2>/dev/null || continue
     say "$c reports complete; pulling"
     ok=1
-    rsync -az --timeout=120 "$c:~/sky_workdir/runs_seed/" runs_seed/ || ok=0
-    rsync -az --timeout=120 "$c:~/sky_workdir/runs_local/seeds/" runs_local/seeds/ || ok=0
+    rsync -az --timeout=120 "$c:~/sky_workdir/runs_seed/" runs_seed/ 2>/dev/null
+    rsync -az --timeout=120 "$c:~/sky_workdir/runs_stream_seed/" runs_stream_seed/ 2>/dev/null
+    rsync -az --timeout=120 "$c:~/sky_workdir/runs_local/seeds/" runs_local/seeds/ 2>/dev/null
+    rsync -az --timeout=120 "$c:~/sky_workdir/runs_local/stream_seed/" runs_local/stream_seed/ 2>/dev/null
     rsync -az --timeout=120 "$c:~/cifar_100_pretrain/variants/" ../cifar_100_pretrain/variants/ || ok=0
     [ "$ok" = "1" ] || { say "$c PULL FAILED; leaving it up (autodown is the backstop)"; continue; }
     # Defence 2: the data must be verifiably here before the pod is destroyed.
     job=$(ssh -o ConnectTimeout=8 -o BatchMode=yes "$c" \
-          'ls -d ~/sky_workdir/runs_seed/*/ 2>/dev/null | head -1 | xargs -n1 basename' 2>/dev/null)
+          'ls -d ~/sky_workdir/runs_seed/*/ ~/sky_workdir/runs_stream_seed/*/ 2>/dev/null | head -1 | xargs -n1 basename' 2>/dev/null)
     if [ -n "$job" ] && verify_local "$job"; then
       say "$c verified locally ($job: 3 orders x 144 lines + pretrain); tearing down"
       sky down "$c" -y > /dev/null 2>&1 && say "$c down" || say "$c FAILED to down"
