@@ -75,7 +75,7 @@ for pass in $(seq 1 "$MAX_PASSES"); do
     job=$(ssh -o ConnectTimeout=8 -o BatchMode=yes "$c" \
           'ls -d ~/sky_workdir/runs_seed/*/ ~/sky_workdir/runs_stream_seed/*/ 2>/dev/null | head -1 | xargs -n1 basename' 2>/dev/null)
     if [ -n "$job" ] && verify_local "$job"; then
-      say "$c verified locally ($job: 3 orders x 144 lines + pretrain); tearing down"
+      say "$c verified locally ($job); tearing down"
       sky down "$c" -y > /dev/null 2>&1 && say "$c down" || say "$c FAILED to down"
     else
       say "$c pulled but local verification FAILED for '${job:-unknown}'; leaving it up"
