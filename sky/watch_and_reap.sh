@@ -57,8 +57,12 @@ for pass in $(seq 1 "$MAX_PASSES"); do
   for c in $live; do
     sky status "$c" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -qE "^$c .*UP" || continue
     # Defence 1: sentinel, via exit code. Any ssh failure means "not finished".
+    # The sentinel lives under a different directory for each job shape, so BOTH must be
+    # checked. Widening the pull paths and the verification without widening this check left
+    # finished stream-seed pods invisible to the reaper, to be destroyed by their autodown
+    # with results still on them. Add the path here whenever a new job shape is added.
     ssh -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o BatchMode=yes "$c" \
-        'test -f ~/sky_workdir/runs_local/seeds/JOB_COMPLETE' 2>/dev/null || continue
+        'test -f ~/sky_workdir/runs_local/seeds/JOB_COMPLETE || test -f ~/sky_workdir/runs_local/stream_seed/JOB_COMPLETE' 2>/dev/null || continue
     say "$c reports complete; pulling"
     ok=1
     rsync -az --timeout=120 "$c:~/sky_workdir/runs_seed/" runs_seed/ 2>/dev/null
