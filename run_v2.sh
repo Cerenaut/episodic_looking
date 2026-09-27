@@ -136,7 +136,7 @@ if [ "$KIND" = head ]; then
   [ -n "${PRETRAIN_EPOCHS:-}" ] && CMD="$CMD --pretrain-epochs $PRETRAIN_EPOCHS"
   [ -n "${LR:-}" ] && CMD="$CMD --lr $LR"
 fi
-if [ "$KIND" = ltm ] && [ -n "${EPOCHS:-}" ]; then CMD="$CMD --epochs $EPOCHS"; fi
+if [ "$KIND" = ltm ] && [ "$SETTING" != baseline ] && [ -n "${EPOCHS:-}" ]; then CMD="$CMD --epochs $EPOCHS"; fi
 if [ "$KIND" = stm ] && [ "$SETTING" != stream ]; then  # stream sets both in its command
   [ -n "${TRAINING_STEPS:-}" ] && CMD="$CMD --training-steps $TRAINING_STEPS"
   [ -n "${EVAL_EPOCHS:-}" ] && CMD="$CMD --evaluate-epochs $EVAL_EPOCHS"
