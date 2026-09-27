@@ -22,7 +22,7 @@
 # budgets are the draft's, in each model's own epochs, until the pilot sets them:
 #   STM   continual 12/phase, stream 96 x 8,000 steps at batch 1 (evaluated every 8 epochs), few-shot 12 at every N;
 #         pre-training 12 epochs at batch 16 (stream jobs use the same checkpoint).
-#   heads continual 12/phase, stream 12, few-shot floor(6250/N); pre-trained 12 epochs on fine 1,2.
+#   heads continual 12/phase, stream 12, few-shot floor(6250/N); pre-trained 12 epochs on all of fine 1,2 (C6).
 #   LTM   continual 12/phase, stream 12, few-shot floor(6250/N).
 # The seed also selects the few-shot images, the same ones in every model for a given seed (C9). Use the same seed
 # numbers for every model.
@@ -122,7 +122,7 @@ case "$SETTING/$KIND" in
   stream/head)
     CMD="$HEAD_BASE --experiment-type streaming --fine-classes $CLS" ;;
   fewshot/head)
-    CMD="$HEAD_BASE --experiment-type continual --fine-classes $CLS --max-instances $N" ;;
+    CMD="$HEAD_BASE --experiment-type continual --fine-classes $CLS --max-instances $N --pretrain-all-instances" ;;
   continual/ltm)
     CMD="$LTM_BASE --experiment-type continual --fine-classes $ORDER --run-root $UNIT_DIR" ;;
   stream/ltm)
