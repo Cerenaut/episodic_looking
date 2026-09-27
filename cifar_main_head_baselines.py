@@ -65,8 +65,9 @@ METHOD_DEFAULT_MOMENTUM = {"linear": 0.0, "ncm": 0.0, "flymodel": 0.0, "sdmlp": 
 # Pre-training optimizer of the gradient-trained heads; the continual phases then get a fresh optimizer with --lr /
 # --momentum. SDMLP as Bricken: pre-training uses his model_params.py defaults (SGDM 0.9, lr 0.03); his continual runs
 # use plain SGD at lr 0.05 and do not reload the optimizer state. Linear probe: pre-training keeps the prior, untuned
-# lr 0.01, because the fine 1,2 validation images were in the LTM's pre-training set and cannot choose it.
-METHOD_DEFAULT_PRETRAIN_LR = {"sdmlp": 0.03, "linear": 0.01}
+# lr 0.01, because the fine 1,2 validation images were in the LTM's pre-training set and cannot choose it. FlyModel:
+# its Hebbian rate, 0.2, in both; listed so that --lr (e.g. a sweep) changes the continual phases only.
+METHOD_DEFAULT_PRETRAIN_LR = {"sdmlp": 0.03, "linear": 0.01, "flymodel": 0.2}
 METHOD_DEFAULT_PRETRAIN_MOMENTUM = {"sdmlp": 0.9, "linear": 0.0}
 
 
@@ -103,7 +104,7 @@ def parse_args():
     p.add_argument("--momentum", type=float, default=None,
                    help=f"SGD momentum (linear, sdmlp). Default per method: {METHOD_DEFAULT_MOMENTUM}")
     p.add_argument("--pretrain-lr", type=float, default=None,
-                   help="Learning rate while pre-training on fine-classes 1,2 (linear, sdmlp); --lr applies to the "
+                   help="Learning rate while pre-training on fine-classes 1,2 (linear, sdmlp, flymodel); --lr applies to the "
                         f"continual phases. Default per method: {METHOD_DEFAULT_PRETRAIN_LR}, else --lr.")
     p.add_argument("--pretrain-momentum", type=float, default=None,
                    help="SGD momentum while pre-training (linear, sdmlp); --momentum applies to the continual phases. "
@@ -418,6 +419,10 @@ class FlyModelHead(Head):
         self.R = R.to(device)
         self.W = torch.zeros(NUM_CLASSES, n_kc, device=device)
 
+    def set_optimizer(self, lr: float, momentum: float):
+        """Switch the Hebbian rate (pre-training -> continual phases); momentum does not apply."""
+        self.lr = lr
+
     @torch.no_grad()
     def kc(self, x):
         mn = x.min(dim=1, keepdim=True).values
@@ -537,7 +542,8 @@ def make_head(args, device) -> Head:
     if args.method == "ncm":
         return NCMHead(device)
     if args.method == "flymodel":
-        return FlyModelHead(args.n_kc, args.n_response, args.k_frac, args.lr, args.seed, device)
+        # Built with the pre-training rate; main() switches to --lr for the continual phases.
+        return FlyModelHead(args.n_kc, args.n_response, args.k_frac, args.pretrain_lr, args.seed, device)
     if args.method == "sdmlp":
         # Built with the pre-training optimizer; main() switches to --lr / --momentum for the continual phases.
         return SDMLPHead(args.nneurons, args.k, args.gaba_switch_activations, args.pretrain_lr,

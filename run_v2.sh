@@ -20,7 +20,8 @@
 # Protocol defaults (plan.md section 3): validation split --val-holdout 100 --split-seed 0 everywhere; the STM
 # evaluates by one pass over every test and validation image (--eval-sweep) at the policy mean, 16 environments;
 # budgets are the draft's, in each model's own epochs, until the pilot sets them:
-#   STM   continual 12/phase, stream 96 x 8,000 steps at batch 1 (evaluated every 8 epochs), few-shot 12 at every N;
+#   STM   continual 12/phase, stream 192 epochs of 4,000 steps at batch 1 (evaluated every 16 epochs), few-shot 12
+#         at every N;
 #         pre-training 12 epochs at batch 16 (stream jobs use the same checkpoint).
 #   heads continual 12/phase, stream 12, few-shot floor(6250/N); pre-trained 12 epochs on all of fine 1,2 (C6).
 #   LTM   continual 12/phase, stream 12, few-shot floor(6250/N).
@@ -111,12 +112,13 @@ case "$SETTING/$KIND" in
   continual/stm)
     CMD="$STM_BASE $STM_LR --experiment-type continual --fine-classes $ORDER --epochs ${EPOCHS:-12} --stm-checkpoint $STM_CKPT $(save_stm "$UNIT_DIR/stm") --run-root $UNIT_DIR" ;;
   stream/stm)
-    # Single-stream: batch 1 from the batch-16 pre-trained checkpoint, lr 0.01 (0.1 diverges at batch 1).
-    CMD="$STM_BASE $STM_STREAM_LR --experiment-type few-shot --fine-classes $CLS --batch-size 1 --epochs ${EPOCHS:-96} --training-steps ${TRAINING_STEPS:-8000} --evaluate-epochs ${EVAL_EPOCHS:-8} --stm-checkpoint $STM_CKPT $(save_stm "$UNIT_DIR/stm_final.pth") --run-root $UNIT_DIR" ;;
+    # Single-stream: batch 1 from the batch-16 pre-trained checkpoint, lr 0.01 (0.1 diverges at batch 1). Epochs in the
+    # draft's units, 4,000 steps each (192 at the draft's budget), evaluated every 16th epoch and at the last.
+    CMD="$STM_BASE $STM_STREAM_LR --experiment-type few-shot --fine-classes $CLS --batch-size 1 --epochs ${EPOCHS:-192} --training-steps ${TRAINING_STEPS:-4000} --evaluate-epochs ${EVAL_EPOCHS:-16} --stm-checkpoint $STM_CKPT $(save_stm "$UNIT_DIR/stm_final.pth") --run-root $UNIT_DIR" ;;
   fewshot/stm)
     CMD="$STM_BASE $STM_LR --experiment-type few-shot --fine-classes $CLS --max-instances $N --epochs ${EPOCHS:-12} --stm-checkpoint $STM_CKPT $(save_stm "$UNIT_DIR/stm_final.pth") --run-root $UNIT_DIR" ;;
   baseline/ltm)
-    CMD="eval_pretrained_baseline.py --checkpoint $LTM_CKPT --coarse-classes $CC --out $UNIT_DIR/results_evaluate.txt" ;;
+    CMD="eval_pretrained_baseline.py --checkpoint $LTM_CKPT --coarse-classes $CC $SPLIT --out $UNIT_DIR/results_evaluate.txt" ;;
   continual/head)
     CMD="$HEAD_BASE --experiment-type continual --fine-classes $ORDER" ;;
   stream/head)
@@ -151,13 +153,19 @@ if [ -d "$UNIT_DIR" ] && [ -n "$(find "$UNIT_DIR" -name 'results_*.txt' -print -
   echo "unfinished results in $UNIT_DIR: move it to an archive before re-running" >&2; exit 3
 fi
 if [ "$KIND" = stm ] && [ "$SETTING" != pretrain ] && [ ! -f "$PRETRAIN_DIR/job.done" ]; then
-  echo "no finished pre-training for this model, pair and seed: run 'bash run_v2.sh pretrain$SUFFIX ...' first ($PRETRAIN_DIR)" >&2
+  echo "no finished pre-training for this model, pair and seed: run '${SUFFIX:+LTM=$LTM }bash run_v2.sh pretrain $MODEL \"$CC\" $SEED' first ($PRETRAIN_DIR)" >&2
   exit 3
 fi
 mkdir -p "$UNIT_DIR"
-echo "[$(date '+%F %T')] start: $PY $CMD" | tee "$UNIT_DIR/job.log"
-git rev-parse HEAD > "$UNIT_DIR/code_commit.txt" 2>/dev/null
-git status --porcelain -- '*.py' >> "$UNIT_DIR/code_commit.txt" 2>/dev/null
+# One launch per unit at a time: mkdir is atomic. A lock left by a killed launch must be removed by hand, after
+# checking that no process is still running the unit.
+if ! mkdir "$UNIT_DIR/.lock" 2>/dev/null; then
+  echo "$UNIT_DIR is locked by another launch (or a killed one: check, then remove $UNIT_DIR/.lock)" >&2; exit 3
+fi
+trap 'rmdir "$UNIT_DIR/.lock" 2>/dev/null' EXIT
+# job.log and code_commit.txt are appended to, so a failed attempt's log is kept when the unit is re-run.
+echo "[$(date '+%F %T')] start: $PY $CMD" | tee -a "$UNIT_DIR/job.log"
+{ echo "[$(date '+%F %T')]"; git rev-parse HEAD; git status --porcelain -- '*.py'; } >> "$UNIT_DIR/code_commit.txt" 2>/dev/null
 # shellcheck disable=SC2086  # CMD is word-split on purpose (bash, not zsh)
 $PY $CMD >> "$UNIT_DIR/job.log" 2>&1
 rc=$?

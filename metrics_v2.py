@@ -164,7 +164,9 @@ def continual_runs(runs: str, setting: str, model: str, pair: str, part: str) ->
 
 
 def seed_stats(per_seed: dict[int, list[dict]], key: str) -> tuple[float, float, int]:
-    vals = [np.mean([m[key] for m in ms]) for ms in per_seed.values() if ms]
+    """Mean and sd over seeds of each seed's mean over its orders. Only seeds with all three orders count, so that a
+    half-finished seed does not weigh as much as a complete one (with --partial, any finished order counts)."""
+    vals = [np.mean([m[key] for m in ms]) for ms in per_seed.values() if len(ms) == len(ORDERS) or (PARTIAL and ms)]
     if not vals:
         return np.nan, np.nan, 0
     return float(np.mean(vals)), float(np.std(vals)), len(vals)

@@ -113,12 +113,12 @@ def main():
     split_options = {}
     if VAL_HOLDOUT > 0:
         split_options = {"val_holdout": VAL_HOLDOUT, "split_seed": cifar_args.split_seed}
+        logger.info(f"Validation split: {VAL_HOLDOUT} images per fine class held out, split seed {cifar_args.split_seed}")
     # With --max-instances and --seed, the subsets are those the head and STM scripts draw for that seed.
     subset_options = {}
     if MAX_INSTANCES is not None and SEED is not None:
         subset_options = {"subset_seed": SEED}
         logger.info(f"Subsets of {MAX_INSTANCES} images per coarse class drawn with seed {SEED}")
-        logger.info(f"Validation split: {VAL_HOLDOUT} images per fine class held out, split seed {cifar_args.split_seed}")
 
     dataset_training_3 = Cifar100Dataset(
         file_path=data_file_path, 

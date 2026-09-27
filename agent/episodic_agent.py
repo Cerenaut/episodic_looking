@@ -111,7 +111,12 @@ class EpisodicAgent:
         return self.config.batch_size
 
     def get_envs(self, mode:str) -> gym.vector.VectorEnv:
-        """The environments used in this mode (the same object for both modes unless evaluate_batch_size is set)."""
+        """
+        The environments used in this mode (the same object for both modes unless evaluate_batch_size is set).
+        Caution: with separate sets, both still share one CifarEnvConfig object (the registered env constructor's), so
+        set_dataset_config on either set rewrites the fields of that mode for both. That is safe only because each set
+        stays in its own mode: always address dataset configs and mode switches through get_envs(mode).
+        """
         if mode == Instrumentation.MODE_EVALUATE:
             return self.envs_evaluate
         return self.envs_training
