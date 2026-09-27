@@ -98,7 +98,7 @@ def main():
     FINE_CLASSES = args.fine_classes
     COARSE_CLASSES = args.coarse_classes
     LEARNING_RATE = args.learning_rate
-    NUM_EPOCHS = args.epochs
+    NUM_EPOCHS = args.epochs if args.epochs is not None else 12  # --epochs defaults to None, for LTM-only's rule
     EVALUATE_INTERVAL_EPOCHS = args.evaluate_epochs
     VAL_HOLDOUT = args.val_holdout
     logger.info(f"Exp.:{EXPERIMENT_TYPE} Fine classes:{FINE_CLASSES} Batch size:{BATCH_SIZE} max. instances:{MAX_INSTANCES} LR: {LEARNING_RATE} Seed: {SEED}")

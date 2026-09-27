@@ -25,7 +25,9 @@ class CifarArgs:
         parser.add_argument(
             "--epochs",
             type=int,
-            default=12,
+            default=None,
+            help="STM: epochs (per phase in continual), default 12. LTM-only: epochs per phase, default "
+                 "int(6250 / instances per epoch) (12 at 500 instances), which it previously always used.",
         )
 
         parser.add_argument(
@@ -91,7 +93,7 @@ class CifarArgs:
             "--ltm-checkpoint",
             type=str,
             default=None,
-            help="Frozen LTM checkpoint (default: the script's built-in path).",
+            help="Frozen LTM checkpoint (STM), or the LTM to fine-tune (LTM-only) (default: the script's built-in path).",
         )
         parser.add_argument(
             "--stm-checkpoint",

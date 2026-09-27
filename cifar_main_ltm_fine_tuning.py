@@ -48,6 +48,8 @@ def main():
 
     CIFAR_DATA_FILE_PATH = "../cifar-100-python"
     CLASSIFIER_FILE_PATH = "../cifar_100_pretrain/cifar_100_subclasses_12_e11_31.1.pth"
+    if cifar_args.ltm_checkpoint is not None:
+        CLASSIFIER_FILE_PATH = cifar_args.ltm_checkpoint
     NUM_CLASSES = 20
 
     max_instances_description = str(MAX_INSTANCES) if MAX_INSTANCES is not None else "500"
@@ -90,6 +92,9 @@ def main():
     # = 12.5 epochs @ batch size 16
     NUM_EPOCHS = int(target_steps / instances_per_epoch)
     logger.info(f"Target steps: {target_steps} instances / epoch: {instances_per_epoch} so num. epochs: {NUM_EPOCHS}")
+    if cifar_args.epochs is not None:  # budget set by the protocol (Notes/experiments/plan.md, section 3)
+        NUM_EPOCHS = cifar_args.epochs
+        logger.info(f"Epochs per phase set by --epochs: {NUM_EPOCHS}")
 
     # Select coarse classes
     exclude_classes_coarse = set()
