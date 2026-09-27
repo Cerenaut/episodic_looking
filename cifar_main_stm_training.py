@@ -105,10 +105,15 @@ def main():
 
     # Validation split (--val-holdout): every training set holds out the same images per fine class as the head
     # script, and the held-out images are evaluated alongside the test sets.
+    # With --max-instances and --seed, the subset is the one the head and LTM-only scripts draw for that seed
+    # (Cifar100Dataset.get_subset_mask), and environments re-derive it identically; without a seed, the old draw.
     TRAINING_DATASET_OPTIONS = None
     VALIDATION_DATASET_OPTIONS = None
+    if MAX_INSTANCES is not None and SEED is not None:
+        TRAINING_DATASET_OPTIONS = {"subset_seed": SEED}
+        logger.info(f"Subset of {MAX_INSTANCES} images per coarse class drawn with seed {SEED}")
     if VAL_HOLDOUT > 0:
-        TRAINING_DATASET_OPTIONS = {"val_holdout": VAL_HOLDOUT, "split_seed": args.split_seed}
+        TRAINING_DATASET_OPTIONS = {**(TRAINING_DATASET_OPTIONS or {}), "val_holdout": VAL_HOLDOUT, "split_seed": args.split_seed}
         VALIDATION_DATASET_OPTIONS = {
             "training": True, "val_holdout": VAL_HOLDOUT, "split_seed": args.split_seed, "split_part": "validation",
         }
@@ -236,6 +241,7 @@ def main():
         exclude_classes_fine_training=exclude_classes_fine,
         exclude_classes_fine_evaluate=exclude_classes_fine,
         dataset_options_training=TRAINING_DATASET_OPTIONS,
+        max_instances_training=MAX_INSTANCES,  # as dataset_training, which the environments attach to
     )
 
     class NoArgCifarEnv(CifarEnv):
@@ -592,7 +598,7 @@ def main():
             mode = Instrumentation.MODE_TRAINING,
             shared_memory_names = shared_memory_names_continual,
             exclude_classes_fine = exclude_classes_fine_continual,
-            max_instances = None,  # All instances
+            max_instances = MAX_INSTANCES,  # as dataset_training_continual (None: all); was None, which failed
             dataset_options = TRAINING_DATASET_OPTIONS,
         )
 

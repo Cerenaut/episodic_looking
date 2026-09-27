@@ -296,6 +296,30 @@ def subsample_per_coarse_class(X, yc, yf, coarse_classes: list[int], max_instanc
     return X[idx], yc[idx], yf[idx]
 
 
+def split_and_subsample(enc: dict, args, rng: np.random.Generator) -> tuple[dict, dict]:
+    """
+    Training and validation arrays per group from enc[f"train_{name}"] = (X, y_coarse, y_fine): the validation
+    hold-out first, then the --max-instances subset of what remains, drawn from rng. Cifar100Dataset.get_subset_mask
+    replays this draw so the STM and LTM-only scripts train on the same images; checks/check_fewshot_subsets.py
+    compares the two by calling this function on raw images.
+    """
+    train_arrays, val_arrays = {}, {}
+    for name in GROUPS:
+        # Validation hold-out first, so few-shot subsets are drawn from the remaining training images only
+        X_all, yc_all, yf_all = enc[f"train_{name}"]
+        holdout = Cifar100Dataset.get_validation_mask(yf_all, args.val_holdout, args.split_seed)
+        if holdout.any():
+            val_arrays[name] = (X_all[holdout], yc_all[holdout], yf_all[holdout])
+        train_pool = (X_all[~holdout], yc_all[~holdout], yf_all[~holdout])
+        X, yc, yf = subsample_per_coarse_class(*train_pool, args.coarse_classes, args.max_instances, rng)
+        if name == "12" and args.pretrain_all_instances:
+            # The subsample above is still drawn and discarded, so the rng stream, and therefore the
+            # few-shot subsets of fine-classes 3-5, are the same as without the flag for a given seed.
+            X, yc, yf = subsample_per_coarse_class(*train_pool, args.coarse_classes, None, rng)
+        train_arrays[name] = (X, yc, yf)
+    return train_arrays, val_arrays
+
+
 # --------------------------------------------------------------------------------------
 # Heads. All operate on [B, 512] float tensors and emit [B, 20] logits.
 # --------------------------------------------------------------------------------------
@@ -581,20 +605,9 @@ def main():
     def to_t(X, y):
         return torch.from_numpy(X).float().to(head_device), torch.from_numpy(y).long().to(head_device)
 
-    train_sets, val_sets = {}, {}
-    for name in GROUPS:
-        # Validation hold-out first, so few-shot subsets are drawn from the remaining training images only
-        X_all, yc_all, yf_all = enc[f"train_{name}"]
-        holdout = Cifar100Dataset.get_validation_mask(yf_all, args.val_holdout, args.split_seed)
-        if holdout.any():
-            val_sets[name] = to_t(X_all[holdout], yc_all[holdout])
-        train_pool = (X_all[~holdout], yc_all[~holdout], yf_all[~holdout])
-        X, yc, yf = subsample_per_coarse_class(*train_pool, args.coarse_classes, args.max_instances, rng)
-        if name == "12" and args.pretrain_all_instances:
-            # The subsample above is still drawn and discarded, so the rng stream, and therefore the
-            # few-shot subsets of fine-classes 3-5, are the same as without the flag for a given seed.
-            X, yc, yf = subsample_per_coarse_class(*train_pool, args.coarse_classes, None, rng)
-        train_sets[name] = to_t(X, yc)
+    train_arrays, val_arrays = split_and_subsample(enc, args, rng)
+    train_sets = {name: to_t(X, yc) for name, (X, yc, yf) in train_arrays.items()}
+    val_sets = {name: to_t(X, yc) for name, (X, yc, yf) in val_arrays.items()}
     test_sets = {name: to_t(enc[f"test_{name}"][0], enc[f"test_{name}"][1]) for name in GROUPS}
     for name in GROUPS:
         n_val = val_sets[name][0].shape[0] if name in val_sets else 0

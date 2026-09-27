@@ -44,10 +44,13 @@ class Cifar100Dataset(Dataset):
         val_holdout:int = 0,
         split_seed:int = 0,
         split_part:str = "train",
+        subset_seed:int|None = None,
     ):
         """
         val_holdout, split_seed, split_part: validation split of the training file (get_validation_mask). split_part
             "train" keeps the images left for training, "validation" the held-out ones. val_holdout 0 = no split.
+        subset_seed: with max_instances, draw the subset reproducibly with get_subset_mask, the same images the head
+            script draws for --seed subset_seed. None = the unseeded draw of sample_data, as before.
         """
         self.max_instances = max_instances
         self.as_tensor = as_tensor
@@ -62,17 +65,24 @@ class Cifar100Dataset(Dataset):
         self.exclude_classes_coarse = exclude_classes_coarse
         self.exclude_classes_fine = exclude_classes_fine        
 
-        # Validation split, chosen on the whole file before the class filter below, which keeps whole fine labels in
-        # file order; so every script and every class filter holds out the same images. Before max_instances.
-        if val_holdout > 0:
+        # Validation split and seeded subset, chosen on the whole file before the class filter below, which keeps
+        # whole fine labels in file order; so every script and every class filter selects the same images. The split
+        # comes first: subsets are drawn from the images left for training.
+        seeded_subset = self.max_instances is not None and subset_seed is not None
+        if val_holdout > 0 or seeded_subset:
             if not training:
-                raise ValueError("The validation split applies to the training file only")
+                raise ValueError("The validation split and seeded subsets apply to the training file only")
             if split_part not in ("train", "validation"):
                 raise ValueError(f"Unknown split_part: {split_part}")
             if split_part == "validation" and self.max_instances is not None:
                 raise ValueError("The validation part is never subsampled (max_instances must be None)")
             holdout = Cifar100Dataset.get_validation_mask(labels_fine, val_holdout, split_seed)
             select = holdout if split_part == "validation" else ~holdout
+            if seeded_subset:
+                coarse_classes = sorted(set(range(20)) - set(self.exclude_classes_coarse or set()))
+                select &= Cifar100Dataset.get_subset_mask(
+                    labels_coarse, labels_fine, coarse_classes, self.max_instances, subset_seed, holdout,
+                )
             images = images[select]
             labels_coarse = [int(x) for x in np.asarray(labels_coarse)[select]]
             labels_fine = [int(x) for x in np.asarray(labels_fine)[select]]
@@ -87,7 +97,7 @@ class Cifar100Dataset(Dataset):
 
         # Optionally sample a subset of the data
         num_instances = len(self.images)
-        if self.max_instances is None:
+        if self.max_instances is None or seeded_subset:
             pass
         else:  # Reduce to a finite number of instances
             self.images, self.labels_coarse, self.labels_fine = self.sample_data(
@@ -170,6 +180,10 @@ class Cifar100Dataset(Dataset):
             array = labels_coarse_array,
         )
         self.shared_memory_names.labels_coarse = self.shared_memory_labels_coarse.name
+        if not np.array_equal(shared_labels_coarse_array, labels_coarse_array):
+            # An attaching copy (environment) derived a different selection from the creator's, e.g. a different
+            # split or subset: its images would come from the shared buffer but its targets from its own list.
+            raise ValueError("Shared-memory dataset does not match the attaching dataset's labels")
         shared_labels_coarse = shared_labels_coarse_array.tolist()
 
         labels_fine_array = np.asarray(labels_fine, dtype=np.int64)
@@ -504,6 +518,45 @@ class Cifar100Dataset(Dataset):
             rng = np.random.default_rng([split_seed, int(fine_label)])
             chosen = rng.permutation(len(positions))[:holdout_per_fine_class]
             mask[positions[chosen]] = True
+        return mask
+
+    # Fine-class groups in the order cifar_main_head_baselines.py draws their few-shot subsets (its GROUPS).
+    SUBSET_DRAW_GROUPS = ([1, 2], [3], [4], [5])
+
+    @staticmethod
+    def get_subset_mask(
+        labels_coarse,
+        labels_fine,
+        coarse_classes:list[int],
+        max_instances:int,
+        subset_seed:int,
+        holdout_mask:np.ndarray|None = None,
+    ) -> np.ndarray:
+        """
+        Boolean mask over the whole training file: max_instances images per coarse class of every fine-class group
+        (1,2 / 3 / 4 / 5), drawn exactly as cifar_main_head_baselines.py draws its subsets for --seed subset_seed.
+        One np.random.default_rng(subset_seed); groups in that order; coarse classes ascending; rng.choice(pool,
+        max_instances, replace=False) over the group's images of that coarse class in file order, validation
+        hold-out (holdout_mask) removed first. rng.choice picks by position, and its draws depend only on the pool
+        size, so the positions and hence the images match the head script's. The 1,2 group is drawn even when a
+        script does not use it, as the head script does, so the stream reaches fine classes 3-5 in the same state.
+        """
+        labels_coarse = np.asarray(labels_coarse)
+        labels_fine = np.asarray(labels_fine)
+        available = np.ones(len(labels_fine), dtype=bool) if holdout_mask is None else ~holdout_mask
+        available &= np.isin(labels_coarse, list(coarse_classes))
+        rng = np.random.default_rng(subset_seed)
+        mask = np.zeros(len(labels_fine), dtype=bool)
+        for group in Cifar100Dataset.SUBSET_DRAW_GROUPS:
+            in_group = available & np.isin(labels_fine, list(Cifar100Dataset.get_fine_classes(group)))
+            for coarse_class in sorted(coarse_classes):
+                pool = np.flatnonzero(in_group & (labels_coarse == coarse_class))
+                if len(pool) < max_instances:
+                    raise ValueError(
+                        f"Coarse class {coarse_class}, fine classes {group}: only {len(pool)} instances, "
+                        f"max_instances={max_instances} requested."
+                    )
+                mask[rng.choice(pool, size=max_instances, replace=False)] = True
         return mask
 
     @staticmethod
