@@ -149,6 +149,21 @@ class CifarArgs:
             help="agent.step() calls per reported epoch (4000 = 8,000 image exposures at batch 16, 8-step episodes).",
         )
 
+        parser.add_argument(
+            "--val-holdout",
+            type=int,
+            default=0,
+            help="Validation split: hold out this many training images per fine class (Cifar100Dataset."
+                 "get_validation_mask, the same images as the head script's --val-holdout), train on the rest, and "
+                 "evaluate the held-out images alongside the test sets, into results_<type>_val.txt. 0 = no split.",
+        )
+        parser.add_argument(
+            "--split-seed",
+            type=int,
+            default=0,
+            help="Seed of the validation split (not the run seed).",
+        )
+
         args = parser.parse_args()
         logger.info("Parse args:")
         logger.info(json.dumps(vars(args), indent=4))

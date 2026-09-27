@@ -28,6 +28,7 @@ def main():
     FINE_CLASSES = cifar_args.fine_classes
     COARSE_CLASSES = cifar_args.coarse_classes
     LEARNING_RATE = cifar_args.learning_rate
+    VAL_HOLDOUT = cifar_args.val_holdout
 
     logger.info(f"Exp.:{EXPERIMENT_TYPE} Fine classes:{FINE_CLASSES} Batch size:{BATCH_SIZE} max. instances:{MAX_INSTANCES} LR: {LEARNING_RATE}")
 
@@ -49,6 +50,10 @@ def main():
 
     results_file = CifarResults(run_path = run_path, suffix=EXPERIMENT_TYPE)
     results_file.clear_file()
+    results_file_val = None  # same format and epochs as results_file, on the validation sets
+    if VAL_HOLDOUT > 0:
+        results_file_val = CifarResults(run_path = run_path, suffix=f"{EXPERIMENT_TYPE}_val")
+        results_file_val.clear_file()
 
     device = get_device()  # cuda > mps > cpu; override with EPISODIC_DEVICE env var
     print(f"Device:{device}")
@@ -84,6 +89,13 @@ def main():
     exclude_classes_fine_4  = Cifar100Dataset.get_fine_classes([1,2,3,  5,])
     exclude_classes_fine_5  = Cifar100Dataset.get_fine_classes([1,2,3,4,  ])
 
+    # Validation split (--val-holdout): the training sets hold out the same images per fine class as the head script,
+    # and the held-out images are evaluated alongside the test sets. The epoch count stays nominal (500 instances).
+    split_options = {}
+    if VAL_HOLDOUT > 0:
+        split_options = {"val_holdout": VAL_HOLDOUT, "split_seed": cifar_args.split_seed}
+        logger.info(f"Validation split: {VAL_HOLDOUT} images per fine class held out, split seed {cifar_args.split_seed}")
+
     dataset_training_3 = Cifar100Dataset(
         file_path=data_file_path, 
         label_type=Cifar100Dataset.LABEL_TYPE_COARSE,
@@ -92,6 +104,7 @@ def main():
         exclude_classes_fine=exclude_classes_fine_3,
         max_instances = MAX_INSTANCES,
         as_tensor=True,
+        **split_options,
     )
     dataset_training_4 = Cifar100Dataset(
         file_path=data_file_path, 
@@ -101,6 +114,7 @@ def main():
         exclude_classes_fine=exclude_classes_fine_4,
         max_instances = MAX_INSTANCES,
         as_tensor=True,
+        **split_options,
     )
     dataset_training_5 = Cifar100Dataset(
         file_path=data_file_path, 
@@ -110,6 +124,7 @@ def main():
         exclude_classes_fine=exclude_classes_fine_5,
         max_instances = MAX_INSTANCES,
         as_tensor=True,
+        **split_options,
     )
 
     # Evaluate on all instances in epoch
@@ -197,6 +212,30 @@ def main():
         num_workers=2,
         pin_memory=pin_memory,
     )
+
+    # Validation sets: the held-out training images of each test group
+    loaders_validation = []
+    if VAL_HOLDOUT > 0:
+        for exclude_classes_fine_validation in (exclude_classes_fine_12, exclude_classes_fine_3, exclude_classes_fine_4, exclude_classes_fine_5):
+            dataset_validation = Cifar100Dataset(
+                file_path=data_file_path,
+                label_type=Cifar100Dataset.LABEL_TYPE_COARSE,
+                training=True,
+                exclude_classes_coarse=exclude_classes_coarse,
+                exclude_classes_fine=exclude_classes_fine_validation,
+                as_tensor=True,
+                split_part="validation",
+                **split_options,
+            )
+            loaders_validation.append(DataLoader(
+                dataset_validation,
+                batch_size=BATCH_SIZE,
+                shuffle=False,
+                num_workers=2,
+                pin_memory=pin_memory,
+            ))
+        logger.info(f"Training set sizes: 3: {len(dataset_training_3)} 4: {len(dataset_training_4)} 5: {len(dataset_training_5)}; "
+                    f"validation set sizes: {[len(loader.dataset) for loader in loaders_validation]}")
 
     config = ResNetConfig(
         num_classes=NUM_CLASSES,
@@ -320,13 +359,16 @@ def main():
             f"| train loss {metrics_training.mean_loss:.4f} "
             f"| train acc {metrics_training.mean_accuracy:.3f} "
         )
-        results_file.append_line(
-            coarse_classes = COARSE_CLASSES,
-            fine_classes = FINE_CLASSES,
-            mode = Instrumentation.MODE_TRAINING,
-            epoch = epoch,
-            accuracy = metrics_training.mean_accuracy,            
-        )
+        for results in (results_file, results_file_val):
+            if results is None:
+                continue
+            results.append_line(
+                coarse_classes = COARSE_CLASSES,
+                fine_classes = FINE_CLASSES,
+                mode = Instrumentation.MODE_TRAINING,
+                epoch = epoch,
+                accuracy = metrics_training.mean_accuracy,            
+            )
 
         evaluate_names = ["12","3","4","5"]
         evaluate_loaders = [loader_evaluate_12, loader_evaluate_3, loader_evaluate_4, loader_evaluate_5]
@@ -358,6 +400,28 @@ def main():
                 mode = Instrumentation.MODE_EVALUATE,
                 epoch = epoch,
                 accuracy = metrics_evaluate.mean_accuracy,            
+            )
+
+        for i, validation_loader in enumerate(loaders_validation):
+            metrics_validation = do_epoch_mode(
+                model,
+                validation_loader,
+                optimizer,
+                device,
+                training = False,
+                global_step = global_step_evaluate,
+                max_steps = MAX_STEPS_EVALUATE,
+            )
+            print(
+                f"Epoch {epoch + 1:3d}/{NUM_EPOCHS} "
+                f"| val. acc. {evaluate_names[i]}: {metrics_validation.mean_accuracy:.3f}"
+            )
+            results_file_val.append_line(
+                coarse_classes = COARSE_CLASSES,
+                fine_classes = [evaluate_names[i]],
+                mode = Instrumentation.MODE_EVALUATE,
+                epoch = epoch,
+                accuracy = metrics_validation.mean_accuracy,
             )
 
         print(f"Epoch {epoch + 1:3d}/{NUM_EPOCHS} complete.")

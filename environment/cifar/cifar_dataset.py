@@ -41,7 +41,14 @@ class Cifar100Dataset(Dataset):
         max_instances:int|None = None,
         shared_memory_names:CifarSharedMemoryNames|None = None,
         as_tensor:bool = True,
+        val_holdout:int = 0,
+        split_seed:int = 0,
+        split_part:str = "train",
     ):
+        """
+        val_holdout, split_seed, split_part: validation split of the training file (get_validation_mask). split_part
+            "train" keeps the images left for training, "validation" the held-out ones. val_holdout 0 = no split.
+        """
         self.max_instances = max_instances
         self.as_tensor = as_tensor
         self.shared_memory_names = shared_memory_names
@@ -54,6 +61,21 @@ class Cifar100Dataset(Dataset):
         # Optionally filter samples to only some classes
         self.exclude_classes_coarse = exclude_classes_coarse
         self.exclude_classes_fine = exclude_classes_fine        
+
+        # Validation split, chosen on the whole file before the class filter below, which keeps whole fine labels in
+        # file order; so every script and every class filter holds out the same images. Before max_instances.
+        if val_holdout > 0:
+            if not training:
+                raise ValueError("The validation split applies to the training file only")
+            if split_part not in ("train", "validation"):
+                raise ValueError(f"Unknown split_part: {split_part}")
+            if split_part == "validation" and self.max_instances is not None:
+                raise ValueError("The validation part is never subsampled (max_instances must be None)")
+            holdout = Cifar100Dataset.get_validation_mask(labels_fine, val_holdout, split_seed)
+            select = holdout if split_part == "validation" else ~holdout
+            images = images[select]
+            labels_coarse = [int(x) for x in np.asarray(labels_coarse)[select]]
+            labels_fine = [int(x) for x in np.asarray(labels_fine)[select]]
 
         self.images, self.labels_coarse, self.labels_fine = self.filter_data(
             images, 
