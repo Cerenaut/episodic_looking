@@ -126,7 +126,7 @@ def parse_args():
                    help="SDMLP: binary activations per neuron for the GABA switch to complete. "
                         "Default: half the number of pretraining samples, or 1 if --pretrain-epochs 0. Sized for dense "
                         "firing, so at k = 32 only ~25%% of neurons complete the switch in pre-training; a completed "
-                        "switch (e.g. 100) made the head more plastic and forget more (Gideon Notes/stm_optimizations.md).")
+                        "switch (e.g. 100) made the head more plastic and forget more (Notes/stm_optimizations.md).")
     p.add_argument("--grad-clip", type=float, default=1.0, help="SDMLP: gradient-norm clip (Bricken default 1.0).")
     # plumbing
     p.add_argument("--run-path", type=str, default=None,
