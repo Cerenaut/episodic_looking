@@ -463,6 +463,28 @@ class Cifar100Dataset(Dataset):
         raise ValueError("Fine class set not recognized.")
 
     @staticmethod
+    def get_validation_mask(labels_fine, holdout_per_fine_class:int, split_seed:int = 0) -> np.ndarray:
+        """
+        Boolean mask over training instances: True for the validation hold-out. For every fine label, the same
+        holdout_per_fine_class images are chosen by a generator seeded with (split_seed, fine label), by position
+        among that label's images in file order. Filtering by class keeps file order, so any script that applies
+        this to its class-filtered training labels, before any per-class subsampling (max_instances), holds out the
+        same images.
+        """
+        labels_fine = np.asarray(labels_fine)
+        mask = np.zeros(len(labels_fine), dtype=bool)
+        if holdout_per_fine_class <= 0:
+            return mask
+        for fine_label in np.unique(labels_fine):
+            positions = np.flatnonzero(labels_fine == fine_label)
+            if holdout_per_fine_class >= len(positions):
+                raise ValueError(f"Cannot hold out {holdout_per_fine_class} of {len(positions)} images of fine label {fine_label}")
+            rng = np.random.default_rng([split_seed, int(fine_label)])
+            chosen = rng.permutation(len(positions))[:holdout_per_fine_class]
+            mask[positions[chosen]] = True
+        return mask
+
+    @staticmethod
     def get_fine_classes(fine_classes:list[int]):
         all_fine_classes = None
         for fine_class in fine_classes:

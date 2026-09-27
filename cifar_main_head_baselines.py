@@ -54,8 +54,20 @@ TARGET_STEPS = 6250       # from cifar_main_ltm_fine_tuning.py: NUM_EPOCHS = int
 EXPERIMENT_TYPE_CONTINUAL = "continual"
 EXPERIMENT_TYPE_STREAMING = "streaming"
 
-METHOD_DEFAULT_LR = {"linear": 0.01, "ncm": 0.0, "flymodel": 0.2, "sdmlp": 0.05}
-METHOD_DEFAULT_MOMENTUM = {"linear": 0.0, "ncm": 0.0, "flymodel": 0.0, "sdmlp": 0.9}
+# Continual-phase optimizer. Linear probe: lr 0.001, momentum 0 (was 0.01), chosen on the validation split
+# (--val-holdout 100, main pair, 3 orders, seed 0, draft budget, continual only) by mean accuracy on the held-out fine
+# 3-5 images: lr {0.001, 0.003, 0.01, 0.03, 0.1} x momentum {0, 0.9} x weight decay {0, 1e-4}, extended to lr 0.0003
+# and 0.0001 at momentum 0, weight decay 0 (runs_local/linear_val_sweep_20260927/), then confirmed with pre-training
+# fixed at 0.01 (runs_local/linear_val_sweep_pt0.01_20260927/). Weight decay made no difference. Not validated for
+# streaming or few-shot.
+METHOD_DEFAULT_LR = {"linear": 0.001, "ncm": 0.0, "flymodel": 0.2, "sdmlp": 0.05}
+METHOD_DEFAULT_MOMENTUM = {"linear": 0.0, "ncm": 0.0, "flymodel": 0.0, "sdmlp": 0.0}
+# Pre-training optimizer of the gradient-trained heads; the continual phases then get a fresh optimizer with --lr /
+# --momentum. SDMLP as Bricken: pre-training uses his model_params.py defaults (SGDM 0.9, lr 0.03); his continual runs
+# use plain SGD at lr 0.05 and do not reload the optimizer state. Linear probe: pre-training keeps the prior, untuned
+# lr 0.01, because the fine 1,2 validation images were in the LTM's pre-training set and cannot choose it.
+METHOD_DEFAULT_PRETRAIN_LR = {"sdmlp": 0.03, "linear": 0.01}
+METHOD_DEFAULT_PRETRAIN_MOMENTUM = {"sdmlp": 0.9, "linear": 0.0}
 
 
 # --------------------------------------------------------------------------------------
@@ -90,6 +102,19 @@ def parse_args():
                    help=f"Learning rate. Default per method: {METHOD_DEFAULT_LR}")
     p.add_argument("--momentum", type=float, default=None,
                    help=f"SGD momentum (linear, sdmlp). Default per method: {METHOD_DEFAULT_MOMENTUM}")
+    p.add_argument("--pretrain-lr", type=float, default=None,
+                   help="Learning rate while pre-training on fine-classes 1,2 (linear, sdmlp); --lr applies to the "
+                        f"continual phases. Default per method: {METHOD_DEFAULT_PRETRAIN_LR}, else --lr.")
+    p.add_argument("--pretrain-momentum", type=float, default=None,
+                   help="SGD momentum while pre-training (linear, sdmlp); --momentum applies to the continual phases. "
+                        f"Default per method: {METHOD_DEFAULT_PRETRAIN_MOMENTUM}, else --momentum.")
+    p.add_argument("--weight-decay", type=float, default=0.0, help="Linear probe: SGD weight decay (L2).")
+    p.add_argument("--val-holdout", type=int, default=0,
+                   help="Validation split: hold out this many training images per fine class (Cifar100Dataset."
+                        "get_validation_mask; experiment_plan_v2 C7 proposes 100 of 500), train on the rest and write "
+                        "the accuracy on the held-out images to results_<type>_val.txt / results_pretrain_val.txt, "
+                        "in the same format as the test-set files. 0 = no split (all images train).")
+    p.add_argument("--split-seed", type=int, default=0, help="Seed of the validation split (not the run seed).")
     # flymodel
     p.add_argument("--n-kc", type=int, default=20000, help="FlyModel: number of Kenyon cells.")
     p.add_argument("--n-response", type=int, default=64, help="FlyModel: ones per row of the random projection.")
@@ -99,8 +124,9 @@ def parse_args():
     p.add_argument("--k", type=int, default=32, help="SDMLP: Top-K k_min (paper STM sparsity 32).")
     p.add_argument("--gaba-switch-activations", type=int, default=None,
                    help="SDMLP: binary activations per neuron for the GABA switch to complete. "
-                        "Default: half the number of pretraining samples (so the switch completes during "
-                        "pretraining), or 1 if --pretrain-epochs 0.")
+                        "Default: half the number of pretraining samples, or 1 if --pretrain-epochs 0. Sized for dense "
+                        "firing, so at k = 32 only ~25%% of neurons complete the switch in pre-training; a completed "
+                        "switch (e.g. 100) made the head more plastic and forget more (Gideon Notes/stm_optimizations.md).")
     p.add_argument("--grad-clip", type=float, default=1.0, help="SDMLP: gradient-norm clip (Bricken default 1.0).")
     # plumbing
     p.add_argument("--run-path", type=str, default=None,
@@ -120,6 +146,10 @@ def parse_args():
         args.lr = METHOD_DEFAULT_LR[args.method]
     if args.momentum is None:
         args.momentum = METHOD_DEFAULT_MOMENTUM[args.method]
+    if args.pretrain_lr is None:
+        args.pretrain_lr = METHOD_DEFAULT_PRETRAIN_LR.get(args.method, args.lr)
+    if args.pretrain_momentum is None:
+        args.pretrain_momentum = METHOD_DEFAULT_PRETRAIN_MOMENTUM.get(args.method, args.momentum)
     return args
 
 
@@ -288,12 +318,19 @@ class LinearHead(Head):
     """Linear probe on the frozen features, initialised from the LTM's own classifier weights."""
     name = "linear"
 
-    def __init__(self, init_weight: np.ndarray, init_bias: np.ndarray, lr: float, momentum: float, device):
+    def __init__(self, init_weight: np.ndarray, init_bias: np.ndarray, lr: float, momentum: float,
+                 weight_decay: float, device):
         self.linear = nn.Linear(ENCODING_DIM, NUM_CLASSES).to(device)
         with torch.no_grad():
             self.linear.weight.copy_(torch.from_numpy(init_weight))
             self.linear.bias.copy_(torch.from_numpy(init_bias))
-        self.opt = torch.optim.SGD(self.linear.parameters(), lr=lr, momentum=momentum)
+        self.weight_decay = weight_decay
+        self.set_optimizer(lr, momentum)
+
+    def set_optimizer(self, lr: float, momentum: float):
+        """A fresh optimizer (no momentum state carried over)."""
+        self.lr, self.momentum = lr, momentum
+        self.opt = torch.optim.SGD(self.linear.parameters(), lr=lr, momentum=momentum, weight_decay=self.weight_decay)
 
     def fit_batch(self, x, y):
         self.opt.zero_grad()
@@ -306,6 +343,9 @@ class LinearHead(Head):
     @torch.no_grad()
     def logits(self, x):
         return self.linear(x)
+
+    def describe(self):
+        return f"linear lr={self.lr} momentum={self.momentum} weight_decay={self.weight_decay}"
 
 
 class NCMHead(Head):
@@ -386,7 +426,8 @@ class SDMLPHead(Head):
     """
     Self-contained port of SDMContinualLearner models/SDM_Base.py + models/TopK_Act.py with the paper's
     CIFAR settings (k_approach "GABA_SWITCH_ACT_BIN", use_bias False, all_positive_weights True,
-    norm_addresses True, norm_values False, SGDM, gradient clip 1.0):
+    norm_addresses True, norm_values False, gradient clip 1.0; SGDM 0.9 at lr 0.03 for pre-training, then
+    plain SGD at lr 0.05 for the continual phases, as his continual-learning runs):
 
       x -> ReLU -> L2-normalise rows -> fc1 (no bias; rows L2-normalised, all >= 0)
         -> Top-K: a = ReLU(a); inhib = min of the top (k+1) values per sample;
@@ -409,8 +450,13 @@ class SDMLPHead(Head):
         self.purkinje = nn.Linear(nneurons, NUM_CLASSES, bias=False).to(device)
         self.counters = torch.zeros(1, nneurons, device=device)
         self.params = list(self.fc1.parameters()) + list(self.purkinje.parameters())
-        self.opt = torch.optim.SGD(self.params, lr=lr, momentum=momentum)
+        self.set_optimizer(lr, momentum)
         self.enforce_constraints()  # on_fit_start
+
+    def set_optimizer(self, lr: float, momentum: float):
+        """A fresh optimizer (no momentum state carried over), as Bricken's reload for continual learning."""
+        self.lr, self.momentum = lr, momentum
+        self.opt = torch.optim.SGD(self.params, lr=lr, momentum=momentum)
 
     @torch.no_grad()
     def enforce_constraints(self):
@@ -454,20 +500,24 @@ class SDMLPHead(Head):
 
     def describe(self):
         switched = float((self.counters >= self.gaba_switch_activations).float().mean())
-        return f"sdmlp k={self.k} N_switch={self.gaba_switch_activations} frac. neurons switched={switched:.2f}"
+        return (f"sdmlp k={self.k} N_switch={self.gaba_switch_activations} frac. neurons switched={switched:.2f} "
+                f"lr={self.lr} momentum={self.momentum}")
 
 
 def make_head(args, device) -> Head:
     if args.method == "linear":
         w, b = load_ltm_classifier(args)
-        return LinearHead(w, b, lr=args.lr, momentum=args.momentum, device=device)
+        # Built with the pre-training optimizer; main() switches to --lr / --momentum for the continual phases.
+        return LinearHead(w, b, lr=args.pretrain_lr, momentum=args.pretrain_momentum,
+                          weight_decay=args.weight_decay, device=device)
     if args.method == "ncm":
         return NCMHead(device)
     if args.method == "flymodel":
         return FlyModelHead(args.n_kc, args.n_response, args.k_frac, args.lr, args.seed, device)
     if args.method == "sdmlp":
-        return SDMLPHead(args.nneurons, args.k, args.gaba_switch_activations, args.lr, args.momentum,
-                         args.grad_clip, device)
+        # Built with the pre-training optimizer; main() switches to --lr / --momentum for the continual phases.
+        return SDMLPHead(args.nneurons, args.k, args.gaba_switch_activations, args.pretrain_lr,
+                         args.pretrain_momentum, args.grad_clip, device)
     raise ValueError(args.method)
 
 
@@ -531,17 +581,24 @@ def main():
     def to_t(X, y):
         return torch.from_numpy(X).float().to(head_device), torch.from_numpy(y).long().to(head_device)
 
-    train_sets = {}
+    train_sets, val_sets = {}, {}
     for name in GROUPS:
-        X, yc, yf = subsample_per_coarse_class(*enc[f"train_{name}"], args.coarse_classes, args.max_instances, rng)
+        # Validation hold-out first, so few-shot subsets are drawn from the remaining training images only
+        X_all, yc_all, yf_all = enc[f"train_{name}"]
+        holdout = Cifar100Dataset.get_validation_mask(yf_all, args.val_holdout, args.split_seed)
+        if holdout.any():
+            val_sets[name] = to_t(X_all[holdout], yc_all[holdout])
+        train_pool = (X_all[~holdout], yc_all[~holdout], yf_all[~holdout])
+        X, yc, yf = subsample_per_coarse_class(*train_pool, args.coarse_classes, args.max_instances, rng)
         if name == "12" and args.pretrain_all_instances:
             # The subsample above is still drawn and discarded, so the rng stream, and therefore the
             # few-shot subsets of fine-classes 3-5, are the same as without the flag for a given seed.
-            X, yc, yf = subsample_per_coarse_class(*enc[f"train_{name}"], args.coarse_classes, None, rng)
+            X, yc, yf = subsample_per_coarse_class(*train_pool, args.coarse_classes, None, rng)
         train_sets[name] = to_t(X, yc)
     test_sets = {name: to_t(enc[f"test_{name}"][0], enc[f"test_{name}"][1]) for name in GROUPS}
     for name in GROUPS:
-        logger.info(f"train {name}: {train_sets[name][0].shape[0]}  test {name}: {test_sets[name][0].shape[0]}")
+        n_val = val_sets[name][0].shape[0] if name in val_sets else 0
+        logger.info(f"train {name}: {train_sets[name][0].shape[0]}  val {name}: {n_val}  test {name}: {test_sets[name][0].shape[0]}")
 
     # Epoch count exactly as the reference LTM script (independent of batch size)
     instances_per_epoch = 500 if args.max_instances is None else args.max_instances
@@ -555,42 +612,57 @@ def main():
         n_pretrain_samples = args.pretrain_epochs * train_sets["12"][0].shape[0]
         args.gaba_switch_activations = max(1, n_pretrain_samples // 2)
         logger.info(f"SDMLP GABA switch activations (auto): {args.gaba_switch_activations}")
+        with open(os.path.join(run_path, "args.json"), "w") as f:
+            json.dump(vars(args), f, indent=4)  # again, now with the resolved threshold
     head = make_head(args, head_device)
 
     results_file = CifarResults(run_path=run_path, suffix=args.experiment_type)
     results_file.clear_file()
     results_pretrain = CifarResults(run_path=run_path, suffix="pretrain")
     results_pretrain.clear_file()
+    # Validation files mirror the test-set files (same format and epochs), so plot_comparison.py reads them with a
+    # glob on results_<type>_val.txt and takes the pre-continual baseline from results_pretrain_val.txt.
+    results_val = results_pretrain_val = None
+    if val_sets:
+        results_val = CifarResults(run_path=run_path, suffix=f"{args.experiment_type}_val")
+        results_val.clear_file()
+        results_pretrain_val = CifarResults(run_path=run_path, suffix="pretrain_val")
+        results_pretrain_val.clear_file()
     timings = []
 
-    def do_epoch(results, train_fine_classes: list[int], X, y, epoch: int, epoch_global: int, total_epochs: int):
+    def do_epoch(results, results_v, train_fine_classes: list[int], X, y, epoch: int, epoch_global: int,
+                 total_epochs: int):
         t = EpochTiming()
         t0 = time.time()
         train_acc = train_epoch(head, X, y, args.batch_size, rng)
         t.train_s = time.time() - t0
         print(f"Epoch {epoch + 1:3d}/{total_epochs} | train acc {train_acc:.3f} | {head.describe()}")
-        results.append_line(
-            coarse_classes=args.coarse_classes,
-            fine_classes=train_fine_classes,
-            mode=Instrumentation.MODE_TRAINING,
-            epoch=epoch,
-            accuracy=train_acc,
-        )
         t0 = time.time()
-        accs = {}
-        for name in EVALUATE_NAMES:
-            acc = evaluate(head, *test_sets[name])
-            accs[name] = acc
-            results.append_line(
+        accs, val_accs = {}, {}
+        for res, eval_sets, acc_out in ((results, test_sets, accs), (results_v, val_sets, val_accs)):
+            if res is None:
+                continue
+            res.append_line(
                 coarse_classes=args.coarse_classes,
-                fine_classes=[name],
-                mode=Instrumentation.MODE_EVALUATE,
-                epoch=epoch_global,
-                accuracy=acc,
+                fine_classes=train_fine_classes,
+                mode=Instrumentation.MODE_TRAINING,
+                epoch=epoch,
+                accuracy=train_acc,
             )
+            for name in EVALUATE_NAMES:
+                acc = evaluate(head, *eval_sets[name])
+                acc_out[name] = acc
+                res.append_line(
+                    coarse_classes=args.coarse_classes,
+                    fine_classes=[name],
+                    mode=Instrumentation.MODE_EVALUATE,
+                    epoch=epoch_global,
+                    accuracy=acc,
+                )
         t.eval_s = time.time() - t0
         print(f"Epoch {epoch + 1:3d}/{total_epochs} | " +
               " | ".join(f"eval. acc. {n}: {a:.3f}" for n, a in accs.items()) +
+              "".join(f" | val. acc. {n}: {a:.3f}" for n, a in val_accs.items()) +
               f" | train {t.train_s:.2f}s eval {t.eval_s:.2f}s")
         timings.append({"phase": train_fine_classes, "epoch": epoch, "train_s": t.train_s, "eval_s": t.eval_s})
         return accs
@@ -600,15 +672,17 @@ def main():
         logger.info(f"Pretraining head on fine-classes 1,2 for {args.pretrain_epochs} epochs")
         X, y = train_sets["12"]
         for epoch in range(args.pretrain_epochs):
-            do_epoch(results_pretrain, [1, 2], X, y, epoch, epoch, args.pretrain_epochs)
+            do_epoch(results_pretrain, results_pretrain_val, [1, 2], X, y, epoch, epoch, args.pretrain_epochs)
 
     # ---- continual phases -----------------------------------------------------------
+    if hasattr(head, "set_optimizer"):
+        head.set_optimizer(args.lr, args.momentum)
     epoch_global = 0
     for fine_class in args.fine_classes:
         logger.info(f"Training fine class {fine_class}")
         X, y = train_sets[str(fine_class)]
         for epoch in range(num_epochs):
-            do_epoch(results_file, [fine_class], X, y, epoch, epoch_global, num_epochs)
+            do_epoch(results_file, results_val, [fine_class], X, y, epoch, epoch_global, num_epochs)
             epoch_global += 1
 
     with open(os.path.join(run_path, "timings.json"), "w") as f:
