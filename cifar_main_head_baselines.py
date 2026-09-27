@@ -73,6 +73,10 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=None, help="Default: 16 (continual) or 1 (streaming).")
     p.add_argument("--max-instances", type=int, default=None,
                    help="Training instances per coarse class per phase (None = all 500, as the reference).")
+    p.add_argument("--pretrain-all-instances", action="store_true",
+                   help="Pre-train on all 500 instances of fine-classes 1,2 even when --max-instances is set, as the "
+                        "STM does (its pre-training is a separate run on the full set). Without it --max-instances "
+                        "also subsamples the pre-training set, which the runs_fewshot_heads/ results did.")
     p.add_argument("--fine-classes", type=int, nargs="+", default=[3, 4, 5],
                    help="Sequence of fine-class phases, e.g. 3 4 5 (continual) or a single class (streaming).")
     p.add_argument("--coarse-classes", type=int, nargs="+", default=[0, 1])
@@ -530,6 +534,10 @@ def main():
     train_sets = {}
     for name in GROUPS:
         X, yc, yf = subsample_per_coarse_class(*enc[f"train_{name}"], args.coarse_classes, args.max_instances, rng)
+        if name == "12" and args.pretrain_all_instances:
+            # The subsample above is still drawn and discarded, so the rng stream, and therefore the
+            # few-shot subsets of fine-classes 3-5, are the same as without the flag for a given seed.
+            X, yc, yf = subsample_per_coarse_class(*enc[f"train_{name}"], args.coarse_classes, None, rng)
         train_sets[name] = to_t(X, yc)
     test_sets = {name: to_t(enc[f"test_{name}"][0], enc[f"test_{name}"][1]) for name in GROUPS}
     for name in GROUPS:
