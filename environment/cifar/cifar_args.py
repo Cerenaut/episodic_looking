@@ -163,6 +163,25 @@ class CifarArgs:
             default=0,
             help="Seed of the validation split (not the run seed).",
         )
+        parser.add_argument(
+            "--eval-batch-size",
+            type=int,
+            default=None,
+            help="STM: parallel environments in evaluation, independent of --batch-size (separate environments). "
+                 "Default None = --batch-size, sharing the training environments as before.",
+        )
+        parser.add_argument(
+            "--eval-sweep",
+            action="store_true",
+            help="STM: evaluate with one deterministic pass over every image of each test and validation set (one "
+                 "8-step episode per image), instead of --evaluate-steps steps on images drawn with replacement.",
+        )
+        parser.add_argument(
+            "--eval-record-images",
+            action="store_true",
+            help="STM, with --eval-sweep: also write each image's result (1/0, in dataset order) per evaluation to "
+                 "results_<type>_images.txt.",
+        )
 
         args = parser.parse_args()
         logger.info("Parse args:")

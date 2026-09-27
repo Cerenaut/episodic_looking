@@ -42,6 +42,7 @@ class AgentState:
 @dataclass
 class EpisodicAgentConfig(InstrumentationConfig):
     batch_size: int = 0
+    evaluate_batch_size: int = 0  # environments in evaluate mode; 0 = batch_size, sharing the training environments
     history_size: int = 0
     action_size: int = 0
     observation_size: int = 0
@@ -68,30 +69,58 @@ class EpisodicAgent:
         self.config = config
         self.state = None
 
-        observation_history_config = ObservationHistoryConfig(
-            batch_size= self.config.batch_size,
-            history_size= self.config.history_size,
-            observation_size = self.config.observation_size,
-        )
-        self.observation_history = ObservationHistory(
-            config = observation_history_config,
-            device = self.device,
-        )
+        # Environments and observation history per mode. Evaluation gets its own, at its own batch size, only when
+        # evaluate_batch_size differs from batch_size; otherwise both modes share one set, as before.
+        self.batch_size = self.config.batch_size  # of the current mode
+        self.observation_history = self.create_observation_history(self.config.batch_size)
 
         self.instrumentation = Instrumentation(self.config)
         self.instrumentation.write_config(self.config)
 
         logger.info("Creating environments...")
         self.envs = self.create_environments()
+        self.envs_training = self.envs
+        self.observation_history_training = self.observation_history
+        self.envs_evaluate = self.envs
+        self.observation_history_evaluate = self.observation_history
+        evaluate_batch_size = self.get_batch_size(Instrumentation.MODE_EVALUATE)
+        if evaluate_batch_size != self.config.batch_size:
+            logger.info(f"Creating {evaluate_batch_size} evaluation environments...")
+            self.envs_evaluate = self.create_environments(evaluate_batch_size)
+            self.observation_history_evaluate = self.create_observation_history(evaluate_batch_size)
 
         logger.info("Creating models...")
         self.model_create()
 
         logger.info("Agent init complete.")
 
-    def create_environments(self) -> gym.vector.VectorEnv:
+    def create_observation_history(self, batch_size:int) -> ObservationHistory:
+        observation_history_config = ObservationHistoryConfig(
+            batch_size= batch_size,
+            history_size= self.config.history_size,
+            observation_size = self.config.observation_size,
+        )
+        return ObservationHistory(
+            config = observation_history_config,
+            device = self.device,
+        )
+
+    def get_batch_size(self, mode:str) -> int:
+        if mode == Instrumentation.MODE_EVALUATE and self.config.evaluate_batch_size > 0:
+            return self.config.evaluate_batch_size
+        return self.config.batch_size
+
+    def get_envs(self, mode:str) -> gym.vector.VectorEnv:
+        """The environments used in this mode (the same object for both modes unless evaluate_batch_size is set)."""
+        if mode == Instrumentation.MODE_EVALUATE:
+            return self.envs_evaluate
+        return self.envs_training
+
+    def create_environments(self, batch_size:int|None = None) -> gym.vector.VectorEnv:
         # Agent step() assumes https://farama.org/Vector-Autoreset-Mode SAME_STEP
         # i.e. resets in same step, final obs available in infos.
+        if batch_size is None:
+            batch_size = self.config.batch_size
         max_episode_steps = self.config.max_episode_steps
         environment_id = self.config.environment_id
         def make_env():
@@ -106,18 +135,24 @@ class EpisodicAgent:
 
         if self.config.async_env:
             envs = gym.vector.AsyncVectorEnv(
-                [make_env for _ in range(self.config.batch_size)],
+                [make_env for _ in range(batch_size)],
                 autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,  # Force legacy behavior to allow every step to train without mask
             )
         else:
             envs = gym.vector.SyncVectorEnv(
-                [make_env for _ in range(self.config.batch_size)],
+                [make_env for _ in range(batch_size)],
                 autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,  # Force legacy behavior to allow every step to train without mask
             )
         return envs
 
     def set_mode(self, mode:str):
         self.instrumentation.set_mode(mode)
+        self.envs = self.get_envs(mode)
+        if mode == Instrumentation.MODE_EVALUATE:
+            self.observation_history = self.observation_history_evaluate
+        else:
+            self.observation_history = self.observation_history_training
+        self.batch_size = self.get_batch_size(mode)
         self.reset()  # inc. reset envs
 
     def reset(self):
@@ -205,7 +240,7 @@ class EpisodicAgent:
     def actions_to_tensor(self, actions: np.ndarray|None) -> torch.Tensor:
         if actions is None:
             return torch.zeros(
-                (self.config.batch_size, self.config.action_size), 
+                (self.batch_size, self.config.action_size), 
                 dtype=torch.float,
                 device=self.device, 
             )

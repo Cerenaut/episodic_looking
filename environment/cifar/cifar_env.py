@@ -26,10 +26,29 @@ class CifarEnvConfig:
     exclude_classes_fine_evaluate:set[int]|None = field(default_factory=None)
     max_instances_training:int|None = None
     max_instances_evaluate:int|None = None
-    # Extra Cifar100Dataset options per mode (validation split; "training" to read the training file in evaluate
-    # mode, for the validation set). They must match those of the dataset that created the shared memory.
+    # Extra Cifar100Dataset options per mode (validation split, seeded subset; "training" to read the training file in
+    # evaluate mode, for the validation set). They must match those of the dataset that created the shared memory.
     dataset_options_training:dict|None = None
     dataset_options_evaluate:dict|None = None
+
+
+class EvaluationSweep:
+    """
+    One pass over every image of the evaluation dataset, shared by all environments of a synchronous vector env:
+    each environment takes the next image at every reset. Once all are taken, resets are padding episodes (image 0,
+    flagged in the info) that the agent does not score.
+    """
+
+    def __init__(self, num_images:int):
+        self.num_images = num_images
+        self.next_index = 0
+
+    def take(self) -> int|None:
+        if self.next_index >= self.num_images:
+            return None
+        index = self.next_index
+        self.next_index += 1
+        return index
 
 
 class CifarEnv(gym.Env):
@@ -62,6 +81,8 @@ class CifarEnv(gym.Env):
         self.image_index = None  # Set on reset()
         self.state_dict = None  # Set on reset()
         self.obs_cache = None
+        self.image_sweep = None  # EvaluationSweep, or None for random images
+        self.padding = False  # this episode is sweep padding, not to be scored
 
         observation_space_dict = {}
         self._add_observation_spaces(observation_space_dict)
@@ -98,6 +119,15 @@ class CifarEnv(gym.Env):
             max_instances=max_instances,
             dataset_options=dataset_options,
         )
+
+    @staticmethod
+    def set_image_sweep_for_envs(envs, image_sweep:EvaluationSweep|None):
+        if not isinstance(envs, gym.vector.SyncVectorEnv):
+            raise ValueError("An image sweep is shared by the environments, so they must be synchronous")
+        envs.call("set_image_sweep", image_sweep=image_sweep)
+
+    def set_image_sweep(self, image_sweep:EvaluationSweep|None):
+        self.image_sweep = image_sweep
 
     def set_dataset_config(
         self,
@@ -222,7 +252,13 @@ class CifarEnv(gym.Env):
         self.image_index = image_index
 
     def set_random_image(self):
-        # Pick an image randomly. 
+        # Pick an image randomly, or the sweep's next image.
+        if self.image_sweep is not None:
+            index = self.image_sweep.take()
+            self.padding = index is None
+            self.image_index = 0 if index is None else index
+            return
+        self.padding = False
         num_images = self.get_num_images()
         self.image_index = np.random.randint(0, num_images)
     
@@ -274,6 +310,7 @@ class CifarEnv(gym.Env):
                 "index": self.image_index,
                 "class": state_dict["class"],
             },
+            "padding": self.padding,
         }
 
     def _get_obs(self) -> dict:
