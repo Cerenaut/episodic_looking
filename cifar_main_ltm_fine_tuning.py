@@ -43,6 +43,8 @@ def main():
     COARSE_CLASSES = cifar_args.coarse_classes
     LEARNING_RATE = cifar_args.learning_rate
     VAL_HOLDOUT = cifar_args.val_holdout
+    LOADER_WORKERS = cifar_args.loader_workers
+    EVALUATE_INTERVAL_EPOCHS = cifar_args.evaluate_epochs  # evaluate at epoch % k == 0 and the last epoch of a phase
 
     logger.info(f"Exp.:{EXPERIMENT_TYPE} Fine classes:{FINE_CLASSES} Batch size:{BATCH_SIZE} max. instances:{MAX_INSTANCES} LR: {LEARNING_RATE} Seed: {SEED}")
 
@@ -201,7 +203,7 @@ def main():
         dataset_training_3,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=2,
+        num_workers=LOADER_WORKERS,
         pin_memory=pin_memory,
         generator=sampler_generator(3),
     )
@@ -209,7 +211,7 @@ def main():
         dataset_training_4,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=2,
+        num_workers=LOADER_WORKERS,
         pin_memory=pin_memory,
         generator=sampler_generator(4),
     )
@@ -217,7 +219,7 @@ def main():
         dataset_training_5,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=2,
+        num_workers=LOADER_WORKERS,
         pin_memory=pin_memory,
         generator=sampler_generator(5),
     )
@@ -226,28 +228,28 @@ def main():
         dataset_evaluate_12,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=2,
+        num_workers=LOADER_WORKERS,
         pin_memory=pin_memory,
     )
     loader_evaluate_3 = DataLoader(
         dataset_evaluate_3,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=2,
+        num_workers=LOADER_WORKERS,
         pin_memory=pin_memory,
     )
     loader_evaluate_4 = DataLoader(
         dataset_evaluate_4,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=2,
+        num_workers=LOADER_WORKERS,
         pin_memory=pin_memory,
     )
     loader_evaluate_5 = DataLoader(
         dataset_evaluate_5,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=2,
+        num_workers=LOADER_WORKERS,
         pin_memory=pin_memory,
     )
 
@@ -269,7 +271,7 @@ def main():
                 dataset_validation,
                 batch_size=BATCH_SIZE,
                 shuffle=False,
-                num_workers=2,
+                num_workers=LOADER_WORKERS,
                 pin_memory=pin_memory,
             ))
         logger.info(f"Training set sizes: 3: {len(dataset_training_3)} 4: {len(dataset_training_4)} 5: {len(dataset_training_5)}; "
@@ -410,6 +412,8 @@ def main():
 
         evaluate_names = ["12","3","4","5"]
         evaluate_loaders = [loader_evaluate_12, loader_evaluate_3, loader_evaluate_4, loader_evaluate_5]
+        if EVALUATE_INTERVAL_EPOCHS > 1 and epoch % EVALUATE_INTERVAL_EPOCHS != 0 and epoch != NUM_EPOCHS - 1:
+            evaluate_loaders = []  # training line only; the metrics count epochs by training lines
         for i, evaluate_loader in enumerate(evaluate_loaders):
             metrics_evaluate = do_epoch_mode(
                 model,
@@ -440,7 +444,7 @@ def main():
                 accuracy = metrics_evaluate.mean_accuracy,            
             )
 
-        for i, validation_loader in enumerate(loaders_validation):
+        for i, validation_loader in enumerate(loaders_validation if evaluate_loaders else []):
             metrics_validation = do_epoch_mode(
                 model,
                 validation_loader,

@@ -28,8 +28,8 @@
 # The seed also selects the few-shot images, the same ones in every model for a given seed (C9). Use the same seed
 # numbers for every model.
 #
-# Overrides (environment): EPOCHS (per phase / per run), PRETRAIN_EPOCHS, LR, PRETRAIN_LR (STM), TRAINING_STEPS (STM), EVAL_EPOCHS (STM
-# evaluation interval), VAL_HOLDOUT, LTM=e13|e40, SAVE_STM=1 (keep STM checkpoints), EXTRA (appended to the script's arguments), PY, DRY=1 (print the
+# Overrides (environment): EPOCHS (per phase / per run), PRETRAIN_EPOCHS, LR, PRETRAIN_LR (STM), TRAINING_STEPS (STM), EVAL_EPOCHS
+# (evaluation interval, every model), VAL_HOLDOUT, LTM=e13|e40, SAVE_STM=1 (keep STM checkpoints), EXTRA (appended to the script's arguments), PY, DRY=1 (print the
 # command only), RUNS (default runs_v2).
 # Resumable: a finished unit has <unit>/job.done; the script refuses to run into an unfinished directory that already
 # holds results (move it to an archive first: results are never overwritten).
@@ -100,7 +100,8 @@ else
   STM_STREAM_LR="--learning-rate ${LR:-0.01}"
 fi
 HEAD_BASE="cifar_main_head_baselines.py --method $MODEL --coarse-classes $CC --seed $SEED $SPLIT --checkpoint $LTM_CKPT --run-path $UNIT_DIR"
-LTM_BASE="cifar_main_ltm_fine_tuning.py --coarse-classes $CC --seed $SEED $SPLIT --ltm-checkpoint $LTM_CKPT --learning-rate ${LR:-0.001}"
+# LTM-only loads in the main process: worker processes are re-spawned every epoch, 7x slower for short epochs, same result
+LTM_BASE="cifar_main_ltm_fine_tuning.py --coarse-classes $CC --seed $SEED $SPLIT --ltm-checkpoint $LTM_CKPT --learning-rate ${LR:-0.001} --loader-workers 0"
 # STM checkpoints after training (per phase in continual) only with SAVE_STM=1: ~44 MB each.
 save_stm() { [ "${SAVE_STM:-0}" = 1 ] && echo "--stm-checkpoint-out $1"; }
 
@@ -139,6 +140,8 @@ if [ "$KIND" = head ]; then
   [ -n "${LR:-}" ] && CMD="$CMD --lr $LR"
 fi
 if [ "$KIND" = ltm ] && [ "$SETTING" != baseline ] && [ -n "${EPOCHS:-}" ]; then CMD="$CMD --epochs $EPOCHS"; fi
+# Evaluation interval for the heads and LTM-only (every k-th epoch of a phase and its last); the STM's is above
+if [ "$KIND" != stm ] && [ "$SETTING" != baseline ] && [ -n "${EVAL_EPOCHS:-}" ]; then CMD="$CMD --evaluate-epochs $EVAL_EPOCHS"; fi
 if [ "$KIND" = stm ] && [ "$SETTING" != stream ]; then  # stream sets both in its command
   [ -n "${TRAINING_STEPS:-}" ] && CMD="$CMD --training-steps $TRAINING_STEPS"
   [ -n "${EVAL_EPOCHS:-}" ] && CMD="$CMD --evaluate-epochs $EVAL_EPOCHS"

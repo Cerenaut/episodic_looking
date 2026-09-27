@@ -34,6 +34,15 @@ class CifarArgs:
             "--evaluate-epochs",
             type=int,
             default=1,
+            help="Evaluate at every epoch whose index is a multiple of this, and at the last epoch (few-shot STM; every "
+                 "phase for LTM-only). 1 = every epoch. STM pre-training skips the last-epoch rule, as before.",
+        )
+        parser.add_argument(
+            "--loader-workers",
+            type=int,
+            default=2,
+            help="LTM-only: DataLoader worker processes. Workers are re-spawned every epoch (macOS), which dominates "
+                 "short epochs; 0 loads in the main process. The data order comes from the samplers, not the workers.",
         )
 
         parser.add_argument(

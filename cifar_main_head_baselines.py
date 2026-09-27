@@ -96,6 +96,10 @@ def parse_args():
     p.add_argument("--pretrain-epochs", type=int, default=12,
                    help="Epochs of head training on fine-classes 1,2 of the coarse pair before the continual phases "
                         "(mirrors the STM pretraining). 0 disables.")
+    p.add_argument("--evaluate-epochs", type=int, default=1,
+                   help="Continual phases: evaluate at every epoch whose index within the phase is a multiple of this, "
+                        "and at the phase's last epoch (as the STM and LTM-only scripts). Pre-training always "
+                        "evaluates every epoch. 1 = every epoch.")
     p.add_argument("--epochs", type=int, default=None,
                    help="Epochs per phase. Default: int(6250 / instances_per_epoch) = 12 at 500 instances, "
                         "exactly as cifar_main_ltm_fine_tuning.py (independent of batch size).")
@@ -650,7 +654,7 @@ def main():
     timings = []
 
     def do_epoch(results, results_v, train_fine_classes: list[int], X, y, epoch: int, epoch_global: int,
-                 total_epochs: int):
+                 total_epochs: int, evaluate_now: bool = True):
         t = EpochTiming()
         t0 = time.time()
         train_acc = train_epoch(head, X, y, args.batch_size, rng)
@@ -668,7 +672,7 @@ def main():
                 epoch=epoch,
                 accuracy=train_acc,
             )
-            for name in EVALUATE_NAMES:
+            for name in (EVALUATE_NAMES if evaluate_now else []):
                 acc = evaluate(head, *eval_sets[name])
                 acc_out[name] = acc
                 res.append_line(
@@ -701,7 +705,8 @@ def main():
         logger.info(f"Training fine class {fine_class}")
         X, y = train_sets[str(fine_class)]
         for epoch in range(num_epochs):
-            do_epoch(results_file, results_val, [fine_class], X, y, epoch, epoch_global, num_epochs)
+            evaluate_now = epoch % args.evaluate_epochs == 0 or epoch == num_epochs - 1
+            do_epoch(results_file, results_val, [fine_class], X, y, epoch, epoch_global, num_epochs, evaluate_now)
             epoch_global += 1
 
     with open(os.path.join(run_path, "timings.json"), "w") as f:
