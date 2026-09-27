@@ -1,6 +1,8 @@
 import logging
+import random
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -21,6 +23,18 @@ logger = logging.getLogger(__name__)
 def main():
     cifar_args = CifarArgs.parse_args()
 
+    SEED = cifar_args.seed
+    if SEED is not None:
+        # Model state is loaded from the checkpoint; the randomness is the training loaders' shuffles (seeded below
+        # through their own generators) and any other torch / numpy use.
+        random.seed(SEED)
+        np.random.seed(SEED)
+        torch.manual_seed(SEED)
+        if torch.backends.mps.is_available():
+            torch.mps.manual_seed(SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(SEED)
+
     EXPERIMENT_TYPE = cifar_args.experiment_type
     BATCH_SIZE = cifar_args.batch_size
     #SPARSITY = cifar_args.sparsity
@@ -30,7 +44,7 @@ def main():
     LEARNING_RATE = cifar_args.learning_rate
     VAL_HOLDOUT = cifar_args.val_holdout
 
-    logger.info(f"Exp.:{EXPERIMENT_TYPE} Fine classes:{FINE_CLASSES} Batch size:{BATCH_SIZE} max. instances:{MAX_INSTANCES} LR: {LEARNING_RATE}")
+    logger.info(f"Exp.:{EXPERIMENT_TYPE} Fine classes:{FINE_CLASSES} Batch size:{BATCH_SIZE} max. instances:{MAX_INSTANCES} LR: {LEARNING_RATE} Seed: {SEED}")
 
     CIFAR_DATA_FILE_PATH = "../cifar-100-python"
     CLASSIFIER_FILE_PATH = "../cifar_100_pretrain/cifar_100_subclasses_12_e11_31.1.pth"
@@ -162,12 +176,21 @@ def main():
     )
 
     pin_memory = True
+
+    def sampler_generator(fine_class:int):
+        # Each training loader shuffles with its own generator when seeded, so its order does not depend on other
+        # torch random use. None = the global generator, as before.
+        if SEED is None:
+            return None
+        return torch.Generator().manual_seed(SEED * 10 + fine_class)
+
     loader_training_3 = DataLoader(
         dataset_training_3,
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=2,
         pin_memory=pin_memory,
+        generator=sampler_generator(3),
     )
     loader_training_4 = DataLoader(
         dataset_training_4,
@@ -175,6 +198,7 @@ def main():
         shuffle=True,
         num_workers=2,
         pin_memory=pin_memory,
+        generator=sampler_generator(4),
     )
     loader_training_5 = DataLoader(
         dataset_training_5,
@@ -182,6 +206,7 @@ def main():
         shuffle=True,
         num_workers=2,
         pin_memory=pin_memory,
+        generator=sampler_generator(5),
     )
 
     loader_evaluate_12 = DataLoader(
