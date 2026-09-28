@@ -313,18 +313,23 @@ def table_e40(runs, part, fmt_kind):
 
 
 # --------------------------------------------------------------------------------------
-SMOOTH_POINTS = 3      # running mean over this many evaluations (centred) before the rule is applied
+SMOOTH_POINTS = 3      # centred running mean over this many evaluations (truncated at the ends) before the rule
 MIN_DELTA = 0.01       # an improvement must exceed the best so far by more than this; also the budget tolerance
 PATIENCE = 0.5         # plateaued once the run has gone this fraction longer than the epoch of its last improvement
+TIE = 0.03             # learning rates within this of the best are tied (about one standard error of a 200-image set)
+SELECTION_CLASSES = (3, 4, 5)   # single-stream and few-shot selection average fine classes 3, 4 and 5
+GRID_EXTENSION_MARK = "grid_extension"  # file in a tree created by a grid-edge step (only one step is taken)
 
 
 def selection_rule(curve: pd.Series) -> dict:
     """
     The protocol's budget rule on one validation curve (index = epoch, 1-based):
-      smooth (centred running mean of SMOOTH_POINTS evaluations);
+      smooth (centred running mean of SMOOTH_POINTS evaluations, truncated at the ends);
       last improvement = last epoch at which the smoothed value beat the best so far by more than MIN_DELTA;
       plateaued if the run is at least (1 + PATIENCE) x that epoch long; otherwise extend (the run is doubled);
-      budget = smallest epoch whose smoothed value is within MIN_DELTA of the best smoothed value.
+      budget = smallest epoch whose smoothed value is within MIN_DELTA of the best smoothed value;
+      unresolved if that is the first evaluation and the next one is more than one epoch later (the peak may lie
+      between them).
     """
     smooth = curve.rolling(SMOOTH_POINTS, center=True, min_periods=1).mean()
     best, last_improvement = -np.inf, int(smooth.index[0])
@@ -334,36 +339,48 @@ def selection_rule(curve: pd.Series) -> dict:
     top = smooth.max()
     budget = int(smooth.index[np.argmax(smooth.to_numpy() >= top - MIN_DELTA)])
     length = int(smooth.index[-1])
+    unresolved = budget == int(smooth.index[0]) and len(smooth) > 1 and int(smooth.index[1]) - budget > 1
     plateaued = length >= (1 + PATIENCE) * last_improvement
     return {"budget": budget, "value": float(smooth.loc[budget]), "best": float(top),
-            "last_improvement": last_improvement, "length": length, "plateaued": plateaued,
-            "extend_to": None if plateaued else 2 * length}
+            "last_improvement": last_improvement, "length": length, "plateaued": plateaued, "unresolved": unresolved}
 
 
-def validation_curve(runs, model, setting, units, pair) -> pd.Series | None:
-    """Mean validation curve of the trained class (fine 3-5 only) over seeds, classes, orders and phases."""
-    curves = []
-    for seed, seed_dir in seeds_of(os.path.join(runs, setting, model, pair)):
-        for u in units:
-            unit = os.path.join(seed_dir, u)
-            if not finished(unit):
-                continue
-            f = one_file(unit, "val")
+def selection_units(setting: str, n: int | None) -> list[str]:
+    if setting == "continual":
+        return ["order" + "_".join(map(str, o)) for o in ORDERS]
+    if setting == "stream":
+        return [f"fine{c}" for c in SELECTION_CLASSES]
+    return [f"fine{c}_n{n}" for c in SELECTION_CLASSES]
+
+
+def validation_curve(runs, model, setting, n, pair) -> pd.Series | None:
+    """
+    Selection curve on the validation split, from every unit of the setting (None unless all have finished, or with
+    --partial any): continual, the accuracy over the fine classes 3-5 seen so far, by epoch within the phase, averaged
+    over phases and orders; single-stream and few-shot, the accuracy on the trained class, averaged over fine classes
+    3, 4, 5. Only epochs evaluated in every unit are kept, so units with different evaluation schedules are not mixed.
+    """
+    curves, missing = [], 0
+    for seed, seed_dir in seeds_of(os.path.join(runs, setting, model, pair)) or [(1, None)]:
+        for u in selection_units(setting, n):
+            unit = None if seed_dir is None else os.path.join(seed_dir, u)
+            f = one_file(unit, "val") if unit and finished(unit) else None
             piv = load_run_pivot(f) if f else None
             if piv is None:
+                missing += 1
                 continue
             if setting == "continual":
-                # within each phase, the class that phase trains, by epoch within the phase
                 order = [int(x) for x in u[len("order"):].split("_")]
-                per = len(piv.index) // 3
-                for t, c in enumerate(order):
-                    seg = piv[str(c)].iloc[t * per:(t + 1) * per].to_numpy()
-                    curves.append(pd.Series(seg, index=range(1, per + 1)))
+                per = int(piv.index.max()) // 3  # epochs per phase (the last epoch of every phase is evaluated)
+                for t in range(3):
+                    rows = piv[(piv.index > t * per) & (piv.index <= (t + 1) * per)]
+                    seen = [str(c) for c in order[:t + 1]]
+                    curves.append(pd.Series(rows[seen].mean(axis=1).to_numpy(), index=rows.index - t * per))
             else:
                 curves.append(piv[u[len("fine"):].split("_")[0]].dropna())
-    if not curves:
+    if not curves or (missing and not PARTIAL):
         return None
-    return pd.concat(curves, axis=1).mean(axis=1).dropna()
+    return pd.concat(curves, axis=1).dropna().mean(axis=1)
 
 
 def draft_budget(model: str, setting: str, n: int | None) -> int:
@@ -390,91 +407,113 @@ def fmt_lr(lr: float) -> str:
     return f"{lr:g}"
 
 
+def choose_learning_rate(candidates: list[dict]) -> dict:
+    """
+    candidates: dicts with tree, lr (None for models without one), value, extension (a grid-edge tree).
+    Returns {"tree": chosen} or {"extend": new_lr, "from": tree}. Learning rates within TIE of the best are tied, and
+    among tied ones the interior of the grid is preferred. The grid is extended one step only when the best is at an
+    edge and beats its inner neighbour by more than TIE, and the edge is not itself an extension.
+    """
+    best = max(candidates, key=lambda c: c["value"])
+    with_lr = sorted((c for c in candidates if c["lr"] is not None), key=lambda c: c["lr"])
+    if len(with_lr) < 2 or best["lr"] is None:
+        return {"tree": best["tree"]}
+    lrs = [c["lr"] for c in with_lr]
+    k = lrs.index(best["lr"])
+    if k in (0, len(lrs) - 1):
+        inner = with_lr[1] if k == 0 else with_lr[-2]
+        if best["value"] - inner["value"] > TIE and not best["extension"]:
+            ratio = inner["lr"] / best["lr"] if k == 0 else best["lr"] / inner["lr"]
+            new_lr = best["lr"] / ratio if k == 0 else best["lr"] * ratio
+            return {"extend": float(f"{new_lr:.3g}"), "from": best["tree"]}
+    tied = [c for c in with_lr if c["value"] >= best["value"] - TIE]
+    interior = [c for c in tied if c["lr"] not in (lrs[0], lrs[-1])]
+    return {"tree": max(interior or tied, key=lambda c: c["value"])["tree"]}
+
+
 def plateau(runs_list, fmt_kind, pair="pair0_1", ns=FEWSHOT_N, actions_path=None, latex_path=None):
     """
     Hyperparameter selection (results_v2.tex, Setup), per model and setting, over the trees given (one per learning
-    rate, named <model>_lr<x>): the rule on each tree's validation curve; runs that have not plateaued are to be
-    extended (doubled, up to the cap); once all have plateaued, the learning rate with the highest smoothed value at its
-    budget is kept, unless it is the smallest or largest tried, in which case the grid is extended one step (the
-    grid's own ratio) in that direction. Continual: the curve is the class being trained within each phase, so the
-    choice is to be confirmed by a run at the selected budget (validation ACC_new).
-    actions_path: write the runs still needed, one per line: tree path|environment|run_v2.sh arguments|unit directory.
-    latex_path: write the selection as rows of results_v2.tex's selection table.
+    rate, named <model>_lr<x>; a tree holding the file 'grid_extension' is a grid-edge step): the rule on each tree's
+    selection curve; runs that have not plateaued are extended (doubled, up to the cap), unresolved ones re-run with
+    log-spaced evaluation; once every learning rate of the grid has a settled curve, choose_learning_rate decides.
+    Continual choices are to be confirmed by a run at the selected budget.
+    actions_path: the runs still needed, one per line: tree path|environment|run_v2.sh arguments|unit dir|flag
+    (flag 'grid_extension' for a new grid-edge tree). latex_path: rows of results_v2.tex's selection table.
     """
     lines = [f"% hyperparameter selection on validation (fine 3-5), {pair}: model & setting & tree & budget & value at "
              f"budget & best & last improvement & length & status"]
-    settings = [("continual", None, ["order" + "_".join(map(str, o)) for o in ORDERS]), ("stream", None, ["fine3"])]
-    settings += [("fewshot", n, [f"fine3_n{n}"]) for n in ns]
+    settings = [("continual", None), ("stream", None)] + [("fewshot", n) for n in ns]
     cc = pair[len("pair"):].replace("_", " ")
     actions, choices, cells = [], [], {}
 
-    def unit_args(setting, n, tree_path, model):
-        """[(run_v2.sh arguments, unit directory)] for one setting of the selection run (seed 1, fine class 3)."""
+    def unit_actions(tree_path, model, setting, n, epochs, lr, flag=""):
+        env = f"EPOCHS={epochs}" + (" EVAL_POINTS=96" if setting == "fewshot" else "")
+        env += f" LR={fmt_lr(lr)}" if lr is not None else ""
         base = os.path.join(tree_path, setting, model, pair, "seed1")
-        if setting == "continual":
-            return [(f"continual {model} \"{cc}\" 1 \"{' '.join(u[len('order'):].split('_'))}\"", os.path.join(base, u))
-                    for u in settings[0][2]]
-        if setting == "stream":
-            return [(f"stream {model} \"{cc}\" 1 3", os.path.join(base, "fine3"))]
-        return [(f"fewshot {model} \"{cc}\" 1 3 {n}", os.path.join(base, f"fine3_n{n}"))]
-
-    def env(setting, n, epochs, lr):
-        e = f"EPOCHS={epochs}"
-        if setting == "fewshot":
-            e += " EVAL_POINTS=96"
-        return e + (f" LR={fmt_lr(lr)}" if lr is not None else "")
+        for u in selection_units(setting, n):
+            if setting == "continual":
+                args = f"continual {model} \"{cc}\" 1 \"{' '.join(u[len('order'):].split('_'))}\""
+            elif setting == "stream":
+                args = f"stream {model} \"{cc}\" 1 {u[len('fine'):]}"
+            else:
+                args = f"fewshot {model} \"{cc}\" 1 {u[len('fine'):].split('_')[0]} {n}"
+            actions.append(f"{tree_path}|{env}|{args}|{os.path.join(base, u)}|{flag}")
 
     for model, label in MODELS:
-        for setting, n, units in settings:
+        trees = [r for r in runs_list
+                 if os.path.basename(os.path.normpath(r)) == model or os.path.basename(os.path.normpath(r)).startswith(model + "_lr")]
+        for setting, n in settings:
             setting_label = setting if n is None else f"fewshot N={n}"
-            candidates = []
-            for runs in runs_list:
+            candidates, incomplete = [], False
+            for runs in trees:
                 tree = os.path.basename(os.path.normpath(runs))
-                if not (tree == model or tree.startswith(model + "_")):
-                    continue
-                curve = validation_curve(runs, model, setting, units, pair)
+                extension = os.path.exists(os.path.join(runs, GRID_EXTENSION_MARK))
+                curve = validation_curve(runs, model, setting, n, pair)
                 if curve is None:
+                    if not extension:  # a grid-edge tree only runs the settings it was needed for
+                        incomplete = True
                     continue
                 r = selection_rule(curve)
                 limit = cap(model, setting, n)
                 r["at_cap"] = not r["plateaued"] and r["length"] >= limit
-                candidates.append((tree, r, runs))
-                if r["plateaued"]:
+                if r["unresolved"]:
+                    status = "UNRESOLVED: peak at the first evaluation, re-run with log-spaced evaluation"
+                    unit_actions(runs, model, setting, n, r["length"], tree_lr(tree))
+                elif r["plateaued"]:
                     status = "plateaued"
                 elif r["at_cap"]:
                     status = "NOT PLATEAUED at the cap"
                 else:
-                    target = min(2 * r["length"], limit)
-                    status = f"extend to {target}"
-                    for a, u in unit_args(setting, n, runs, model):
-                        actions.append(f"{runs}|{env(setting, n, target, tree_lr(tree))}|{a}|{u}")
+                    status = f"extend to {min(2 * r['length'], limit)}"
+                    unit_actions(runs, model, setting, n, min(2 * r["length"], limit), tree_lr(tree))
+                settled = (r["plateaued"] or r["at_cap"]) and not r["unresolved"]
+                candidates.append({"tree": tree, "path": runs, "lr": tree_lr(tree), "value": r["value"],
+                                   "extension": extension, "settled": settled, "r": r})
                 cells[(tree, setting_label)] = r
                 lines.append(emit([label, setting_label, tree, str(r["budget"]), f"{r['value']:.3f}", f"{r['best']:.3f}",
                                    str(r["last_improvement"]), str(r["length"]), status], fmt_kind))
             if not candidates:
                 continue
-            settled = [c for c in candidates if c[1]["plateaued"] or c[1]["at_cap"]]
-            paths = {c[0]: c[2] for c in candidates}
-            if len(settled) < len(candidates):
-                choices.append(emit([label, setting_label, "undecided: runs to extend", "-", "-"], fmt_kind))
+            if incomplete or not all(c["settled"] for c in candidates):
+                why = "runs missing" if incomplete else "runs to extend or re-run"
+                choices.append(emit([label, setting_label, f"undecided: {why}", "-", "-"], fmt_kind))
                 continue
-            tree, r, _ = max(settled, key=lambda c: c[1]["value"])
-            lrs = sorted(x for x in (tree_lr(c[0]) for c in candidates) if x is not None)
-            lr = tree_lr(tree)
-            if lr is not None and len(lrs) >= 2 and lr in (lrs[0], lrs[-1]):
-                ratio = lrs[1] / lrs[0] if lr == lrs[0] else lrs[-1] / lrs[-2]
-                new_lr = float(f"{(lr / ratio if lr == lrs[0] else lr * ratio):.3g}")
-                new_tree = f"{model}_lr{fmt_lr(new_lr)}"
-                choices.append(emit([label, setting_label, f"grid edge ({tree}): try {new_tree}", "-", "-"], fmt_kind))
-                new_path = os.path.join(os.path.dirname(os.path.normpath(paths[tree])), new_tree)
-                for a, u in unit_args(setting, n, new_path, model):
-                    actions.append(f"{new_path}|{env(setting, n, r['length'], new_lr)}|{a}|{u}")
-                cells[("choice", model, setting_label)] = ("edge", tree)
+            decision = choose_learning_rate(candidates)
+            if "extend" in decision:
+                src = next(c for c in candidates if c["tree"] == decision["from"])
+                new_tree = f"{model}_lr{fmt_lr(decision['extend'])}"
+                new_path = os.path.join(os.path.dirname(os.path.normpath(src["path"])), new_tree)
+                unit_actions(new_path, model, setting, n, src["r"]["length"], decision["extend"], GRID_EXTENSION_MARK)
+                choices.append(emit([label, setting_label, f"grid edge ({src['tree']}): run {new_tree}", "-", "-"], fmt_kind))
+                cells[("choice", model, setting_label)] = ("edge", src["tree"])
                 continue
-            note = " (confirm at the budget: validation ACC_new)" if setting == "continual" else ""
-            note += " (NOT PLATEAUED: at the cap)" if r["at_cap"] else ""
-            choices.append(emit([label, setting_label, tree + note, str(r["budget"]), f"{r['value']:.3f}"], fmt_kind))
-            cells[("choice", model, setting_label)] = ("chosen", tree)
+            c = next(c for c in candidates if c["tree"] == decision["tree"])
+            note = " (confirm at the budget)" if setting == "continual" else ""
+            note += " (NOT PLATEAUED: at the cap)" if c["r"]["at_cap"] else ""
+            note += " (at the extended edge of the grid)" if c["extension"] else ""
+            choices.append(emit([label, setting_label, c["tree"] + note, str(c["r"]["budget"]), f"{c['value']:.3f}"], fmt_kind))
+            cells[("choice", model, setting_label)] = ("chosen", c["tree"])
     lines += ["", "% selection: model & setting & tree (learning rate) & budget & value"] + choices
     if actions_path:
         with open(actions_path, "w") as f:
@@ -486,7 +525,11 @@ def plateau(runs_list, fmt_kind, pair="pair0_1", ns=FEWSHOT_N, actions_path=None
 
 
 def write_selection_latex(path, runs_list, cells, ns):
-    """Rows for results_v2.tex: one per model and learning rate; each cell budget (smoothed validation value)."""
+    """
+    Rows for results_v2.tex: one per model and learning rate; each cell 'budget (smoothed validation value)'.
+    Bold: chosen. Marks: $^\dagger$ to be extended, $^\S$ not plateaued at the cap, $^?$ unresolved,
+    $^\ddagger$ the grid is extended from here.
+    """
     labels = dict(MODELS)
     cols = ["continual", "stream"] + [f"fewshot N={n}" for n in ns]
     rows = []
@@ -501,7 +544,11 @@ def write_selection_latex(path, runs_list, cells, ns):
                 out.append("\\pending")
                 continue
             cell = f"{r['budget']} ({r['value']:.3f})"
-            if not r["plateaued"]:
+            if r["unresolved"]:
+                cell += "$^?$"
+            elif r["at_cap"]:
+                cell += "$^\\S$"
+            elif not r["plateaued"]:
                 cell += "$^\\dagger$"
             choice = cells.get(("choice", model, c))
             if choice and choice[1] == tree:
