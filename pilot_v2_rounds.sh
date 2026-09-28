@@ -8,7 +8,7 @@
 #             plateaued, doubled up to the cap; unresolved ones re-run with log-spaced evaluation; one grid step where
 #             an edge learning rate clearly wins. Repeat until nothing is left (at most MAX_ROUNDS).
 # A unit that is re-run is first moved to runs_v2_pilot_archive/<round>/ (never deleted or overwritten; a second copy
-# gets a numbered name). Heads and LTM-only run in two parallel lanes. Waits for pilot_v2_m3.sh to exit, then restores
+# gets a numbered name). The heads run in one lane and each LTM-only learning rate in a parallel lane of its own. Waits for pilot_v2_m3.sh to exit, then restores
 # run_v2.sh to the committed version (the pilot ran an older copy: a running bash script must not be edited) and
 # refuses to continue if that version lacks EVAL_POINTS. Continual confirmation runs are not part of this script.
 # Relaunching is safe: round 1b is skipped once done, and later rounds are recomputed from the runs.
@@ -37,11 +37,11 @@ archive() {  # unit dir, round label -> moves it under $ARCHIVE/<round>/, never 
   mkdir -p "$(dirname "$dest")" && mv "$unit" "$dest" && step "archived $unit -> $dest"
 }
 
-run_actions() {  # actions file, round label, lane (ltm | heads)
+run_actions() {  # actions file, round label, lane (heads, or the name of one LTM-only tree)
   local file=$1 round=$2 lane=$3 tree env args unit flag
   while IFS='|' read -r tree env args unit flag; do
     [ -z "$tree" ] && continue
-    case "$(basename "$tree")" in ltm*) [ "$lane" = ltm ] || continue ;; *) [ "$lane" = heads ] || continue ;; esac
+    case "$(basename "$tree")" in ltm*) [ "$lane" = "$(basename "$tree")" ] || continue ;; *) [ "$lane" = heads ] || continue ;; esac
     if [ -d "$unit" ] && ! archive "$unit" "$round"; then
       step "FAILED $round $(basename "$tree"): could not archive $unit, not re-run"; continue
     fi
@@ -58,8 +58,13 @@ run_actions() {  # actions file, round label, lane (ltm | heads)
   done < "$file"
 }
 
-run_round() {  # actions file, round label
-  run_actions "$1" "$2" heads & run_actions "$1" "$2" ltm & wait
+run_round() {  # actions file, round label: the heads in one lane, each LTM-only learning rate in a lane of its own
+  local t
+  run_actions "$1" "$2" heads &
+  for t in $(cut -d'|' -f1 "$1" | sort -u); do
+    case "$(basename "$t")" in ltm*) run_actions "$1" "$2" "$(basename "$t")" & ;; esac
+  done
+  wait
 }
 
 trees() { find "$ROOT" -mindepth 1 -maxdepth 1 -type d | sort; }
