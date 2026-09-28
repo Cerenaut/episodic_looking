@@ -313,39 +313,96 @@ def table_e40(runs, part, fmt_kind):
 
 
 # --------------------------------------------------------------------------------------
-def plateau(runs, fmt_kind, pair="pair0_1", ns=FEWSHOT_N):
-    """Validation curves of the trained class and the protocol's budget: smallest epoch within 0.01 of the max."""
-    lines = [f"% plateau rule on validation (fine 3-5 only), {pair}: model & setting & budget (epochs) & max & curve"]
+SMOOTH_POINTS = 3      # running mean over this many evaluations (centred) before the rule is applied
+MIN_DELTA = 0.01       # an improvement must exceed the best so far by more than this; also the budget tolerance
+PATIENCE = 0.5         # plateaued once the run has gone this fraction longer than the epoch of its last improvement
+
+
+def selection_rule(curve: pd.Series) -> dict:
+    """
+    The protocol's budget rule on one validation curve (index = epoch, 1-based):
+      smooth (centred running mean of SMOOTH_POINTS evaluations);
+      last improvement = last epoch at which the smoothed value beat the best so far by more than MIN_DELTA;
+      plateaued if the run is at least (1 + PATIENCE) x that epoch long; otherwise extend (the run is doubled);
+      budget = smallest epoch whose smoothed value is within MIN_DELTA of the best smoothed value.
+    """
+    smooth = curve.rolling(SMOOTH_POINTS, center=True, min_periods=1).mean()
+    best, last_improvement = -np.inf, int(smooth.index[0])
+    for epoch, value in smooth.items():
+        if value > best + MIN_DELTA:
+            best, last_improvement = value, int(epoch)
+    top = smooth.max()
+    budget = int(smooth.index[np.argmax(smooth.to_numpy() >= top - MIN_DELTA)])
+    length = int(smooth.index[-1])
+    plateaued = length >= (1 + PATIENCE) * last_improvement
+    return {"budget": budget, "value": float(smooth.loc[budget]), "best": float(top),
+            "last_improvement": last_improvement, "length": length, "plateaued": plateaued,
+            "extend_to": None if plateaued else 2 * length}
+
+
+def validation_curve(runs, model, setting, units, pair) -> pd.Series | None:
+    """Mean validation curve of the trained class (fine 3-5 only) over seeds, classes, orders and phases."""
+    curves = []
+    for seed, seed_dir in seeds_of(os.path.join(runs, setting, model, pair)):
+        for u in units:
+            unit = os.path.join(seed_dir, u)
+            if not finished(unit):
+                continue
+            f = one_file(unit, "val")
+            piv = load_run_pivot(f) if f else None
+            if piv is None:
+                continue
+            if setting == "continual":
+                # within each phase, the class that phase trains, by epoch within the phase
+                order = [int(x) for x in u[len("order"):].split("_")]
+                per = len(piv.index) // 3
+                for t, c in enumerate(order):
+                    seg = piv[str(c)].iloc[t * per:(t + 1) * per].to_numpy()
+                    curves.append(pd.Series(seg, index=range(1, per + 1)))
+            else:
+                curves.append(piv[u[len("fine"):].split("_")[0]].dropna())
+    if not curves:
+        return None
+    return pd.concat(curves, axis=1).mean(axis=1).dropna()
+
+
+def plateau(runs_list, fmt_kind, pair="pair0_1", ns=FEWSHOT_N):
+    """
+    Hyperparameter selection (results_v2.tex, Setup): for each model and setting, the rule on each tree's validation
+    curve (one tree per learning rate), then the learning rate whose smoothed value at its budget is highest among the
+    plateaued ones. Continual: the curve is the class being trained within each phase, so the choice is to be confirmed
+    by a run at the selected budget (validation ACC_new); a shorter single-stream or few-shot run is the start of the
+    longer one, so there the curve is exact.
+    """
+    lines = [f"% hyperparameter selection on validation (fine 3-5), {pair}: model & setting & tree & budget & value at "
+             f"budget & best & last improvement & length & plateaued"]
     settings = [("continual", ["order" + "_".join(map(str, o)) for o in ORDERS]), ("stream", ["fine3", "fine4", "fine5"])]
     settings += [(f"fewshot N={n}", [f"fine{c}_n{n}" for c in (3, 4, 5)]) for n in ns]
+    choices = []
     for model, label in MODELS:
         for setting_label, units in settings:
             setting = setting_label.split()[0]
-            curves = []
-            for seed, seed_dir in seeds_of(os.path.join(runs, setting, model, pair)):
-                for u in units:
-                    unit = os.path.join(seed_dir, u)
-                    if not finished(unit):
-                        continue
-                    f = one_file(unit, "val")
-                    piv = load_run_pivot(f) if f else None
-                    if piv is None:
-                        continue
-                    if setting == "continual":
-                        order = [int(x) for x in u[len("order"):].split("_")]
-                        per = len(piv.index) // 3
-                        for t, c in enumerate(order):
-                            seg = piv[str(c)].iloc[t * per:(t + 1) * per].to_numpy()
-                            curves.append(pd.Series(seg, index=range(1, per + 1)))
-                    else:
-                        c = u[len("fine"):].split("_")[0]
-                        curves.append(piv[c])
-            if not curves:
-                continue
-            curve = pd.concat(curves, axis=1).mean(axis=1).dropna()
-            budget = int(curve.index[np.argmax(curve.to_numpy() >= curve.max() - 0.01)])
-            points = " ".join(f"{e}:{v:.3f}" for e, v in curve.items())
-            lines.append(emit([label, setting_label, str(budget), f"{curve.max():.3f}", points], fmt_kind))
+            candidates = []
+            for runs in runs_list:
+                curve = validation_curve(runs, model, setting, units, pair)
+                if curve is None:
+                    continue
+                r = selection_rule(curve)
+                tree = os.path.basename(os.path.normpath(runs))
+                candidates.append((tree, r))
+                status = "yes" if r["plateaued"] else f"NO: extend to {r['extend_to']}"
+                lines.append(emit([label, setting_label, tree, str(r["budget"]), f"{r['value']:.3f}", f"{r['best']:.3f}",
+                                   str(r["last_improvement"]), str(r["length"]), status], fmt_kind))
+            done = [c for c in candidates if c[1]["plateaued"]]
+            if candidates:
+                if len(done) == len(candidates):
+                    tree, r = max(done, key=lambda c: c[1]["value"])
+                    choices.append(emit([label, setting_label, tree, str(r["budget"]), f"{r['value']:.3f}"], fmt_kind))
+                else:
+                    choices.append(emit([label, setting_label, "undecided: extend the runs that have not plateaued",
+                                         "-", "-"], fmt_kind))
+    lines += ["", f"% selected (all learning rates plateaued; highest smoothed value at budget): model & setting & tree "
+                  f"(learning rate) & budget & value"] + choices
     return lines
 
 
@@ -355,8 +412,9 @@ TABLES = {"continual": table_continual, "starting": table_starting, "pairs": tab
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--runs", default="runs_v2")
-    p.add_argument("--tables", nargs="+", default=list(TABLES), choices=list(TABLES))
+    p.add_argument("--runs", nargs="+", default=["runs_v2"],
+                   help="Result trees. The tables read the first; --plateau compares all (one per learning rate).")
+    p.add_argument("--tables", nargs="*", default=list(TABLES), choices=list(TABLES))
     p.add_argument("--part", choices=["test", "val"], default="test")
     p.add_argument("--format", choices=["latex", "md"], default="latex")
     p.add_argument("--plateau", action="store_true")
@@ -367,11 +425,12 @@ def main():
     args = p.parse_args()
     global PARTIAL
     PARTIAL = args.partial
-    if not os.path.isdir(args.runs):
-        sys.exit(f"no such directory: {args.runs}")
+    for runs in args.runs:
+        if not os.path.isdir(runs):
+            sys.exit(f"no such directory: {runs}")
     warnings.simplefilter("always")
     for name in args.tables:
-        for line in TABLES[name](args.runs, args.part, args.format):
+        for line in TABLES[name](args.runs[0], args.part, args.format):
             print(line)
         print()
     if args.plateau:
