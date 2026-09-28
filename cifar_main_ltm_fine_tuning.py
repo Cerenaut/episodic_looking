@@ -97,6 +97,10 @@ def main():
     if cifar_args.epochs is not None:  # budget set by the protocol (Notes/experiments/plan.md, section 3)
         NUM_EPOCHS = cifar_args.epochs
         logger.info(f"Epochs per phase set by --epochs: {NUM_EPOCHS}")
+    EVALUATE_EPOCHS_SET = None  # --evaluate-points: log-spaced evaluation epochs within each phase
+    if cifar_args.evaluate_points is not None:
+        EVALUATE_EPOCHS_SET = CifarResults.evaluation_epochs(NUM_EPOCHS, cifar_args.evaluate_points)
+        logger.info(f"Evaluating at {len(EVALUATE_EPOCHS_SET)} log-spaced epochs of each phase")
 
     # Select coarse classes
     exclude_classes_coarse = set()
@@ -412,7 +416,11 @@ def main():
 
         evaluate_names = ["12","3","4","5"]
         evaluate_loaders = [loader_evaluate_12, loader_evaluate_3, loader_evaluate_4, loader_evaluate_5]
-        if EVALUATE_INTERVAL_EPOCHS > 1 and epoch % EVALUATE_INTERVAL_EPOCHS != 0 and epoch != NUM_EPOCHS - 1:
+        if EVALUATE_EPOCHS_SET is not None:
+            evaluate_now = epoch in EVALUATE_EPOCHS_SET
+        else:
+            evaluate_now = EVALUATE_INTERVAL_EPOCHS <= 1 or epoch % EVALUATE_INTERVAL_EPOCHS == 0 or epoch == NUM_EPOCHS - 1
+        if not evaluate_now:
             evaluate_loaders = []  # training line only; the metrics count epochs by training lines
         for i, evaluate_loader in enumerate(evaluate_loaders):
             metrics_evaluate = do_epoch_mode(

@@ -14,6 +14,16 @@ class CifarResults:
         self.run_path = run_path
         self.suffix = suffix
 
+    @staticmethod
+    def evaluation_epochs(num_epochs:int, points:int) -> set[int]:
+        """
+        0-based epochs at which to evaluate for --evaluate-points: about `points` epochs log-spaced from the first to
+        the last (dense early, where short few-shot runs peak; sparse late), always including both.
+        """
+        import numpy as np
+        grid = np.unique(np.rint(np.geomspace(1, max(1, num_epochs), max(2, points))).astype(int))
+        return {int(e) - 1 for e in grid} | {num_epochs - 1}
+
     def get_file_name(self) -> str:
         return os.path.join(self.run_path, f"results_{self.suffix}.txt")
 

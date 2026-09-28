@@ -29,7 +29,7 @@
 # numbers for every model.
 #
 # Overrides (environment): EPOCHS (per phase / per run), PRETRAIN_EPOCHS, LR, PRETRAIN_LR (STM), TRAINING_STEPS (STM), EVAL_EPOCHS
-# (evaluation interval, every model), VAL_HOLDOUT, LTM=e13|e40, SAVE_STM=1 (keep STM checkpoints), EXTRA (appended to the script's arguments), PY, DRY=1 (print the
+# (evaluation interval, every model), EVAL_POINTS (log-spaced evaluation, heads and LTM-only), VAL_HOLDOUT, LTM=e13|e40, SAVE_STM=1 (keep STM checkpoints), EXTRA (appended to the script's arguments), PY, DRY=1 (print the
 # command only), RUNS (default runs_v2).
 # Resumable: a finished unit has <unit>/job.done; the script refuses to run into an unfinished directory that already
 # holds results (move it to an archive first: results are never overwritten).
@@ -142,6 +142,8 @@ fi
 if [ "$KIND" = ltm ] && [ "$SETTING" != baseline ] && [ -n "${EPOCHS:-}" ]; then CMD="$CMD --epochs $EPOCHS"; fi
 # Evaluation interval for the heads and LTM-only (every k-th epoch of a phase and its last); the STM's is above
 if [ "$KIND" != stm ] && [ "$SETTING" != baseline ] && [ -n "${EVAL_EPOCHS:-}" ]; then CMD="$CMD --evaluate-epochs $EVAL_EPOCHS"; fi
+# Log-spaced evaluation (heads, LTM-only): about EVAL_POINTS epochs per phase, dense early; overrides EVAL_EPOCHS
+if [ "$KIND" != stm ] && [ "$SETTING" != baseline ] && [ -n "${EVAL_POINTS:-}" ]; then CMD="$CMD --evaluate-points $EVAL_POINTS"; fi
 if [ "$KIND" = stm ] && [ "$SETTING" != stream ]; then  # stream sets both in its command
   [ -n "${TRAINING_STEPS:-}" ] && CMD="$CMD --training-steps $TRAINING_STEPS"
   [ -n "${EVAL_EPOCHS:-}" ] && CMD="$CMD --evaluate-epochs $EVAL_EPOCHS"

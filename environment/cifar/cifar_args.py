@@ -38,6 +38,13 @@ class CifarArgs:
                  "phase for LTM-only). 1 = every epoch. STM pre-training skips the last-epoch rule, as before.",
         )
         parser.add_argument(
+            "--evaluate-points",
+            type=int,
+            default=None,
+            help="LTM-only: evaluate at about this many log-spaced epochs of each phase, first and last included "
+                 "(CifarResults.evaluation_epochs), instead of --evaluate-epochs. Default None.",
+        )
+        parser.add_argument(
             "--loader-workers",
             type=int,
             default=2,

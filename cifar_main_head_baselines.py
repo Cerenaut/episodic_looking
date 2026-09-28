@@ -100,6 +100,9 @@ def parse_args():
                    help="Continual phases: evaluate at every epoch whose index within the phase is a multiple of this, "
                         "and at the phase's last epoch (as the STM and LTM-only scripts). Pre-training always "
                         "evaluates every epoch. 1 = every epoch.")
+    p.add_argument("--evaluate-points", type=int, default=None,
+                   help="Continual phases: evaluate at about this many log-spaced epochs, first and last included "
+                        "(CifarResults.evaluation_epochs), instead of --evaluate-epochs. Default None.")
     p.add_argument("--epochs", type=int, default=None,
                    help="Epochs per phase. Default: int(6250 / instances_per_epoch) = 12 at 500 instances, "
                         "exactly as cifar_main_ltm_fine_tuning.py (independent of batch size).")
@@ -701,11 +704,15 @@ def main():
     if hasattr(head, "set_optimizer"):
         head.set_optimizer(args.lr, args.momentum)
     epoch_global = 0
+    eval_epochs_set = None if args.evaluate_points is None else CifarResults.evaluation_epochs(num_epochs, args.evaluate_points)
     for fine_class in args.fine_classes:
         logger.info(f"Training fine class {fine_class}")
         X, y = train_sets[str(fine_class)]
         for epoch in range(num_epochs):
-            evaluate_now = epoch % args.evaluate_epochs == 0 or epoch == num_epochs - 1
+            if eval_epochs_set is not None:
+                evaluate_now = epoch in eval_epochs_set
+            else:
+                evaluate_now = epoch % args.evaluate_epochs == 0 or epoch == num_epochs - 1
             do_epoch(results_file, results_val, [fine_class], X, y, epoch, epoch_global, num_epochs, evaluate_now)
             epoch_global += 1
 
