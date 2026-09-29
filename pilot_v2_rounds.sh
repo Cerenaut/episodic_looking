@@ -71,7 +71,7 @@ run_round() {  # actions file, round label: the heads in one lane, each LTM-only
   wait
 }
 
-trees() { find "$ROOT" -mindepth 1 -maxdepth 1 -type d | sort; }
+trees() { find "$ROOT" -mindepth 1 -maxdepth 1 -type d ! -name 'diag*' | sort; }  # diag_*: diagnostics, not model trees
 
 # --- round 1b: fine classes 4 and 5, and log-spaced few-shot ------------------------------------------------------
 if [ ! -f "$ROOT/round1b.done" ]; then
@@ -101,7 +101,8 @@ for r in $(seq "$START_ROUND" "$MAX_ROUNDS"); do
   if [ -e "$A" ] || [ -e "$ROOT/selection_round$r.txt" ]; then step "ABORT: round $r files exist (set START_ROUND past them)"; exit 1; fi
   # shellcheck disable=SC2046  # one argument per tree
   $PY metrics_v2.py --tables --plateau --runs $(trees) --actions "$A" --selection-latex "$ROOT/selection_table_round$r.tex" \
-      > "$ROOT/selection_round$r.txt" 2> "$ROOT/selection_round$r.err"
+      > "$ROOT/selection_round$r.txt" 2> "$ROOT/selection_round$r.err" \
+    || { step "ABORT: metrics_v2.py failed in round $r ($ROOT/selection_round$r.err)"; exit 1; }
   n=$(wc -l < "$A" | tr -d ' ')
   step "round $r: the selection rule asks for $n runs (selection: $ROOT/selection_round$r.txt)"
   [ "$n" = 0 ] && break
