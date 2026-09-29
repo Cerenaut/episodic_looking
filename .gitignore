@@ -220,3 +220,5 @@ __marimo__/
 # local experiment outputs
 runs/
 runs_local/
+archive_e40/
+runs_*/

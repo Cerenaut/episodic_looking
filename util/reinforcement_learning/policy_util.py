@@ -33,12 +33,14 @@ class PolicyModelOutput:
             distribution,
             sample:torch.Tensor,
             sample_one_hot:torch.Tensor,
+            mean:torch.Tensor|None = None,
     ):
         self.logits = logits
         self.mask = mask
         self.distribution = distribution
         self.sample = sample
         self.sample_one_hot = sample_one_hot
+        self.mean = mean  # deterministic action (tanh of mean logits), with grads
 
 class PolicyUtil:
 
@@ -114,6 +116,22 @@ class PolicyUtil:
 
         policy_distribution = Normal(means, stds)
         return policy_distribution
+
+    @staticmethod
+    def get_policy_mean_continuous(
+            logits:torch.Tensor,
+            std:float|None = None,
+    ) -> torch.Tensor:
+        """
+        The mean of the continuous policy (tanh of the mean logits), keeping gradients.
+        Mirrors create_distribution_continuous(); used for deterministic / differentiable actor training.
+        """
+        if std is None:
+            num_actions = logits.shape[1] // 2
+            means = logits[:, :num_actions]
+        else:
+            means = logits
+        return torch.tanh(means)
 
     @staticmethod
     def get_policy_metrics(
