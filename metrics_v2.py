@@ -22,9 +22,9 @@ over its orders, and the +/- is the standard deviation over seeds. Forgetting is
 \\pending, so the output can be pasted over the table bodies.
 
 --part val reads the validation files (results_*_val.txt) instead, for choosing budgets; --plateau then prints, per
-model and setting, the validation accuracy of the trained class against epochs (fine 3-5 only, averaged over seeds,
-classes, orders and phases, by epoch within the phase) and the budget the protocol picks: the smallest epoch within
-0.01 of the maximum.
+model and setting, the selection curve against epochs (validation_curve: continual, the new classes learnt so far;
+single-stream and few-shot, the mean of the trained class and fine 1,2, which counts retention) and the budget the
+protocol's rule picks (selection_rule).
 
 Usage: python metrics_v2.py [--runs runs_v2] [--tables continual stream ...] [--part test|val] [--plateau]
        [--plateau-pair pair0_1] [--partial] [--format latex|md]
@@ -318,6 +318,10 @@ MIN_DELTA = 0.01       # an improvement must exceed the best so far by more than
 PATIENCE = 0.5         # plateaued once the run has gone this fraction longer than the epoch of its last improvement
 TIE = 0.03             # learning rates within this of the best are tied (about one standard error of a 200-image set)
 SELECTION_CLASSES = (3, 4, 5)   # single-stream and few-shot selection average fine classes 3, 4 and 5
+# Single-stream and few-shot: the selection curve is the mean of the trained class and fine 1,2 (retention), not the
+# trained class alone (decided 29 Sep: a learning-only curve chose budgets that cost fine 1,2 more than the new class
+# gained). Fine 1,2 validation is optimistic (the LTM was pre-trained on those images), so forgetting is understated.
+RETENTION_WEIGHT = 0.5
 GRID_EXTENSION_MARK = "grid_extension"  # file in a tree created by a grid-edge step (only one step is taken)
 
 
@@ -357,8 +361,8 @@ def validation_curve(runs, model, setting, n, pair) -> pd.Series | None:
     """
     Selection curve on the validation split, from every unit of the setting (None unless all have finished, or with
     --partial any): continual, the accuracy over the fine classes 3-5 seen so far, by epoch within the phase, averaged
-    over phases and orders; single-stream and few-shot, the accuracy on the trained class, averaged over fine classes
-    3, 4, 5. Only epochs evaluated in every unit are kept, so units with different evaluation schedules are not mixed.
+    over phases and orders; single-stream and few-shot, (1 - RETENTION_WEIGHT) x the accuracy on the trained class +
+    RETENTION_WEIGHT x the accuracy on fine 1,2, averaged over fine classes 3, 4, 5. Only epochs evaluated in every unit are kept, so units with different evaluation schedules are not mixed.
     """
     curves, missing = [], 0
     for seed, seed_dir in seeds_of(os.path.join(runs, setting, model, pair)) or [(1, None)]:
@@ -377,7 +381,8 @@ def validation_curve(runs, model, setting, n, pair) -> pd.Series | None:
                     seen = [str(c) for c in order[:t + 1]]
                     curves.append(pd.Series(rows[seen].mean(axis=1).to_numpy(), index=rows.index - t * per))
             else:
-                curves.append(piv[u[len("fine"):].split("_")[0]].dropna())
+                trained = piv[u[len("fine"):].split("_")[0]]
+                curves.append(((1 - RETENTION_WEIGHT) * trained + RETENTION_WEIGHT * piv["12"]).dropna())
     if not curves or (missing and not PARTIAL):
         return None
     return pd.concat(curves, axis=1).dropna().mean(axis=1)

@@ -20,6 +20,10 @@ ROOT=runs_v2_pilot
 ARCHIVE=runs_v2_pilot_archive
 LOG=$ROOT/rounds.log
 MAX_ROUNDS=${MAX_ROUNDS:-6}
+# A later pass (e.g. after a change to the selection rule) starts at START_ROUND, so earlier rounds' files are kept;
+# a round whose actions file already exists is refused, never overwritten. Final outputs: selection_<FINAL_TAG>.*
+START_ROUND=${START_ROUND:-2}
+FINAL_TAG=${FINAL_TAG:-final}
 NS=(1 4 16 64 400)
 step() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
 
@@ -92,8 +96,9 @@ if [ ! -f "$ROOT/round1b.done" ]; then
 fi
 
 # --- rounds 2+: the selection rule decides --------------------------------------------------------------------------
-for r in $(seq 2 "$MAX_ROUNDS"); do
+for r in $(seq "$START_ROUND" "$MAX_ROUNDS"); do
   A=$ROOT/actions_round$r.txt
+  if [ -e "$A" ] || [ -e "$ROOT/selection_round$r.txt" ]; then step "ABORT: round $r files exist (set START_ROUND past them)"; exit 1; fi
   # shellcheck disable=SC2046  # one argument per tree
   $PY metrics_v2.py --tables --plateau --runs $(trees) --actions "$A" --selection-latex "$ROOT/selection_table_round$r.tex" \
       > "$ROOT/selection_round$r.txt" 2> "$ROOT/selection_round$r.err"
@@ -103,6 +108,6 @@ for r in $(seq 2 "$MAX_ROUNDS"); do
   run_round "$A" "round$r"
 done
 # shellcheck disable=SC2046
-$PY metrics_v2.py --tables --plateau --runs $(trees) --selection-latex "$ROOT/selection_table_final.tex" \
-    > "$ROOT/selection_final.txt" 2> "$ROOT/selection_final.err"
-step "rounds finished: $ROOT/selection_final.txt, $ROOT/selection_table_final.tex"
+$PY metrics_v2.py --tables --plateau --runs $(trees) --selection-latex "$ROOT/selection_table_$FINAL_TAG.tex" \
+    > "$ROOT/selection_$FINAL_TAG.txt" 2> "$ROOT/selection_$FINAL_TAG.err"
+step "rounds finished: $ROOT/selection_$FINAL_TAG.txt, $ROOT/selection_table_$FINAL_TAG.tex"
