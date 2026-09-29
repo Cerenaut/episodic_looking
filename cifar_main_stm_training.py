@@ -144,12 +144,17 @@ def main():
     logger.info(
         f"Using coarse classes: {COARSE_CLASSES} excluding: {exclude_classes_coarse}"
     )
+    # D.15: pre-train on the fine classes of a broader set of coarse classes; evaluation stays on COARSE_CLASSES.
+    exclude_classes_coarse_training = None
+    if EXPERIMENT_TYPE == CifarArgs.EXPERIMENT_TYPE_PRETRAIN and args.pretrain_coarse_classes is not None:
+        exclude_classes_coarse_training = Cifar100Dataset.get_coarse_classes_excluded(args.pretrain_coarse_classes)
+        logger.info(f"Pre-training on coarse classes: {args.pretrain_coarse_classes} (evaluation on {COARSE_CLASSES})")
 
     dataset_training = CifarEnv.create_dataset(
         data_file_path=CIFAR_DATA_FILE_PATH,
         mode=Instrumentation.MODE_TRAINING,
         shared_memory_names=None,
-        exclude_classes_coarse=exclude_classes_coarse,
+        exclude_classes_coarse=exclude_classes_coarse if exclude_classes_coarse_training is None else exclude_classes_coarse_training,
         exclude_classes_fine=exclude_classes_fine,
         max_instances=MAX_INSTANCES,
     )
@@ -174,6 +179,7 @@ def main():
         shared_memory_names_training=shared_memory_names_training,
         shared_memory_names_evaluate=shared_memory_names_evaluate,
         exclude_classes_coarse=exclude_classes_coarse,
+        exclude_classes_coarse_training=exclude_classes_coarse_training,
         exclude_classes_fine_training=exclude_classes_fine,
         exclude_classes_fine_evaluate=exclude_classes_fine,
     )
@@ -250,11 +256,13 @@ def main():
         agent.envs.single_action_space.seed(SEED)
 
     if EXPERIMENT_TYPE == CifarArgs.EXPERIMENT_TYPE_PRETRAIN:
+        # Training rows record the coarse classes the training accuracy was measured over (D.15: the broader set).
+        coarse_classes_training = COARSE_CLASSES if args.pretrain_coarse_classes is None else args.pretrain_coarse_classes
 
         for epoch in range(NUM_EPOCHS):
             accuracy_training = do_training(agent = agent, num_steps = TRAINING_STEPS)
             results_file.append_line(
-                coarse_classes = str(COARSE_CLASSES),
+                coarse_classes = str(coarse_classes_training),
                 fine_classes = str(FINE_CLASSES),
                 mode = Instrumentation.MODE_TRAINING,
                 epoch = epoch,

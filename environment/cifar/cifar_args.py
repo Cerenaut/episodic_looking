@@ -108,6 +108,14 @@ class CifarArgs:
                  "(<prefix>_phase<fine class>.pth), for post-hoc analysis (analyze_stm_inspectability.py).",
         )
         parser.add_argument(
+            "--pretrain-coarse-classes",
+            type=int,
+            nargs="+",
+            default=None,
+            help="pretrain only: coarse classes whose fine classes 1,2 the STM is pre-trained on (e.g. 0..19 = all), "
+                 "while evaluation stays on --coarse-classes. Default None = --coarse-classes.",
+        )
+        parser.add_argument(
             "--seed",
             type=int,
             default=None,
