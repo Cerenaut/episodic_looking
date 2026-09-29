@@ -330,6 +330,10 @@ SELECTION_CLASSES = (3, 4, 5)   # single-stream and few-shot selection average f
 # (decided 29 Sep: a learning-only curve chose budgets that cost the other classes more than the new class gained).
 # Fine 1,2 validation is optimistic (the LTM was pre-trained on those images), so their forgetting is understated.
 FOUR_SETS = ["12", "3", "4", "5"]
+# Seeds each (setting, N) must have before its selection is decided, beyond those found on disk (decided 29 Sep: at
+# small N one seed is one draw of N images, so the heads' few-shot runs at N = 1 and 4 use seeds 1 to 3).
+HEADS = ("linear", "ncm", "flymodel", "sdmlp")
+EXPECTED_SEEDS = {("fewshot", 1): [1, 2, 3], ("fewshot", 4): [1, 2, 3]}
 GRID_EXTENSION_MARK = "grid_extension"  # file in a tree created by a grid-edge step (only one step is taken)
 
 
@@ -365,7 +369,7 @@ def selection_units(setting: str, n: int | None) -> list[str]:
     return [f"fine{c}_n{n}" for c in SELECTION_CLASSES]
 
 
-def validation_curve(runs, model, setting, n, pair) -> pd.Series | None:
+def validation_curve(runs, model, setting, n, pair, seeds: list[int] | None = None) -> pd.Series | None:
     """
     Selection curve on the validation split, from every unit of the setting (None unless all have finished, or with
     --partial any): continual, the accuracy over the fine classes 3-5 seen so far, by epoch within the phase, averaged
@@ -373,12 +377,15 @@ def validation_curve(runs, model, setting, n, pair) -> pd.Series | None:
     averaged over the trained classes 3, 4, 5 and over the seeds the setting has. Only epochs evaluated in every unit are kept, so units with different evaluation schedules are not mixed.
     """
     curves, missing = [], 0
-    seeds = [(k, d) for k, d in seeds_of(os.path.join(runs, setting, model, pair))
-             if any(os.path.isdir(os.path.join(d, u)) for u in selection_units(setting, n))]
-    for seed, seed_dir in seeds or [(1, None)]:
+    if seeds is None:  # the seeds that hold units of this setting
+        pairs_ = [(k, d) for k, d in seeds_of(os.path.join(runs, setting, model, pair))
+                  if any(os.path.isdir(os.path.join(d, u)) for u in selection_units(setting, n))]
+    else:  # the seeds expected (plateau: the union over the base grid); a missing one counts as missing
+        pairs_ = [(k, os.path.join(runs, setting, model, pair, f"seed{k}")) for k in seeds]
+    for seed, seed_dir in pairs_ or [(1, None)]:
         for u in selection_units(setting, n):
             unit = None if seed_dir is None else os.path.join(seed_dir, u)
-            f = one_file(unit, "val") if unit and finished(unit) else None
+            f = one_file(unit, "val") if unit and os.path.isdir(unit) and finished(unit) else None
             piv = load_run_pivot(f) if f else None
             if piv is None:
                 missing += 1
@@ -391,7 +398,7 @@ def validation_curve(runs, model, setting, n, pair) -> pd.Series | None:
                     seen = [str(c) for c in order[:t + 1]]
                     curves.append(pd.Series(rows[seen].mean(axis=1).to_numpy(), index=rows.index - t * per))
             else:
-                curves.append(piv[FOUR_SETS].mean(axis=1, skipna=False).dropna())
+                curves.append(piv.reindex(columns=FOUR_SETS).mean(axis=1, skipna=False).dropna())
     if not curves or (missing and not PARTIAL):
         return None
     return pd.concat(curves, axis=1).dropna().mean(axis=1)
@@ -461,8 +468,9 @@ def plateau(runs_list, fmt_kind, pair="pair0_1", ns=FEWSHOT_N, actions_path=None
     cc = pair[len("pair"):].replace("_", " ")
     actions, choices, cells = [], [], {}
 
-    def unit_actions(tree_path, model, setting, n, epochs, lr, flag="", seeds=None):
-        """Runs for every seed of the setting (seeds: those of tree_path's units, or given), so seeds stay together."""
+    def unit_actions(tree_path, model, setting, n, epochs, lr, flag="", seeds=None, only_missing=False):
+        """Runs for every seed of the setting (seeds: those of tree_path's units, or given), so seeds stay together.
+        only_missing: skip units whose directory exists (finished, running or failed), which the driver would archive."""
         env = f"EPOCHS={epochs}" + (" EVAL_POINTS=96" if setting == "fewshot" else "")
         env += f" LR={fmt_lr(lr)}" if lr is not None else ""
         for seed in seeds or unit_seeds(tree_path, model, setting, n, pair):
@@ -474,6 +482,8 @@ def plateau(runs_list, fmt_kind, pair="pair0_1", ns=FEWSHOT_N, actions_path=None
                     args = f"stream {model} \"{cc}\" {seed} {u[len('fine'):]}"
                 else:
                     args = f"fewshot {model} \"{cc}\" {seed} {u[len('fine'):].split('_')[0]} {n}"
+                if only_missing and os.path.isdir(os.path.join(base, u)):
+                    continue
                 actions.append(f"{tree_path}|{env}|{args}|{os.path.join(base, u)}|{flag}")
 
     for model, label in MODELS:
@@ -481,14 +491,22 @@ def plateau(runs_list, fmt_kind, pair="pair0_1", ns=FEWSHOT_N, actions_path=None
                  if os.path.basename(os.path.normpath(r)) == model or os.path.basename(os.path.normpath(r)).startswith(model + "_lr")]
         for setting, n in settings:
             setting_label = setting if n is None else f"fewshot N={n}"
-            candidates, incomplete, pending = [], False, {}
+            candidates, incomplete, pending, partial_steps = [], False, {}, {}
+            base_trees = [r for r in trees if not os.path.exists(os.path.join(r, GRID_EXTENSION_MARK))]
+            expected = {k for r in base_trees for k in unit_seeds(r, model, setting, n, pair)}
+            if model in HEADS:
+                expected |= set(EXPECTED_SEEDS.get((setting, n), []))
+            expected = sorted(expected) or [1]
             for runs in trees:
                 tree = os.path.basename(os.path.normpath(runs))
                 extension = os.path.exists(os.path.join(runs, GRID_EXTENSION_MARK))
-                curve = validation_curve(runs, model, setting, n, pair)
+                curve = validation_curve(runs, model, setting, n, pair, seeds=expected)
                 if curve is None:
                     if not extension:  # a grid-edge tree only runs the settings it was needed for
                         incomplete = True
+                    elif any(os.path.isdir(os.path.join(runs, setting, model, pair, f"seed{k}", u))
+                             for k in expected for u in selection_units(setting, n)):
+                        partial_steps[fmt_lr(tree_lr(tree))] = runs  # some of its units exist: running or failed
                     continue
                 r = selection_rule(curve)
                 limit = cap(model, setting, n)
@@ -507,7 +525,7 @@ def plateau(runs_list, fmt_kind, pair="pair0_1", ns=FEWSHOT_N, actions_path=None
                     if extension:
                         pending[tree] = todo
                     else:
-                        unit_actions(runs, model, setting, n, todo, tree_lr(tree))
+                        unit_actions(runs, model, setting, n, todo, tree_lr(tree), seeds=expected)
                 settled = (r["plateaued"] or r["at_cap"]) and not r["unresolved"]
                 candidates.append({"tree": tree, "path": runs, "lr": tree_lr(tree), "value": r["value"],
                                    "extension": extension, "settled": settled, "r": r})
@@ -515,6 +533,8 @@ def plateau(runs_list, fmt_kind, pair="pair0_1", ns=FEWSHOT_N, actions_path=None
                 lines.append(emit([label, setting_label, tree, str(r["budget"]), f"{r['value']:.3f}", f"{r['best']:.3f}",
                                    str(r["last_improvement"]), str(r["length"]), status], fmt_kind))
             if not candidates:
+                if incomplete:
+                    choices.append(emit([label, setting_label, "undecided: runs missing", "-", "-"], fmt_kind))
                 continue
             base = [c for c in candidates if not c["extension"]]
             steps = {fmt_lr(c["lr"]): c for c in candidates if c["extension"] and c["lr"] is not None}
@@ -533,18 +553,28 @@ def plateau(runs_list, fmt_kind, pair="pair0_1", ns=FEWSHOT_N, actions_path=None
                 key = fmt_lr(d["extend"])
                 step = steps.get(key)
                 src = next(c for c in pool if c["tree"] == d["from"])
+                if step is not None and step in pool:  # defensive: a step is only ever added once
+                    decision = {"tree": max(pool, key=lambda c: c["value"])["tree"]}
+                    break
+                if step is None and key in partial_steps:
+                    # the step exists but some of its units are missing, running or failed: ask only for the absent ones
+                    unit_actions(partial_steps[key], model, setting, n, src["r"]["length"], d["extend"],
+                                 GRID_EXTENSION_MARK, seeds=expected, only_missing=True)
+                    choices.append(emit([label, setting_label, f"undecided: grid step lr {key} runs missing or running",
+                                         "-", "-"], fmt_kind))
+                    break
                 if step is None:
                     new_tree = f"{model}_lr{key}"
                     new_path = os.path.join(os.path.dirname(os.path.normpath(src["path"])), new_tree)
                     unit_actions(new_path, model, setting, n, src["r"]["length"], d["extend"], GRID_EXTENSION_MARK,
-                                 seeds=unit_seeds(src["path"], model, setting, n, pair))
+                                 seeds=expected, only_missing=True)
                     choices.append(emit([label, setting_label, f"grid edge ({src['tree']}): run {new_tree}", "-", "-"],
                                         fmt_kind))
                     cells[("choice", model, setting_label)] = ("edge", src["tree"])
                     break
                 if not step["settled"]:
                     if step["tree"] in pending:
-                        unit_actions(step["path"], model, setting, n, pending[step["tree"]], step["lr"])
+                        unit_actions(step["path"], model, setting, n, pending[step["tree"]], step["lr"], seeds=expected)
                     choices.append(emit([label, setting_label, f"undecided: grid step {step['tree']} to extend or re-run",
                                          "-", "-"], fmt_kind))
                     break
