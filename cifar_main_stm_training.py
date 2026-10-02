@@ -3,10 +3,7 @@ import logging
 import math
 import os
 
-import random
-
 import gymnasium as gym
-import numpy as np
 import torch
 
 from environment.cifar.cifar_agent import CifarAgent, CifarAgentConfig
@@ -15,7 +12,7 @@ from environment.cifar.cifar_dataset import Cifar100Dataset
 from environment.cifar.cifar_env import CifarEnv, CifarEnvConfig, EvaluationSweep
 from environment.cifar.cifar_model import CifarModel, CifarModelConfig
 from environment.cifar.cifar_results import CifarResults
-from util.device import get_device
+from util.device import get_device, seed_all
 from util.instrumentation import Instrumentation
 from util.log import create_run_path, get_run_path
 
@@ -83,13 +80,7 @@ def main():
     if SEED is not None:
         # Model init and policy sampling (torch), env image sampling and dataset subsets (numpy global RNG,
         # envs are synchronous so they share it), python's random for completeness.
-        random.seed(SEED)
-        np.random.seed(SEED)
-        torch.manual_seed(SEED)
-        if torch.backends.mps.is_available():
-            torch.mps.manual_seed(SEED)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(SEED)
+        seed_all(SEED)
 
     EXPERIMENT_TYPE = args.experiment_type
     BATCH_SIZE = args.batch_size

@@ -1,8 +1,6 @@
 import logging
-import random
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -13,7 +11,7 @@ from environment.cifar.cifar_classifier import CifarClassifier
 from environment.cifar.cifar_dataset import Cifar100Dataset
 from environment.cifar.cifar_results import CifarResults
 from model.resnet import ResNetConfig
-from util.device import get_device
+from util.device import get_device, seed_all
 from util.instrumentation import Instrumentation
 from util.log import create_run_path, get_run_path
 
@@ -27,13 +25,7 @@ def main():
     if SEED is not None:
         # Model state is loaded from the checkpoint; the randomness is the training loaders' shuffles (seeded below
         # through their own generators) and any other torch / numpy use.
-        random.seed(SEED)
-        np.random.seed(SEED)
-        torch.manual_seed(SEED)
-        if torch.backends.mps.is_available():
-            torch.mps.manual_seed(SEED)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(SEED)
+        seed_all(SEED)
 
     EXPERIMENT_TYPE = cifar_args.experiment_type
     BATCH_SIZE = cifar_args.batch_size
