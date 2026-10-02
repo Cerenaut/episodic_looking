@@ -122,8 +122,8 @@ class CifarArgs:
             "--stm-checkpoint-out",
             type=str,
             default=None,
-            help="continual only: prefix for STM checkpoints saved after each phase "
-                 "(<prefix>_phase<fine class>.pth), for post-hoc analysis (analyze_stm_inspectability.py).",
+            help="STM checkpoints after training, for post-hoc analysis (analyze_stm_inspectability.py). continual: a "
+                 "prefix, one checkpoint per phase (<prefix>_phase<fine class>.pth); few-shot: the checkpoint's path.",
         )
         parser.add_argument(
             "--pretrain-coarse-classes",
