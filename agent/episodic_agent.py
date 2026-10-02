@@ -189,9 +189,7 @@ class EpisodicAgent:
 
     def step(self, num_steps:int = 0) -> int:
         # Convert the most recent observation into a tensor (somehow) and add it to the context
-        self.state.obs_1_tensor = self.observation_to_tensor(
-            observation=self.state.obs_1,
-        )
+        self.state.obs_1_tensor = self.observation_1_to_tensor()
         self.observation_history.update(observation=self.state.obs_1_tensor)
         self.state.obs_1_history_tensor = self.observation_history_to_tensor(self.observation_history)
 
@@ -224,6 +222,15 @@ class EpisodicAgent:
 
         self.state_update(reset_mask=self.state.completed)
         return global_step
+
+    def observation_1_to_tensor(self) -> torch.Tensor:
+        """
+        Tensor of the step's first observation, state.obs_1. Subclasses may override this to reuse the previous
+        step's obs_2_tensor where the two are known to be identical (CifarAgent: --ltm-obs-cache).
+        """
+        return self.observation_to_tensor(
+            observation=self.state.obs_1,
+        )
 
     def observation_to_tensor(self, observation) -> torch.Tensor:
         """

@@ -277,6 +277,7 @@ def main():
         image_shape=image_shape,
         learning_rate=LEARNING_RATE,
         momentum=0.5,
+        ltm_obs_cache=args.ltm_obs_cache,
     )
 
     model_config = CifarModelConfig(

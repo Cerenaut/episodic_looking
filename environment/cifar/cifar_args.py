@@ -201,6 +201,15 @@ class CifarArgs:
                  "results_<type>_images.txt.",
         )
 
+        parser.add_argument(
+            "--ltm-obs-cache",
+            choices=["on", "off", "check"],
+            default="on",
+            help="STM: reuse each step's second LTM pass as the next step's first while no episode ended (same image "
+                 "and bias, frozen LTM), saving 7 of 16 LTM passes per episode; results are bitwise identical. "
+                 "off = recompute every pass (the original code path); check = recompute and fail unless identical.",
+        )
+
         args = parser.parse_args()
         logger.info("Parse args:")
         logger.info(json.dumps(vars(args), indent=4))

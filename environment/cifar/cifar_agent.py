@@ -22,11 +22,19 @@ class CifarAgentConfig(EpisodicAgentConfig):
     image_shape: list[int] = field(default_factory=list) 
     learning_rate:float = 0.1
     momentum:float = 0.0
+    # Reuse a step's obs_2 LTM pass as the next step's obs_1 tensor while no episode ended (same image, same bias,
+    # frozen LTM in eval mode, so the same output). off = always recompute (the original behaviour); on = reuse;
+    # check = recompute and raise unless the reused tensor is bitwise equal.
+    ltm_obs_cache:str = "off"
 
 class CifarAgent(EpisodicAgent):
     """
     Agent for the Cifar-100 dataset.
     """
+
+    LTM_OBS_CACHE_OFF = "off"
+    LTM_OBS_CACHE_ON = "on"
+    LTM_OBS_CACHE_CHECK = "check"
 
     def __init__(
         self, 
@@ -48,6 +56,10 @@ class CifarAgent(EpisodicAgent):
         self.previous_policy_data = None
         self.current_policy_data = None
         self.sweep_correct = None  # image index -> 1/0 during an evaluation sweep, else None
+
+        self.obs_1_tensor_cache = None  # see CifarAgentConfig.ltm_obs_cache
+        self.obs_1_tensor_cache_hits = 0
+        self.obs_1_tensor_cache_misses = 0
 
     def create_optimizers(self):
         optimizer_config = self.create_optimizer_config(
@@ -194,6 +206,9 @@ class CifarAgent(EpisodicAgent):
 
     def reset(self):
         super().reset()
+        # New images and zero bias in every environment: never reuse across a reset (mode switches, evaluation sweeps,
+        # dataset changes and continual phases all reset the agent before stepping).
+        self.clear_obs_1_tensor_cache()
         self.previous_policy_data = None
         self.current_policy_data = None
         self.bias_with_grad = None
@@ -204,6 +219,8 @@ class CifarAgent(EpisodicAgent):
         #self.reset_intra_episode_metrics()
 
     def state_update(self, reset_mask:torch.Tensor):
+        obs_2_tensor = self.state.obs_2_tensor
+        obs_2_image = self.state.obs_2_final[CifarEnv.OBSERVATION_KEY_IMAGE]  # the image that pass classified
         super().state_update(reset_mask)
 
         # Clear any old state on episode reset
@@ -213,6 +230,61 @@ class CifarAgent(EpisodicAgent):
         self.update_reward_previous(self.model.get_reward_current())
         self.reset_reward_previous(reset_mask)  # reset obs_2 for complete episodes 
         self.reset_bias(reset_mask)
+        self.update_obs_1_tensor_cache(obs_2_tensor, obs_2_image, reset_mask)
+
+    def clear_obs_1_tensor_cache(self):
+        if self.obs_1_tensor_cache_hits + self.obs_1_tensor_cache_misses > 0:
+            logger.info(f"LTM obs. cache ({self.config.ltm_obs_cache}): {self.obs_1_tensor_cache_hits} obs_1 passes reused, "
+                        f"{self.obs_1_tensor_cache_misses} computed")
+        self.obs_1_tensor_cache = None
+        self.obs_1_tensor_cache_hits = 0
+        self.obs_1_tensor_cache_misses = 0
+
+    def update_obs_1_tensor_cache(self, obs_2_tensor:torch.Tensor, obs_2_image:np.ndarray, reset_mask):
+        """
+        After state_update: keep this step's obs_2 pass for the next step's obs_1 if no episode ended. Then every
+        environment's obs_1 is its obs_2 (obs_2_final differs only for ended episodes) and the bias is unchanged
+        (reset_bias zeroes ended episodes only). Any ended episode: recompute the whole batch, so the reused rows
+        never come from a forward pass at another batch composition.
+        """
+        self.obs_1_tensor_cache = None
+        if self.config.ltm_obs_cache == CifarAgent.LTM_OBS_CACHE_OFF:
+            return
+        if bool(np.any(np.asarray(reset_mask))):
+            return
+        self.obs_1_tensor_cache = {
+            "tensor": obs_2_tensor,
+            "logits": self.classifier_logits,  # of the obs_2 pass (model_update read it), detached
+            "image": obs_2_image,
+            "bias": self.bias,  # identity and version: any set_bias() or in-place change invalidates
+            "bias_version": self.bias._version,
+        }
+
+    def is_obs_1_tensor_cache_valid(self, cache:dict) -> bool:
+        if getattr(self, "bias_with_grad", None) is not None:
+            return False  # a pending differentiable pass must go through observation_to_tensor
+        bias = self.get_bias()
+        if bias is not cache["bias"] or bias._version != cache["bias_version"]:
+            return False
+        image = self.state.obs_1[CifarEnv.OBSERVATION_KEY_IMAGE]
+        return np.array_equal(image, cache["image"])
+
+    def observation_1_to_tensor(self) -> torch.Tensor:
+        cache = self.obs_1_tensor_cache
+        self.obs_1_tensor_cache = None  # single use
+        if cache is None or not self.is_obs_1_tensor_cache_valid(cache):
+            if self.config.ltm_obs_cache != CifarAgent.LTM_OBS_CACHE_OFF:
+                self.obs_1_tensor_cache_misses += 1
+            return super().observation_1_to_tensor()
+
+        self.obs_1_tensor_cache_hits += 1
+        if self.config.ltm_obs_cache == CifarAgent.LTM_OBS_CACHE_CHECK:
+            obs_1_tensor = super().observation_1_to_tensor()
+            if not (torch.equal(obs_1_tensor, cache["tensor"]) and torch.equal(self.classifier_logits, cache["logits"])):
+                raise RuntimeError("LTM obs. cache: the reused obs_2 pass differs from a fresh obs_1 pass")
+            return obs_1_tensor
+        self.classifier_logits = cache["logits"]  # as observation_to_tensor() would set it
+        return cache["tensor"]
 
     def reset_bias(self, reset_mask:torch.Tensor|None = None):
         if reset_mask is None:
