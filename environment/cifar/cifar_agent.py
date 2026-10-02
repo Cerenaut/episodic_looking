@@ -107,7 +107,7 @@ class CifarAgent(EpisodicAgent):
             )
             if self.instrumentation.is_mode_training():
                 self.bias_with_grad = self.output_actor.mean
-        elif self.model_config.eval_bias == "mean" and not self.instrumentation.is_mode_training():
+        elif self.model_config.eval_bias == CifarModel.EVAL_BIAS_MEAN and not self.instrumentation.is_mode_training():
             self.set_bias(
                 self.output_actor.mean.detach().clone()
             )
