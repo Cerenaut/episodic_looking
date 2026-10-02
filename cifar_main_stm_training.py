@@ -107,16 +107,14 @@ def main():
     # script, and the held-out images are evaluated alongside the test sets.
     # With --max-instances and --seed, the subset is the one the head and LTM-only scripts draw for that seed
     # (Cifar100Dataset.get_subset_mask), and environments re-derive it identically; without a seed, the old draw.
-    TRAINING_DATASET_OPTIONS = None
-    VALIDATION_DATASET_OPTIONS = None
-    if MAX_INSTANCES is not None and SEED is not None:
-        TRAINING_DATASET_OPTIONS = {"subset_seed": SEED}
+    subset_options = Cifar100Dataset.get_subset_options(MAX_INSTANCES, SEED)
+    split_options = Cifar100Dataset.get_split_options(VAL_HOLDOUT, args.split_seed)
+    TRAINING_DATASET_OPTIONS = {**subset_options, **split_options} or None
+    VALIDATION_DATASET_OPTIONS = None  # "training": the validation set is read from the training file
+    if subset_options:
         logger.info(f"Subset of {MAX_INSTANCES} images per coarse class drawn with seed {SEED}")
-    if VAL_HOLDOUT > 0:
-        TRAINING_DATASET_OPTIONS = {**(TRAINING_DATASET_OPTIONS or {}), "val_holdout": VAL_HOLDOUT, "split_seed": args.split_seed}
-        VALIDATION_DATASET_OPTIONS = {
-            "training": True, "val_holdout": VAL_HOLDOUT, "split_seed": args.split_seed, "split_part": "validation",
-        }
+    if split_options:
+        VALIDATION_DATASET_OPTIONS = {"training": True, **split_options, "split_part": "validation"}
         logger.info(f"Validation split: {VAL_HOLDOUT} images per fine class held out, split seed {args.split_seed}")
 
     LOG_PREFIX = "cifar-100-bias"

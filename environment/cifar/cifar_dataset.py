@@ -499,6 +499,26 @@ class Cifar100Dataset(Dataset):
         raise ValueError("Fine class set not recognized.")
 
     @staticmethod
+    def get_split_options(val_holdout:int, split_seed:int) -> dict:
+        """
+        Constructor options for the validation split (the scripts' --val-holdout, --split-seed); add
+        split_part="validation" for the held-out part. {} when val_holdout is 0 (no split).
+        """
+        if val_holdout <= 0:
+            return {}
+        return {"val_holdout": val_holdout, "split_seed": split_seed}
+
+    @staticmethod
+    def get_subset_options(max_instances:int|None, seed:int|None) -> dict:
+        """
+        Constructor options for the seeded subset (--max-instances with --seed): the images every script draws for
+        that seed. {} without both, which keeps the unseeded draw of sample_data.
+        """
+        if max_instances is None or seed is None:
+            return {}
+        return {"subset_seed": seed}
+
+    @staticmethod
     def get_validation_mask(labels_fine, holdout_per_fine_class:int, split_seed:int = 0) -> np.ndarray:
         """
         Boolean mask over training instances: True for the validation hold-out. For every fine label, the same
