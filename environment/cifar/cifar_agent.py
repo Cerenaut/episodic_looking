@@ -56,6 +56,8 @@ class CifarAgent(EpisodicAgent):
         self.previous_policy_data = None
         self.current_policy_data = None
         self.sweep_correct = None  # image index -> 1/0 during an evaluation sweep, else None
+        self.bias_with_grad = None  # differentiable actor, training: the bias with its graph, until the next classifier pass
+        self.classifier_logits_with_grad = None
 
         self.obs_1_tensor_cache = None  # see CifarAgentConfig.ltm_obs_cache
         self.obs_1_tensor_cache_hits = 0
@@ -321,7 +323,7 @@ class CifarAgent(EpisodicAgent):
         bias_detached = self.get_bias().detach()  # current bias
         image_tensor = torch.from_numpy(image_array).to(self.device)
 
-        bias_with_grad = getattr(self, "bias_with_grad", None)
+        bias_with_grad = self.bias_with_grad
         if bias_with_grad is not None:
             # Differentiable actor, training: this is the first classifier pass after model_actions(),
             # i.e. on the observation that results from the bias just emitted. Keep the graph.
