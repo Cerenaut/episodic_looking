@@ -439,34 +439,23 @@ def main():
             accuracy = accuracy_evaluate,            
         )        
 
-    exclude_classes_fine_evaluate_12 = Cifar100Dataset.get_fine_classes([    3,4,5,])
-    exclude_classes_fine_evaluate_3  = Cifar100Dataset.get_fine_classes([1,2,  4,5,])
-    exclude_classes_fine_evaluate_4  = Cifar100Dataset.get_fine_classes([1,2,3,  5,])
-    exclude_classes_fine_evaluate_5  = Cifar100Dataset.get_fine_classes([1,2,3,4,  ])
+    # Test (and validation) sets per group of fine classes: 1,2 together, as they were pre-trained, then 3, 4, 5.
+    exclude_classes_fine_evaluate_by_key = {
+        "12": Cifar100Dataset.get_fine_classes([    3,4,5,]),
+        "3":  Cifar100Dataset.get_fine_classes([1,2,  4,5,]),
+        "4":  Cifar100Dataset.get_fine_classes([1,2,3,  5,]),
+        "5":  Cifar100Dataset.get_fine_classes([1,2,3,4,  ]),
+    }
 
     evaluate_individual_datasets = {}
-    evaluate_individual_datasets["12"] = create_evaluate_individual_fine_class_dataset(
-        exclude_classes_fine_evaluate = exclude_classes_fine_evaluate_12,
-    )
-    evaluate_individual_datasets["3"] = create_evaluate_individual_fine_class_dataset(
-        exclude_classes_fine_evaluate = exclude_classes_fine_evaluate_3,
-    )
-    evaluate_individual_datasets["4"] = create_evaluate_individual_fine_class_dataset(
-        exclude_classes_fine_evaluate = exclude_classes_fine_evaluate_4,
-    )
-    evaluate_individual_datasets["5"] = create_evaluate_individual_fine_class_dataset(
-        exclude_classes_fine_evaluate = exclude_classes_fine_evaluate_5,
-    )
+    for key, exclude_classes_fine_evaluate in exclude_classes_fine_evaluate_by_key.items():
+        evaluate_individual_datasets[key] = create_evaluate_individual_fine_class_dataset(
+            exclude_classes_fine_evaluate = exclude_classes_fine_evaluate,
+        )
     logger.info("Eval. individual fine classes using datasets:")
     for key, value in evaluate_individual_datasets.items():
         logger.info(f"Fine classes: {key} --> shared memory: {value.shared_memory_names} size: {len(value)}")
 
-    exclude_classes_fine_evaluate_by_key = {
-        "12": exclude_classes_fine_evaluate_12,
-        "3": exclude_classes_fine_evaluate_3,
-        "4": exclude_classes_fine_evaluate_4,
-        "5": exclude_classes_fine_evaluate_5,
-    }
     validation_individual_datasets = {}
     if VAL_HOLDOUT > 0:
         for key, exclude_classes_fine_evaluate in exclude_classes_fine_evaluate_by_key.items():
