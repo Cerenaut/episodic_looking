@@ -30,7 +30,8 @@
 #
 # Overrides (environment): EPOCHS (per phase / per run), PRETRAIN_EPOCHS, LR, PRETRAIN_LR (STM), TRAINING_STEPS (STM), EVAL_EPOCHS
 # (evaluation interval, every model), EVAL_POINTS (log-spaced evaluation, heads and LTM-only), VAL_HOLDOUT, LTM=e13|e40, SAVE_STM=1 (keep STM checkpoints), EXTRA (appended to the script's arguments), PY, DRY=1 (print the
-# command only), RUNS (default runs_v2).
+# command only), PRINT_UNIT=1 (print the unit dir only and exit; sky/v2_launch.sh uses it so that the layout lives in
+# this file alone), RUNS (default runs_v2).
 # Resumable: a finished unit has <unit>/job.done; the script refuses to run into an unfinished directory that already
 # holds results (move it to an archive first: results are never overwritten).
 set -u
@@ -86,6 +87,7 @@ case "$SETTING" in
     CLS=${ARG5:?fine class}; : "${N:?N images per coarse class}"; UNIT_DIR=$SEEDDIR/fine${CLS}_n$N ;;
   *) echo "unknown setting: $SETTING" >&2; exit 2 ;;
 esac
+if [ "${PRINT_UNIT:-0}" = 1 ]; then echo "$UNIT_DIR"; exit 0; fi
 
 # --- the command -------------------------------------------------------------------------------
 STM_BASE="cifar_main_stm_training.py --coarse-classes $CC --seed $SEED $SPLIT --eval-sweep --eval-batch-size 16 --ltm-checkpoint $LTM_CKPT"
