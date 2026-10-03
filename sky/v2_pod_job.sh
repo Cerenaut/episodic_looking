@@ -27,14 +27,22 @@
 #                                      one (by the EXIT trap if the job died before writing it; empty if no unit dir
 #                                      exists), so the reaper can check a failed job's pull with v2_verify.sh --partial
 #   $ROUND/pods/$JOB/setup.log         the pod setup's log with timings (sky/v2_pod_setup.sh, $SETUP_LOG)
+#   ~/v2_job_started (JOB_MARKER)      OUTSIDE the round: one line "<time> ROUND=.. JOB=.. COMMIT=.. PID=.." appended
+#                                      as the job's very first action (the job fails if it cannot); the reaper's proof
+#                                      that a job ran on this pod, valid across rounds (sky/v2_reap.sh)
 # Sentinels (tested by the reaper with test -f, never parsed):
 #   $ROUND/pods/$JOB/JOB_COMPLETE  every unit has job.done and the manifest is written
-#   $ROUND/pods/$JOB/JOB_FAILED    the job ended any other way (written by the EXIT trap, so also on a crash)
+#   $ROUND/pods/$JOB/JOB_FAILED    the job ended any other way (written by the EXIT trap, so also on a crash; NOT on
+#                                  SIGKILL or the OOM killer: the reaper then sees the job gone from sky queue with no
+#                                  sentinel, pulls what there is and HOLDs the pod)
 #
 # Environment: ROUND (round directory, relative to the repo), JOB (normally the cluster name), NPROC (default 3),
 # PY (default .venv/bin/python), COMMIT (the launcher's git commit), ACTIONS_B64 (the actions file, base64; used
 # when no file argument is given), UNIT_TIMEOUT (required: per-unit cap in timeout(1) syntax, e.g. 6h; see
-# sky/v2_launch.sh for suggested values), RUN_V2 (default run_v2.sh; tests only), REQUIRE_CUDA (default 1).
+# sky/v2_launch.sh for suggested values), RUN_V2 (default run_v2.sh; tests only), REQUIRE_CUDA (default 1),
+# JOB_MARKER (default ~/v2_job_started; tests only).
+# Re-running units by hand on a pod after the reaper has pulled a failed job is not supported: the reaper pulls a failed
+# job once and does not pull it again. Re-run through a new launch (sky/v2_reap.sh header).
 # Usage (on the pod): bash sky/v2_pod_job.sh [actions file]
 # Written for bash 3.2 as well as 5 (no mapfile, no wait -n, no find -printf), so it can be tested on the Mac.
 set -u
@@ -46,6 +54,12 @@ JOB=${JOB:-$(hostname -s 2>/dev/null || echo job)}
 RUN_V2=${RUN_V2:-run_v2.sh}
 UNIT_TIMEOUT=${UNIT_TIMEOUT:-}
 LOG=$ROUND/pods/$JOB
+# FIRST ACTION: the round-independent "a job started on this machine" marker (sky/v2_reap.sh never tears down a
+# launch- or setup-failed pod that carries it, whatever round it names: cluster names repeat across rounds). If it
+# cannot be written the job does not start.
+JOB_MARKER=${JOB_MARKER:-$HOME/v2_job_started}
+echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') ROUND=$ROUND JOB=$JOB COMMIT=${COMMIT:-unknown} PID=$$" >> "$JOB_MARKER" \
+  || { echo "JOB FAILED: cannot append to the job marker $JOB_MARKER; not starting" >&2; exit 1; }
 mkdir -p "$LOG" || exit 1
 rm -f "$LOG/JOB_COMPLETE" "$LOG/JOB_FAILED" "$LOG/manifest.tsv"
 SETUP_LOG=${SETUP_LOG:-$HOME/v2_setup.log}

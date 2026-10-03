@@ -26,14 +26,19 @@
 #                 EU-RO-1 had capacity and synced well from this Mac in the 2026-10-03/04 rounds; EUR-IS (IS) took
 #                 the file-mount sync at 4-90 KB/s and killed it (ledger, re-review N1). Each pod's yaml
 #                 (<round dir>/yaml/<cluster>.yaml) restricts resources to these regions (any_of, every accelerator
-#                 of sky/v2_pod.yaml in each). If that launch fails and sky status (read successfully) shows no such
-#                 cluster, it is launched again from <cluster>.fallback.yaml: every other region of the RunPod catalog
-#                 except AVOID_REGIONS (default "IS"). STRICT_REGIONS=1: no fallback (the launch fails instead).
+#                 of sky/v2_pod.yaml in each). If that launch fails FOR LACK OF CAPACITY (its log names SkyPilot's
+#                 ResourcesUnavailableError and not "Cluster launched"; not exit 142, LAUNCH_TIMEOUT, after which the API
+#                 server may still be launching) and sky status (read successfully) shows no such cluster, it is
+#                 launched again from <cluster>.fallback.yaml: every other region of the RunPod catalog except
+#                 AVOID_REGIONS (default "IS"). Any other failure is not retried (logged why). STRICT_REGIONS=1: no
+#                 fallback (the launch fails instead).
 #                 Regions known to SkyPilot's RunPod catalog (v8, 2026-10-04): AU CA CZ DK FR IN IS JP NL NO RO SE SG US.
 #   CIFAR_SRC     the Mac's CIFAR-100 dir (default ~/Dev/datasets/cifar-100-python): sha256 of train, test and meta are
 #                 computed here and passed to the pod, whose setup fetches the dataset from the official URL and
 #                 fails unless its files are byte-for-byte these (sky/v2_pod_setup.sh). The dataset is not synced.
 #   The e40 LTM checkpoint is mounted only on a pod whose actions file has a unit with LTM=e40 (the e13 one always).
+#   LTM_SRC (default ~/Dev/cifar_100_pretrain, = the yaml's file_mounts sources): sha256 of e13 (and e40 for such a pod)
+#   computed here and passed (LTM_SHA256_E13/_E40); the pod's setup fails unless the mounted files match.
 #   IDLE (autostop minutes, default 240), NPROC (per pod, default 3), ALLOW_DIRTY=1 (launch from a tree with
 #   uncommitted changes or untracked non-ignored files; the commit is then recorded as +dirty), AUTOSTOP_WAIT (s,
 #   default 3600), LAUNCH_TIMEOUT (s per sky launch attempt, default 5400; a fallback launch is a second attempt),
@@ -43,7 +48,10 @@
 #   no actions copies and starts nothing).
 # A launch that fails (sky launch exits non-zero, also after the fallback) is recorded in <round dir>/launch_failed/
 # <cluster> with its exit code: sky/v2_status.sh shows LAUNCH_FAILED (exit 1), and sky/v2_reap.sh tears such a pod down
-# once it has proved over ssh that its job never started.
+# once it has proved that no job ever started on it (header of sky/v2_reap.sh; after exit 142 not before LF142_GRACE_MIN).
+# Refused: a cluster name that is still live in ANOTHER round dir of the repo (<dir>/actions/<cluster>.txt without
+# <dir>/reaped/<cluster>): names repeat across rounds and two reapers must never watch one pod.
+# Re-running units by hand on a pod is not supported (the reaper pulls a failed job once): re-run via a new launch.
 set -u
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
@@ -174,6 +182,31 @@ for f in "$@"; do
 done
 
 [ -s "$LTM_SRC/cifar_100_subclasses_12_e13.pth" ] || die "no $LTM_SRC/cifar_100_subclasses_12_e13.pth (mounted on every pod)"
+# sha256 of the LTM checkpoints, checked on the pod by its setup (sky/v2_pod_setup.sh, phase ltm), as for CIFAR-100
+SHA_E13=$(sha256 "$LTM_SRC/cifar_100_subclasses_12_e13.pth"); [[ "$SHA_E13" =~ ^[0-9a-f]{64}$ ]] || die "cannot hash $LTM_SRC/cifar_100_subclasses_12_e13.pth"
+SHA_E40=""
+case " ${E40[*]} " in *" 1 "*)
+  SHA_E40=$(sha256 "$LTM_SRC/cifar_100_subclasses_12_e40.pth"); [[ "$SHA_E40" =~ ^[0-9a-f]{64}$ ]] || die "cannot hash $LTM_SRC/cifar_100_subclasses_12_e40.pth" ;;
+esac
+say "LTM sha256 (Mac): e13 ${SHA_E13:0:12}..${SHA_E40:+ e40 ${SHA_E40:0:12}.. (pods with LTM=e40 units only)}"
+
+# --- a cluster name still live in ANOTHER round is refused ---------------------------------------------
+# Cluster names are actions-file basenames, so they repeat across rounds; two live rounds with the same name would each
+# run a reaper on the same pod, and the other round's reaper reads this round's pod through its own markers (F1 of the
+# 2026-10-04 final review). Searched: every <dir>/actions/<cluster>.txt in the repo up to depth 6 (round dirs live
+# under runs_local/), other than this round's; "live" = no <dir>/reaped/<cluster> (a DRY reaper's reaped/<c>.dry does
+# not count). Unreadable (find fails) = refused.
+for c in "${CLUSTERS[@]}"; do
+  hits=$(find "$REPO" -maxdepth 6 \( -name .git -o -name .venv -o -name node_modules \) -prune -o -type f -path "*/actions/$c.txt" -print 2>/dev/null) \
+    || die "cannot search the repo for other rounds that use the cluster name $c (find failed); nothing launched"
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    od=$(dirname "$(dirname "$h")"); od=${od#"$REPO/"}
+    [ "$od" = "$ROUND" ] && continue
+    [ -e "$REPO/$od/reaped/$c" ] && continue
+    die "cluster name $c is still live in another round: $od (it has actions/$c.txt and no reaped/$c). Its reaper may still act on a pod of that name. Reap or finish that round first (once its pod is gone and its results are safe: touch $od/reaped/$c), or rename this actions file"
+  done <<< "$hits"
+done
 
 # --- per-cluster yaml: sky/v2_pod.yaml with the regions (any_of) and, if needed, the e40 mount -----------------
 gen_yaml() {  # $1 = output, $2 = regions ("" = the template's infra line unchanged), $3 = e40 (0|1)
@@ -204,27 +237,48 @@ done
 if [ "$DRY" = 1 ]; then
   for f in "$@"; do
     c=$(basename "$f" .txt); B64=$(base64 < "$f" | tr -d '\n')
-    say "DRY: sky launch -c $c $ROUND/yaml/$c.yaml (regions $REGIONS${FALLBACK:+, then fallback $FALLBACK}) --env JOB=$c --env ROUND=$ROUND --env COMMIT=$COMMIT --env NPROC=$NPROC --env UNIT_TIMEOUT=$UNIT_TIMEOUT --env ACTIONS_B64=<${#B64} chars> --env CIFAR_SHA256_*=<the Mac's> -y -d"
+    say "DRY: sky launch -c $c $ROUND/yaml/$c.yaml (regions $REGIONS${FALLBACK:+, then fallback $FALLBACK}) --env JOB=$c --env ROUND=$ROUND --env COMMIT=$COMMIT --env NPROC=$NPROC --env UNIT_TIMEOUT=$UNIT_TIMEOUT --env ACTIONS_B64=<${#B64} chars> --env CIFAR_SHA256_*=<the Mac's> --env LTM_SHA256_E13/_E40=<the Mac's> -y -d"
   done
   say "DRY: nothing launched, no actions copies written, no reaper started"; exit 0
 fi
 mkdir -p "$ROUND/actions" "$ROUND/yaml" "$ROUND/launch_failed" || die "cannot create $ROUND/actions, yaml, launch_failed"
 [ -f "$ROUND/pull_root" ] || echo "$PR" > "$ROUND/pull_root"
-attempt() {  # $1 = cluster, $2 = yaml, $3 = actions (base64): one sky launch, capped at LAUNCH_TIMEOUT (exit 142)
+attempt() {  # $1 = cluster, $2 = yaml, $3 = actions (base64), $4 = e40 sha256 or "": one sky launch, capped at
+  # LAUNCH_TIMEOUT (exit 142)
   perl -e 'alarm shift; exec @ARGV or exit 127' "${LAUNCH_TIMEOUT:-5400}" \
     sky launch -c "$1" "$2" --env JOB="$1" --env ROUND="$ROUND" --env COMMIT="$COMMIT" \
     --env NPROC="$NPROC" --env UNIT_TIMEOUT="$UNIT_TIMEOUT" --env ACTIONS_B64="$3" \
-    --env CIFAR_SHA256_TRAIN="$SHA_TRAIN" --env CIFAR_SHA256_TEST="$SHA_TEST" --env CIFAR_SHA256_META="$SHA_META" -y -d
+    --env CIFAR_SHA256_TRAIN="$SHA_TRAIN" --env CIFAR_SHA256_TEST="$SHA_TEST" --env CIFAR_SHA256_META="$SHA_META" \
+    --env LTM_SHA256_E13="$SHA_E13" --env LTM_SHA256_E40="$4" -y -d
 }
-launch_one() {  # $1 = cluster, $2 = actions (base64): preferred regions, then (if the cluster is provably absent) the
-  # fallback regions. Runs in the background; its exit code is the last attempt's.
-  local c=$1 r
-  attempt "$c" "$ROUND/yaml/$c.yaml" "$2"; r=$?
+launch_one() {  # $1 = cluster, $2 = actions (base64), $3 = e40 sha256 or "", $4 = this launch's log (its stdout):
+  # preferred regions, then the fallback regions ONLY when the first attempt is a capacity failure: it exited non-zero
+  # but not 142, its part of the log names SkyPilot's ResourcesUnavailableError (0.13: "Failed to acquire resources in
+  # all zones in <region>", "Failed to provision all possible launchable resources") and does not say "Cluster
+  # launched" (the pod was provisioned and something later failed), and sky status (read successfully) lists no such
+  # cluster. Exit 142 = LAUNCH_TIMEOUT killed the client while the API server may still be launching: a second launch
+  # elsewhere could make a second pod; never. Runs in the background; its exit code is the last attempt's.
+  local c=$1 r off part
+  off=$(wc -c < "$4" 2>/dev/null | tr -d ' '); [[ "$off" =~ ^[0-9]+$ ]] || off=0
+  attempt "$c" "$ROUND/yaml/$c.yaml" "$2" "$3"; r=$?
   [ $r -eq 0 ] || [ ! -f "$ROUND/yaml/$c.fallback.yaml" ] && return $r
+  if [ $r -eq 142 ]; then
+    say "$c: launch in the preferred regions killed by LAUNCH_TIMEOUT (exit 142); the API server may still be launching it: NOT retrying in other regions"
+    return $r
+  fi
+  part=$(tail -c +$((off + 1)) "$4" 2>/dev/null | strip)
+  if ! printf '%s\n' "$part" | grep -q 'ResourcesUnavailableError'; then
+    say "$c: launch in the preferred regions exited $r without a capacity failure in its log (no ResourcesUnavailableError): NOT retrying in other regions"
+    return $r
+  fi
+  if printf '%s\n' "$part" | grep -q 'Cluster launched'; then
+    say "$c: launch in the preferred regions exited $r after the cluster was launched (provisioned): NOT retrying in other regions"
+    return $r
+  fi
   sky_row "$c"
   if [ "$SKY_STATE" = ABSENT ]; then
-    say "$c: launch in the preferred regions ($REGIONS) exited $r and sky status lists no such cluster: trying the fallback regions ($FALLBACK)"
-    attempt "$c" "$ROUND/yaml/$c.fallback.yaml" "$2"; r=$?
+    say "$c: launch in the preferred regions ($REGIONS) exited $r with a capacity failure (ResourcesUnavailableError) and sky status lists no such cluster: trying the fallback regions ($FALLBACK)"
+    attempt "$c" "$ROUND/yaml/$c.fallback.yaml" "$2" "$3"; r=$?
   else
     say "$c: launch in the preferred regions exited $r and sky status is $SKY_STATE${SKY_LINE:+ ($SKY_LINE)}: NOT retrying in other regions"
   fi
@@ -246,7 +300,8 @@ for f in "$@"; do
   rm -f "$ROUND/launch_failed/$c"   # a marker from an earlier launch of this name (the cluster is absent: checked above)
   B64=$(base64 < "$f" | tr -d '\n')
   say "launching $c ($ROUND/yaml/$c.yaml)"
-  launch_one "$c" "$B64" < /dev/null > "$ROUND/$c.launch.log" 2>&1 &
+  e40sha=""; [ "${E40[$i]}" = 1 ] && e40sha=$SHA_E40
+  launch_one "$c" "$B64" "$e40sha" "$ROUND/$c.launch.log" < /dev/null > "$ROUND/$c.launch.log" 2>&1 &
   PIDS[$i]=$!
   i=$((i + 1))
   sleep 3

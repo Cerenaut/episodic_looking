@@ -14,13 +14,17 @@
 #      so the pod's files are byte-for-byte the Mac's; only then is the dir moved to $DATA_DIR.
 #   An existing $DATA_DIR whose three files already match is kept (no download); one that does not match is moved
 #   aside to $DATA_DIR.mismatch.<time> (pod-local input data, never results) and fetched again.
+# Phase "ltm": sha256 of the synced e13 LTM checkpoint ($LTM_DIR/cifar_100_subclasses_12_e13.pth) = LTM_SHA256_E13 and,
+#   when LTM_SHA256_E40 is set (the launcher sets it only for a pod with LTM=e40 units, whose e40 file is mounted), of
+#   the e40 one = LTM_SHA256_E40; both computed by sky/v2_launch.sh from the Mac's files. A mismatch fails setup.
 # Phase "env": .venv from /usr/bin/python3.12 (the image's python3 is 3.10: section 11); requirements installed with
 #   uv (pip install uv, then uv pip install ... --index-strategy unsafe-best-match; pip once took 53 min); then the
 #   installed torch must be exactly requirements.txt's pin (2.13.0+cu126) and, unless REQUIRE_CUDA=0, see a GPU.
 # Timings of each step go to $SETUP_LOG (default ~/v2_setup.log); sky/v2_pod_job.sh copies it into the round's pods
 # dir, so it is pulled with the results.
-# Usage: bash sky/v2_pod_setup.sh [dataset|env|all]     (default all: the two phases run in parallel)
-# Environment: CIFAR_SHA256_TRAIN, CIFAR_SHA256_TEST, CIFAR_SHA256_META (required for "dataset"); DATA_DIR (default
+# Usage: bash sky/v2_pod_setup.sh [dataset|ltm|env|all]  (default all: ltm, then dataset and env in parallel)
+# Environment: CIFAR_SHA256_TRAIN, CIFAR_SHA256_TEST, CIFAR_SHA256_META (required for "dataset"); LTM_SHA256_E13
+# (required for "ltm"), LTM_SHA256_E40 (optional), LTM_DIR (default ~/cifar_100_pretrain); DATA_DIR (default
 # ~/cifar-100-python, where ../cifar-100-python resolves from ~/sky_workdir: section 12); CIFAR_URL, CIFAR_MD5,
 # FETCH_TRIES (default 4), RETRY_SLEEP (s, default 20), PYBIN (default /usr/bin/python3.12), UV_TIMEOUT (s per uv
 # install attempt, default 1200; two attempts), REQUIRE_CUDA (default 1), SETUP_LOG.
@@ -34,6 +38,7 @@ CIFAR_MD5=${CIFAR_MD5:-eb9058c3a382ffc7106e4002c42a8d85}
 FETCH_TRIES=${FETCH_TRIES:-4}; RETRY_SLEEP=${RETRY_SLEEP:-20}
 PYBIN=${PYBIN:-/usr/bin/python3.12}
 UV_TIMEOUT=${UV_TIMEOUT:-1200}
+LTM_DIR=${LTM_DIR:-$HOME/cifar_100_pretrain}
 SETUP_LOG=${SETUP_LOG:-$HOME/v2_setup.log}
 T0=$(date +%s)
 log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] +$(( $(date +%s) - T0 ))s $*" | tee -a "$SETUP_LOG"; }
@@ -103,6 +108,22 @@ dataset() {
   log "dataset: $DATA_DIR in place; sha256 train $CIFAR_SHA256_TRAIN test $CIFAR_SHA256_TEST meta $CIFAR_SHA256_META = the Mac's"
 }
 
+ltm() {  # the synced LTM checkpoints must be byte-for-byte the Mac's (sha256 computed by sky/v2_launch.sh)
+  local h
+  [[ "${LTM_SHA256_E13:-}" =~ ^[0-9a-f]{64}$ ]] || die "LTM_SHA256_E13 not set to a sha256 (sky/v2_launch.sh passes the Mac's): '${LTM_SHA256_E13:-}'"
+  [ -f "$LTM_DIR/cifar_100_subclasses_12_e13.pth" ] || die "no $LTM_DIR/cifar_100_subclasses_12_e13.pth (file mount)"
+  h=$(sha256 "$LTM_DIR/cifar_100_subclasses_12_e13.pth")
+  [ "$h" = "$LTM_SHA256_E13" ] || die "sha256 of $LTM_DIR/cifar_100_subclasses_12_e13.pth is ${h:-unreadable}, the Mac's copy is $LTM_SHA256_E13"
+  log "ltm: e13 checkpoint sha256 $LTM_SHA256_E13 = the Mac's"
+  if [ -n "${LTM_SHA256_E40:-}" ]; then   # passed only for a pod with LTM=e40 units (the e40 file is mounted then)
+    [[ "$LTM_SHA256_E40" =~ ^[0-9a-f]{64}$ ]] || die "LTM_SHA256_E40 is not a sha256: '$LTM_SHA256_E40'"
+    [ -f "$LTM_DIR/cifar_100_subclasses_12_e40.pth" ] || die "no $LTM_DIR/cifar_100_subclasses_12_e40.pth (file mount; LTM=e40 units)"
+    h=$(sha256 "$LTM_DIR/cifar_100_subclasses_12_e40.pth")
+    [ "$h" = "$LTM_SHA256_E40" ] || die "sha256 of $LTM_DIR/cifar_100_subclasses_12_e40.pth is ${h:-unreadable}, the Mac's copy is $LTM_SHA256_E40"
+    log "ltm: e40 checkpoint sha256 $LTM_SHA256_E40 = the Mac's"
+  fi
+}
+
 env_setup() {
   local want got r i
   want=$(sed -n 's/^torch==//p' requirements.txt)
@@ -132,8 +153,10 @@ env_setup() {
 log "setup starting ($PHASE) on $(hostname 2>/dev/null)"
 case "$PHASE" in
   dataset) dataset ;;
+  ltm) ltm ;;
   env) env_setup ;;
-  all) ( dataset ) & dp=$!   # the download runs while uv installs; both must succeed
+  all) ltm                   # seconds; before anything slow, so a wrong checkpoint fails at once
+       ( dataset ) & dp=$!   # the download runs while uv installs; both must succeed
        env_setup
        wait $dp || die "dataset phase failed (see its lines above)" ;;
   *) die "unknown phase $PHASE" ;;

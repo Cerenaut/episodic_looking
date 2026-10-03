@@ -1,6 +1,6 @@
 # One pod job of the v2 CLS/STM runs (sky/v2_pod_job.sh). Launch with sky/v2_launch.sh, which writes a per-cluster copy
 # of this file (<round>/yaml/<cluster>.yaml: region preference, e40 mount when needed), passes JOB, ROUND, COMMIT,
-# UNIT_TIMEOUT, the actions file (ACTIONS_B64) and the Mac's CIFAR-100 sha256s, applies autostop separately (-i/--down
+# UNIT_TIMEOUT, the actions file (ACTIONS_B64) and the Mac's CIFAR-100 and LTM checkpoint sha256s, applies autostop separately (-i/--down
 # are ignored with -d), and logs. Reap with sky/v2_reap.sh; status with sky/v2_status.sh.
 name: v2-pod
 resources:
@@ -32,6 +32,10 @@ envs:
   CIFAR_SHA256_TRAIN: ""
   CIFAR_SHA256_TEST: ""
   CIFAR_SHA256_META: ""
+  # sha256 of the Mac's LTM checkpoints (e13 always; e40 only for a pod with LTM=e40 units), passed by sky/v2_launch.sh;
+  # the setup refuses to run without the e13 one and fails on any mismatch.
+  LTM_SHA256_E13: ""
+  LTM_SHA256_E40: ""
 setup: |
   set -e
   df -h /dev/shm | tail -1

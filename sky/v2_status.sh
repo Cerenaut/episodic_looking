@@ -11,6 +11,8 @@
 #   LAUNCH_FAILED       sky/v2_launch.sh recorded a failed sky launch (launch_failed/<cluster>, with the exit code) and
 #                       the cluster is not reaped yet (the reaper tears it down once it has proved nothing ran)
 #   SETUP_FAILED        sky queue showed FAILED_SETUP (setup_failed/<cluster>), not reaped yet
+#   NO_SENTINEL         the job ended without JOB_COMPLETE or JOB_FAILED (killed without its EXIT trap: SIGKILL, OOM);
+#                       the reaper HOLDs the pod and pulls what there is once (no_sentinel/<cluster>)
 #   REAPER NOT RUNNING  clusters remain and the reaper's heartbeat is older than 15 min (or missing) and its pid is
 #                       gone; REAPER STALE if the pid is alive but the heartbeat is old (hung, or a very long pull)
 # A job that failed before copying its actions file (e.g. no UNIT_TIMEOUT) prints JOB_FAILED with "before the units".
@@ -18,6 +20,8 @@
 # counted against the total, so a working zero reads "0/5". HELD, failed_pulled, failed_safe (a failed job whose files
 # are verified here; short autostop) and failed_verify=FAIL markers are shown, and a count of held or failed clusters.
 # sky status is read ONCE for every cluster (sky_status_all); if that call fails every cluster shows UNREADABLE.
+# A failed job is pulled once (failed_pulled); re-running its units by hand on the pod is not supported: re-run via a
+# new launch (sky/v2_reap.sh header).
 # Usage: bash sky/v2_status.sh <round dir>
 set -u
 cd "$(dirname "$0")/.."
@@ -65,7 +69,8 @@ for af in "$ROUND"/actions/*.txt; do
   [ -e "$ROUND/launch_failed/$c" ] && { marks="$marks LAUNCH_FAILED($(cat "$ROUND/launch_failed/$c" 2>/dev/null))"; rc=1; }
   [ -e "$ROUND/setup_failed/$c" ] && { marks="$marks SETUP_FAILED"; rc=1; }
   [ -e "$ROUND/held/$c" ] && marks="$marks HELD($(cat "$ROUND/held/$c"))"
-  [ -e "$ROUND/failed_pulled/$c" ] && marks="$marks failed_pulled"
+  [ -e "$ROUND/no_sentinel/$c" ] && { marks="$marks NO_SENTINEL($(cat "$ROUND/no_sentinel/$c" 2>/dev/null): job killed without its EXIT trap?$([ -e "$ROUND/no_sentinel_pulled/$c" ] && echo '; pulled, unverified'))"; rc=1; }
+  [ -e "$ROUND/failed_pulled/$c" ] && marks="$marks failed_pulled(once; not re-pulled: re-run via a new launch)"
   [ "$(cat "$ROUND/failed_verify/$c" 2>/dev/null)" = FAIL ] && marks="$marks failed_verify=FAIL"
   [ -e "$ROUND/failed_safe/$c" ] && marks="$marks failed_safe(autostop short since $(cat "$ROUND/failed_safe/$c"))"
   sky_row_all "$c"
@@ -95,7 +100,7 @@ EOF
     FAILED-EARLY*) printf '%-18s %-10s %-11s %-9s %-13s %s\n' "$c" UP "$au" "0/$total" JOB_FAILED "(before the units: ${r#FAILED-EARLY })$marks" ;;
     NOT-STARTED|NOWORKDIR)
       if [ -e "$ROUND/launch_failed/$c" ] || [ -e "$ROUND/setup_failed/$c" ]; then
-        printf '%-18s %-10s %-11s %-9s %-13s %s\n' "$c" UP "$au" "0/$total" LAUNCH_FAILED "(nothing ran: the reaper tears it down)$marks"
+        printf '%-18s %-10s %-11s %-9s %-13s %s\n' "$c" UP "$au" "0/$total" LAUNCH_FAILED "(nothing started: the reaper tears it down once it has proved no job ever ran on it)$marks"
       else
         printf '%-18s %-10s %-11s %-9s %-13s %s\n' "$c" UP "$au" "?/$total" "$r" "(setup still running?)$marks"
       fi ;;

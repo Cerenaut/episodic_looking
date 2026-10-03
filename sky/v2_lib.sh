@@ -60,6 +60,35 @@ sky_row_all() {
   SKY_LINE=$(printf '%s\n' "$SKY_ROWS" | awk -v c="$1" '$1==c' | head -1)
   if [ -n "$SKY_LINE" ]; then SKY_STATE=ROW; else SKY_STATE=ABSENT; fi
 }
+# queue_read <cluster>: ONE `sky queue <cluster>`. Sets Q_OK=1 and Q_STATUSES (the STATUS of every job, space-separated;
+# empty when the cluster has no job) only when ALL hold: sky exited 0; it printed exactly one line "Job queue of ... on
+# cluster <cluster>"; it did not print "Failed to get the job queue" (SkyPilot 0.13 prints that and still exits 0); and
+# the lines after it are either none (no jobs: SkyPilot prints no table at all, not even a header) or a table whose
+# header starts "ID" and holds STATUS, every row of which holds exactly one known job status as a whole field. Anything
+# else leaves Q_OK=0 (UNREADABLE). Whole fields, so FAILED_SETUP or FAILED_DRIVER is never read as FAILED.
+JOB_STATUSES="INIT PENDING SETTING_UP RUNNING FAILED_DRIVER SUCCEEDED FAILED FAILED_SETUP CANCELLED"
+queue_read() {
+  local c=$1 out rc r
+  Q_OK=0; Q_STATUSES=""
+  out=$(tmo "$SKY_TIMEOUT" sky queue "$c" 2>&1 < /dev/null); rc=$?
+  [ $rc -eq 0 ] || return 0
+  out=$(printf '%s\n' "$out" | strip)
+  printf '%s\n' "$out" | grep -q 'Failed to get the job queue' && return 0
+  r=$(printf '%s\n' "$out" | awk -v c="$c" -v sts="$JOB_STATUSES" '
+    BEGIN { n = split(sts, a, " "); for (i = 1; i <= n; i++) known[a[i]] = 1; bad = 0; seen = 0; h = 0; s = ""; t = " on cluster " c }
+    { line = $0; sub(/[[:space:]]+$/, "", line) }
+    line ~ /^Job queue of / && length(line) > length(t) && substr(line, length(line) - length(t) + 1) == t { seen++; p = 1; next }
+    !p || !NF { next }
+    !h { if ($1 == "ID" && line ~ /[[:space:]]STATUS([[:space:]]|$)/) h = 1; else bad = 1; next }
+    { k = 0; st = ""; for (i = 1; i <= NF; i++) if ($i in known) { k++; st = $i }
+      if (k != 1) bad = 1; else s = s " " st }
+    END { if (seen != 1 || bad) print "BAD"; else print "OK" s }')
+  case "$r" in OK|"OK "*) Q_OK=1; Q_STATUSES=${r#OK}; Q_STATUSES=${Q_STATUSES# } ;; esac
+  return 0
+}
+# q_has <status...>: true if the last queue_read showed a job in any of these statuses (whole words).
+q_has() { local w; for w in "$@"; do case " $Q_STATUSES " in *" $w "*) return 0 ;; esac; done; return 1; }
+
 has_autostop() { printf '%s\n' "$1" | grep -qE '[0-9]+[hm] \(down\)'; }
 row_status() { printf '%s\n' "$1" | grep -owE 'UP|INIT|STOPPED' | head -1; }
 
@@ -91,11 +120,12 @@ sha256() {
   if command -v sha256sum >/dev/null; then sha256sum < "$1" | cut -d' ' -f1; else shasum -a 256 < "$1" | cut -d' ' -f1; fi
 }
 
-# Markers of clusters that failed or were held in a round (sky/v2_reap.sh writes held/, job_failed/, setup_failed/;
-# sky/v2_launch.sh writes launch_failed/). failed_or_held <round>: prints the distinct cluster names, one per line.
+# Markers of clusters that failed or were held in a round (sky/v2_reap.sh writes held/, job_failed/, setup_failed/,
+# no_sentinel/; sky/v2_launch.sh writes launch_failed/). failed_or_held <round>: prints the distinct cluster names, one
+# per line.
 failed_or_held() {
   local d f
-  for d in held job_failed launch_failed setup_failed; do
+  for d in held job_failed launch_failed setup_failed no_sentinel; do
     for f in "$1/$d"/*; do [ -e "$f" ] && basename "$f"; done
   done | LC_ALL=C sort -u
 }
