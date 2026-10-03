@@ -214,7 +214,16 @@ while [ "$(echo "$pending" | tr -d ' ')" != "" ] && [ "$(date +%s)" -lt "$deadli
   done
   [ "$(echo "$pending" | tr -d ' ')" = "" ] || sleep 30
 done
-i=0; for c in "${CLUSTERS[@]}"; do collect $i; i=$((i + 1)); done
+# Autostop is on, so the money backstop holds; now wait for every sky launch to return (each is capped by
+# LAUNCH_TIMEOUT), so that its exit code is logged: a launch can still be syncing files or running setup here.
+i=0
+for c in "${CLUSTERS[@]}"; do
+  if [ "${PIDS[$i]}" != 0 ] && [ -z "${LRC[$i]}" ] && kill -0 "${PIDS[$i]}" 2>/dev/null; then
+    say "$c: waiting for sky launch to return (file sync / setup; capped at ${LAUNCH_TIMEOUT:-5400}s)"
+    wait "${PIDS[$i]}" 2>/dev/null
+  fi
+  collect $i; i=$((i + 1))
+done
 say "--- sky status ---"
 tmo "$SKY_TIMEOUT" sky status < /dev/null 2>&1 | strip | tee -a "$LOG"
 if [ "$(echo "$pending" | tr -d ' ')" != "" ]; then

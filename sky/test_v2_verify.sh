@@ -214,7 +214,8 @@ case "$1" in
     if [ $((i % 60)) = 0 ]; then echo "$((i / 60))h (down)" > "$S/$c.autostop"; else echo "${i}m (down)" > "$S/$c.autostop"; fi ;;
   down) rm -f "$S/$2.up"; echo "$2" >> "$S/downs" ;;
   queue) if [ -f "$S/$2.failed_setup" ]; then echo " ID  NAME  STATUS"; echo " 1   v2-pod  FAILED_SETUP"; else echo " 1  v2-pod  RUNNING"; fi ;;
-  launch) c=$3; [ -f "$S/launchfail_$c" ] && { echo "launch failed" ; exit 3; }; touch "$S/$c.up"; echo "-" > "$S/$c.autostop" ;;
+  launch) c=$3; [ -f "$S/launchfail_$c" ] && { echo "launch failed" ; exit 3; }; touch "$S/$c.up"; echo "-" > "$S/$c.autostop"
+          [ -f "$S/launchslow_$c" ] && { sleep 40; exit 4; } ;;
 esac
 exit 0
 EOF
@@ -364,6 +365,7 @@ st;                     status_case 1 "cluster absent" "ABSENT"
 st "$J.up"; echo "-" > "$FAKE_STATE/$J.autostop"; status_case 1 "UP row without autostop" "NO-AUTOSTOP"
 st "$J.up" "$J.sshfail"; status_case 1 "ssh fails" "UNREADABLE (ssh failed"
 st "$J.up"; mkdir -p "$MR/$ROUND/held"; echo "2026-10-04 x" > "$MR/$ROUND/held/$J"; status_case 0 "held pod shows HELD" "HELD("
+export FAKE_POD=$W/podnot; st "$J.up"; status_case 0 "job failed before copying its actions file shows JOB_FAILED" "JOB_FAILED *(before the units"
 unset FAKE_POD
 
 # === the launcher (a fake git repo with the fake run_v2.sh) =================================================
@@ -417,6 +419,12 @@ UNIT_TIMEOUT=1h launch "$LA/v2t-a.txt"   # a second launch must not start a seco
 expect "second launch: the existing reaper is reused and the UP cluster not relaunched" \
   bash -c "grep -q 'reaper already running' '$W/launch_out.txt' && grep -q 'already exists in sky status' '$W/launch_out.txt' && [ \"\$(grep -c '^launch -c v2t-a' '$FAKE_STATE/sky_calls')\" = 1 ]"
 [ -n "$RPID" ] && kill "$RPID" 2>/dev/null
+# a launch that is still running (file sync, setup) after autostop is confirmed: its exit code is still collected
+printf '%s\n' "$T|EPOCHS=1|pretrain rl \"0 1\" 5|$T/pretrain/rl/pair0_1/seed5|" > "$LA/v2t-slow.txt"
+st launchslow_v2t-slow; AW=120 UNIT_TIMEOUT=1h launch "$LA/v2t-slow.txt"
+expect "launch: waits for a launch still running after autostop, and logs its exit code" \
+  bash -c "grep -q 'v2t-slow autostop confirmed' '$LL' && grep -q 'v2t-slow: waiting for sky launch to return' '$LL' && grep -q 'v2t-slow LAUNCH/SETUP FAILED: sky launch exited 4' '$LL'"
+RPID=$(cat "$LR/$LROUND/reaper.lock/pid" 2>/dev/null); [ -n "$RPID" ] && kill "$RPID" 2>/dev/null
 sleep 1
 
 echo "---"; echo "$passes passed, $fails wrong"

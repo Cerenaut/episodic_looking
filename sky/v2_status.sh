@@ -10,6 +10,7 @@
 #   NO-AUTOSTOP         an UP or INIT row without "Nh (down)"/"Nm (down)" (it would bill indefinitely)
 #   REAPER NOT RUNNING  clusters remain and the reaper's heartbeat is older than 15 min (or missing) and its pid is
 #                       gone; REAPER STALE if the pid is alive but the heartbeat is old (hung, or a very long pull)
+# A job that failed before copying its actions file (e.g. no UNIT_TIMEOUT) prints JOB_FAILED with "before the units".
 # A pod whose job has not started yet prints NOT-STARTED (ssh worked, no actions copy on the pod yet). Units done are
 # counted against the total, so a working zero reads "0/5". HELD, failed_pulled and SETUP_FAILED markers are shown.
 # Usage: bash sky/v2_status.sh <round dir>
@@ -52,7 +53,7 @@ for af in "$ROUND"/actions/*.txt; do
   c=$(basename "$af" .txt)
   total=$(grep -c . "$af")
   if [ -e "$ROUND/reaped/$c" ]; then
-    printf '%-18s %-10s %-11s %-9s %-13s %s\n' "$c" REAPED - "$total/$total" verified "$(cat "$ROUND/reaped/$c")"; continue
+    printf '%-18s %-10s %-11s %-9s %-13s %s\n' "$c" REAPED - - reaped "$(cat "$ROUND/reaped/$c")"; continue
   fi
   marks=""
   [ -e "$ROUND/held/$c" ] && marks="$marks HELD($(cat "$ROUND/held/$c"))"
@@ -74,7 +75,7 @@ for af in "$ROUND"/actions/*.txt; do
   r=$(tmo 60 ssh -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=no "$c" "bash -s" 2>/dev/null <<EOF
 cd ~/sky_workdir 2>/dev/null || { echo NOWORKDIR; exit 0; }
 P=$ROUND/pods/$c
-[ -f "\$P/actions.txt" ] || { echo NOT-STARTED; exit 0; }
+[ -f "\$P/actions.txt" ] || { [ -f "\$P/JOB_FAILED" ] && { echo "FAILED-EARLY \$(tail -1 "\$P/progress.log" 2>/dev/null | cut -c1-110)"; exit 0; }; echo NOT-STARTED; exit 0; }
 d=0; t=0
 while IFS='|' read -r tree env args unit flag || [ -n "\$tree" ]; do [ -z "\$tree" ] && continue; t=\$((t+1)); [ -f "\$unit/job.done" ] && d=\$((d+1)); done < "\$P/actions.txt"
 s=running; [ -f "\$P/JOB_FAILED" ] && s=JOB_FAILED; [ -f "\$P/JOB_COMPLETE" ] && s=JOB_COMPLETE
@@ -82,6 +83,7 @@ echo "\$d \$t \$s \$(tail -1 "\$P/progress.log" 2>/dev/null | cut -c1-110)"
 EOF
 )
   case "$r" in
+    FAILED-EARLY*) printf '%-18s %-10s %-11s %-9s %-13s %s\n' "$c" UP "$au" "0/$total" JOB_FAILED "(before the units: ${r#FAILED-EARLY })$marks" ;;
     NOT-STARTED|NOWORKDIR) printf '%-18s %-10s %-11s %-9s %-13s %s\n' "$c" UP "$au" "?/$total" "$r" "(setup still running?)$marks" ;;
     *)
       set -f; set -- $r; set +f   # no globbing: the progress line holds [brackets]
