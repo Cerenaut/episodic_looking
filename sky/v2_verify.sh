@@ -3,29 +3,41 @@
 # (sky/test_v2_verify.sh). Exit 0 ONLY when the pulled results of one pod job are verifiably on this machine;
 # anything missing, unreadable or unexpected is exit 1. It never touches a pod.
 #
-# Checks, on local files only (all paths relative to ROOT, default the repo):
+# Checks, on local files only. Unit paths are relative to ROOT (the pull root, default the repo); ROUND is relative
+# to ROOT or absolute (the reaper passes the repo's round dir, which holds actions/ and pods/, as an absolute path, so
+# that the unit trees can be pulled to another root: sky/v2_reap.sh PULL_ROOT).
 #   1. $ROUND/pods/$JOB/JOB_COMPLETE was pulled (the pod finished cleanly), and no JOB_FAILED next to it.
 #   2. The pulled actions.txt is byte-identical to the launcher's copy $ROUND/actions/$JOB.txt.
-#   3. manifest.tsv (size<TAB>path, written on the pod after the last unit) is non-empty, every line parses, every
-#      path lies under a unit dir of the actions file, and every file exists here with the same size.
-#   4. Every unit of the actions file: job.done; at least one results_*.txt (not _val) and, unless VAL_HOLDOUT=0 is
-#      in its environment, at least one results_*_val.txt, each with an "evaluate" line; at least one manifest
-#      entry; and for STM units (rl, actor) that train, the checkpoint (pretrain: stm_pretrain.pth; others: a .pth).
+#   3. manifest.tsv (size<TAB>sha256<TAB>path, written on the pod after the last unit) is non-empty, every line
+#      parses, every path lies under a unit dir of the actions file, and every file exists here with the same size
+#      and sha256.
+#   4. Every unit of the actions file: its local file set equals the manifest's entries for it (no extra or stale
+#      file here, none missing); job.done; at least one results_*.txt (not _val) and, unless its environment sets
+#      VAL_HOLDOUT=0, at least one results_*_val.txt, each with an "evaluate" line; and for STM units (rl, actor) the
+#      checkpoint: pretrain always writes stm_pretrain.pth; continual, stream and few-shot write a .pth unless the
+#      environment sets SAVE_STM=0.
+# Paths with a component starting with '.' are ignored on both sides (the pod job leaves them out of the manifest):
+# run_v2.sh's .lock directory, and a .DS_Store that Finder may drop on the Mac. They hold no results.
 # Usage: bash sky/v2_verify.sh <round dir> <job> [root]
 set -u
 ROUND=${1:?round dir}
 JOB=${2:?job (cluster) name}
-ROOT=${3:-$(cd "$(dirname "$0")/.." && pwd)}
+HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=${3:-$(cd "$HERE/.." && pwd)}
+# shellcheck source=sky/v2_lib.sh
+. "$HERE/v2_lib.sh" || { echo "VERIFY FAIL: cannot read $HERE/v2_lib.sh"; exit 1; }
 cd "$ROOT" || { echo "VERIFY FAIL: cannot cd to $ROOT"; exit 1; }
 P=$ROUND/pods/$JOB
+AC=$ROUND/actions/$JOB.txt
 bad=0
 no() { echo "VERIFY FAIL [$JOB]: $*"; bad=1; }
+TAB=$(printf '\t')
 
 [ -f "$P/JOB_COMPLETE" ] || no "no JOB_COMPLETE in $P"
 [ -e "$P/JOB_FAILED" ] && no "JOB_FAILED present in $P"
-[ -s "$ROUND/actions/$JOB.txt" ] || no "launcher's actions copy $ROUND/actions/$JOB.txt missing or empty"
+[ -s "$AC" ] || no "launcher's actions copy $AC missing or empty"
 [ -s "$P/actions.txt" ] || no "pulled actions.txt missing or empty"
-if [ "$bad" = 0 ]; then cmp -s "$ROUND/actions/$JOB.txt" "$P/actions.txt" || no "pulled actions.txt differs from the launcher's copy"; fi
+if [ "$bad" = 0 ]; then cmp -s "$AC" "$P/actions.txt" || no "pulled actions.txt differs from the launcher's copy"; fi
 [ -s "$P/manifest.tsv" ] || no "manifest.tsv missing or empty"
 [ "$bad" = 0 ] || { echo "VERIFY RESULT [$JOB]: FAIL"; exit 1; }
 
@@ -42,15 +54,18 @@ done < "$P/actions.txt"
 nfiles=0
 while IFS= read -r mline || [ -n "$mline" ]; do
   [ -z "$mline" ] && continue
-  size=${mline%%$'\t'*}
-  path=${mline#*$'\t'}
-  if [ "$size" = "$mline" ] || ! [[ "$size" =~ ^[0-9]+$ ]] || [ -z "$path" ]; then no "unparsable manifest line: $mline"; continue; fi
+  size=${mline%%"$TAB"*}; rest=${mline#*"$TAB"}
+  hash=${rest%%"$TAB"*}; path=${rest#*"$TAB"}
+  if [ "$size" = "$mline" ] || [ "$hash" = "$rest" ] || ! [[ "$size" =~ ^[0-9]+$ ]] || ! [[ "$hash" =~ ^[0-9a-f]{64}$ ]] \
+     || [ -z "$path" ]; then no "unparsable manifest line: $mline"; continue; fi
   under=0
   for u in "${units[@]}"; do case "$path" in "$u"/*) under=1; break ;; esac; done
   [ "$under" = 1 ] || { no "manifest path not under any unit: $path"; continue; }
   [ -f "$path" ] || { no "missing locally: $path"; continue; }
   lsize=$(wc -c < "$path" 2>/dev/null | tr -d ' ')
   [ "$lsize" = "$size" ] || { no "size differs ($lsize here, $size on pod): $path"; continue; }
+  lhash=$(sha256 "$path")
+  [ "$lhash" = "$hash" ] || { no "sha256 differs (${lhash:-unreadable} here, $hash on pod): $path"; continue; }
   nfiles=$((nfiles + 1))
 done < "$P/manifest.tsv"
 
@@ -59,24 +74,39 @@ while IFS='|' read -r tree env args unit flag || [ -n "$tree" ]; do
   [ -z "$tree" ] && continue
   eval "set -- $args" 2>/dev/null || { no "unparsable args: $args"; continue; }
   setting=${1:-}; model=${2:-}
+  env_value "$env" X > /dev/null || { no "unparsable environment field: $env"; continue; }
+  [ -d "$unit" ] || { no "unit dir missing here: $unit"; continue; }
+  # local file set == manifest entries for this unit (sorted, newline-separated; a path with a newline would show up
+  # as a mismatch, i.e. fail, never pass)
+  lset=$(find "$unit" -name '.*' -prune -o -type f -print 2>/dev/null | LC_ALL=C sort)
+  mset=$(awk -F'\t' -v u="$unit/" 'index($3, u) == 1 { print $3 }' "$P/manifest.tsv" | LC_ALL=C sort)
+  [ -n "$mset" ] || no "no manifest entries for $unit"
+  if [ "$lset" != "$mset" ]; then
+    extra=$(LC_ALL=C comm -23 <(printf '%s\n' "$lset") <(printf '%s\n' "$mset") | grep . | head -5)
+    gone=$(LC_ALL=C comm -13 <(printf '%s\n' "$lset") <(printf '%s\n' "$mset") | grep . | head -5)
+    [ -n "$extra" ] && no "files here that are not in the pod's manifest (extra or stale): $(echo "$extra" | tr '\n' ';')"
+    [ -n "$gone" ] && no "manifest files not here: $(echo "$gone" | tr '\n' ';')"
+    [ -z "$extra$gone" ] && no "local file set differs from the manifest: $unit"
+  fi
   [ -f "$unit/job.done" ] || { no "no job.done: $unit"; continue; }
-  grep -qF "$(printf '\t')$unit/" "$P/manifest.tsv" || no "no manifest entries for $unit"
   main=0; val=0
   while IFS= read -r -d '' f; do
     grep -q evaluate "$f" 2>/dev/null || continue
     case "$f" in *_val.txt) val=$((val + 1)) ;; *) main=$((main + 1)) ;; esac
   done < <(find "$unit" -type f -name 'results_*.txt' ! -name '*_images.txt' -print0 2>/dev/null)
   [ "$main" -ge 1 ] || no "no results_*.txt with an evaluate line: $unit"
-  case " $env " in *" VAL_HOLDOUT=0 "*) ;; *) [ "$val" -ge 1 ] || no "no results_*_val.txt with an evaluate line: $unit" ;; esac
+  [ "$(env_value "$env" VAL_HOLDOUT)" = 0 ] || [ "$val" -ge 1 ] || no "no results_*_val.txt with an evaluate line: $unit"
   case "$model/$setting" in
     rl/pretrain|actor/pretrain) [ -s "$unit/stm_pretrain.pth" ] || no "no stm_pretrain.pth: $unit" ;;
     rl/continual|actor/continual|rl/stream|actor/stream|rl/fewshot|actor/fewshot)
-      [ -n "$(find "$unit" -maxdepth 1 -name '*.pth' -size +0 -print -quit)" ] || no "no STM checkpoint (.pth): $unit" ;;
+      if [ "$(env_value "$env" SAVE_STM)" != 0 ]; then
+        [ -n "$(find "$unit" -maxdepth 1 -name '*.pth' -size +0 -print -quit)" ] || no "no STM checkpoint (.pth): $unit"
+      fi ;;
   esac
 done < "$P/actions.txt"
 
 if [ "$bad" = 0 ] && [ "$nfiles" -gt 0 ]; then
-  echo "VERIFY RESULT [$JOB]: OK (${#units[@]} units, $nfiles files match the pod's manifest)"
+  echo "VERIFY RESULT [$JOB]: OK (${#units[@]} units, $nfiles files match the pod's manifest: size, sha256, file set)"
   exit 0
 fi
 echo "VERIFY RESULT [$JOB]: FAIL"

@@ -1,5 +1,5 @@
 # One pod job of the v2 CLS/STM runs (sky/v2_pod_job.sh). Launch with sky/v2_launch.sh, which passes JOB, ROUND,
-# COMMIT and the actions file (ACTIONS_B64), applies autostop separately (-i/--down are ignored with -d), and logs.
+# COMMIT, UNIT_TIMEOUT and the actions file (ACTIONS_B64), applies autostop separately (-i/--down are ignored with -d), and logs.
 # Reap with sky/v2_reap.sh; status with sky/v2_status.sh.
 name: v2-pod
 resources:
@@ -21,6 +21,9 @@ envs:
   COMMIT: ""
   ACTIONS_B64: ""
   NPROC: "3"
+  # Per-unit cap (timeout(1) syntax). Empty here on purpose: the pod job refuses to start without it, and the launcher
+  # refuses to launch without it (suggested values: sky/v2_launch.sh header).
+  UNIT_TIMEOUT: ""
 setup: |
   set -e
   df -h /dev/shm | tail -1

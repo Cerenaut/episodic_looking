@@ -2,84 +2,236 @@
 # Reaper for v2 pod jobs (sky/v2_launch.sh): pull a job's results the moment it finishes, verify them ON THIS
 # MACHINE, and only then tear the pod down.
 #
-# DESIGN RULE (running_experiments_kb.md sections 5 and 5b): this script destroys things, so every ambiguity resolves
-# to "do nothing". A pod is torn down only when ALL of these hold:
-#   1. the cluster is UP in sky status and is one this round launched (it has $ROUND/actions/<cluster>.txt);
+# DESIGN RULE (running_experiments_kb.md sections 1, 5 and 5b): this script destroys things, so every ambiguity
+# resolves to "do nothing", and an unreadable state is never read as absent. A pod is torn down only when ALL hold:
+#   1. sky status exits 0 and shows the cluster UP, and this round launched it ($ROUND/actions/<cluster>.txt);
 #   2. `test -f` of the JOB_COMPLETE sentinel succeeds over ssh (exit code; nothing is parsed; an ssh failure is
 #      "not finished");
-#   3. every rsync of the pull exits 0;
-#   4. sky/v2_verify.sh passes on the pulled copy (every file of the pod's manifest is here with the same size, every
-#      unit has job.done, results, validation results and its STM checkpoint). Tested on fake good and bad trees by
-#      sky/test_v2_verify.sh.
-# A pod whose job wrote JOB_FAILED is pulled once (so nothing is lost) and LEFT UP for inspection; the autostop
-# backstop applies. The pull never overwrites a file on this machine (--ignore-existing).
+#   3. the pull root has more than MIN_FREE_GB free beyond the size of the pod's manifest;
+#   4. every rsync of the pull exits 0;
+#   5. sky/v2_verify.sh passes on the pulled copy (every file of the pod's manifest is here with the same size and
+#      sha256, each unit's local file set equals the manifest's, every unit has job.done, results, validation results
+#      and, unless its line sets SAVE_STM=0, its STM checkpoint). Tested on fake trees by sky/test_v2_verify.sh.
+# `reaped/<cluster>` is written only when sky status, read successfully, no longer lists the cluster.
 #
-# Usage: nohup bash sky/v2_reap.sh <round dir> > /dev/null 2>&1 &      (log: <round dir>/reap.log)
-# Environment: INTERVAL (s, default 180), MAX_PASSES (default 2000), DRY=1 (everything except sky down).
+# HOLD instead of a silent autodown: a pod that cannot be reaped safely (pull incomplete, verification failed, disk
+# low or unreadable, JOB_FAILED) has its autostop widened ONCE to HOLD_IDLE minutes (default 1440), confirmed in sky
+# status, recorded in held/<cluster>, logged and notified (macOS notification). It is then for a human to inspect and
+# `sky down <cluster> -y` by hand; the reaper keeps retrying the pull and reaps it if a later pass succeeds.
+# A JOB_FAILED pod is pulled once (failed_pulled/<cluster>): units whose directory never existed on the pod are
+# skipped (ssh `test -d` exit 1; exit 255 = unreadable = retry), so no empty unit dir is made here to block a relaunch.
+# The result trees are pulled with --ignore-existing (a file on this machine is never overwritten; a differing one
+# fails verification); the pod-owned metadata dir $ROUND/pods/<cluster>/ is pulled without it, so the manifest is
+# never stale.
+#
+# Other duties each pass: heartbeat ($ROUND/reaper.heartbeat; sky/v2_status.sh reports REAPER NOT RUNNING when it is
+# older than 15 min); apply autostop (-i IDLE --down) to an UP row without one; warn every 10 passes about a pod with
+# no pods dir SETUP_WARN_MIN minutes after it was first seen UP, and check `sky queue` for FAILED_SETUP.
+# One reaper per round: $ROUND/reaper.lock (mkdir; holds the pid). A lock whose pid is dead is moved aside.
+#
+# Pull root: the unit trees land under the root recorded by the launcher in $ROUND/pull_root (absolute; default the
+# repo), at the same relative paths as on the pod. The round dir itself (actions/, pods/, logs) stays in the repo.
+#
+# Usage: nohup caffeinate -i bash sky/v2_reap.sh <round dir> > /dev/null 2>&1 &   (log: <round dir>/reap.log)
+#        (sky/v2_launch.sh starts it itself.)
+# Environment: INTERVAL (s, default 180), MAX_PASSES (default 2000), IDLE (autostop minutes applied to a row without
+# one, default 240), HOLD_IDLE (default 1440), MIN_FREE_GB (default 20), SETUP_WARN_MIN (default 30), SKY_TIMEOUT
+# (s, default 120), DRY=1 (everything except sky down).
 set -u
 cd "$(dirname "$0")/.."
+REPO=$(pwd)
 export PATH="${REAP_TEST_BIN:+$REAP_TEST_BIN:}$HOME/bin:$PATH"   # REAP_TEST_BIN: fakes, sky/test_v2_verify.sh only
+# shellcheck source=sky/v2_lib.sh
+. sky/v2_lib.sh || exit 2
 ROUND=${1:?round dir}
+case "$ROUND" in /*|*..*) echo "round dir must be relative to the repo, without '..'" >&2; exit 2 ;; esac
 [ -d "$ROUND/actions" ] || { echo "no $ROUND/actions: not a round dir" >&2; exit 2; }
 LOG=$ROUND/reap.log
-mkdir -p "$ROUND/reaped" "$ROUND/failed_pulled"
+INTERVAL=${INTERVAL:-180}; IDLE=${IDLE:-240}; HOLD_IDLE=${HOLD_IDLE:-1440}; MIN_FREE_GB=${MIN_FREE_GB:-20}
+SETUP_WARN_MIN=${SETUP_WARN_MIN:-30}; DRY=${DRY:-0}
+for v in INTERVAL IDLE HOLD_IDLE MIN_FREE_GB SETUP_WARN_MIN; do
+  [[ "${!v}" =~ ^[0-9]+$ ]] || { echo "$v must be a whole number, not '${!v}'" >&2; exit 2; }
+done
+mkdir -p "$ROUND/reaped" "$ROUND/failed_pulled" "$ROUND/held" "$ROUND/verified" "$ROUND/first_up" "$ROUND/setup_failed"
 say() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
-strip() { perl -pe 's/\e\[[0-9;]*[mK]//g'; }
-status_line() { sky status "$1" 2>/dev/null | strip | awk -v c="$1" '$1==c'; }
+notify() { local m=${1//\"/}; osascript -e "display notification \"$m\" with title \"v2 reaper: $ROUND\"" > /dev/null 2>&1 || true; }
 SSHO="-o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=no"
-remote_test() { ssh $SSHO "$1" "test -f ~/sky_workdir/$2" < /dev/null 2>/dev/null; }
+remote_test() { tmo 60 ssh $SSHO "$1" "test $2 ~/sky_workdir/$3" < /dev/null 2>/dev/null; }   # exit: 0 yes, 1 no, else unreadable
 
-pull() {  # $1 = cluster; returns non-zero if any rsync fails
-  local c=$1 tree env args unit flag rc=0
+# --- pull root ---------------------------------------------------------------------------------------
+PR=$REPO
+[ -f "$ROUND/pull_root" ] && PR=$(cat "$ROUND/pull_root")
+if [ -n "${PULL_ROOT:-}" ] && [ "$PULL_ROOT" != "$PR" ]; then
+  echo "PULL_ROOT=$PULL_ROOT differs from the round's pull root $PR ($ROUND/pull_root, written by the launcher)" >&2; exit 2
+fi
+case "$PR" in /*) ;; *) echo "pull root must be absolute: $PR" >&2; exit 2 ;; esac
+
+# --- one reaper per round ----------------------------------------------------------------------------
+L=$ROUND/reaper.lock
+if ! mkdir "$L" 2>/dev/null; then
+  p=$(reaper_pid "$ROUND")
+  case "$p" in
+    "?") echo "$L exists without a readable pid: check that no reaper runs on $ROUND, then remove it by hand" | tee -a "$LOG" >&2; exit 3 ;;
+    "") stale=$L.stale.$$.$(date +%s)
+        mv "$L" "$stale" 2>/dev/null && say "moved a stale reaper lock (dead pid) aside to $stale"
+        mkdir "$L" 2>/dev/null || { echo "cannot take $L" >&2; exit 3; } ;;
+    *) echo "a reaper (pid $p) already runs on $ROUND; exiting" >&2; exit 3 ;;
+  esac
+fi
+echo $$ > "$L/pid"
+trap '[ "$(cat "$L/pid" 2>/dev/null)" = $$ ] && rm -rf "$L"' EXIT
+
+beat() { echo "$$ $(date '+%F %T') pass ${pass:-0}" > "$ROUND/reaper.heartbeat"; }
+every10() { [ $((pass % 10)) = 1 ]; }
+fmt_idle() { [ $(($1 % 60)) = 0 ] && [ "$1" -gt 0 ] && echo "$(($1 / 60))h" || echo "${1}m"; }   # as sky status prints it
+
+hold() {  # $1 = cluster, $2 = reason. Widen autostop to HOLD_IDLE once, confirmed in sky status; never destroys.
+  local c=$1 why=$2
+  if [ -e "$ROUND/held/$c" ]; then every10 && say "$c HELD since $(cat "$ROUND/held/$c"); now: $why"; return 0; fi
+  if ! tmo "$SKY_TIMEOUT" sky autostop "$c" -i "$HOLD_IDLE" --down -y < /dev/null >> "$LOG" 2>&1; then
+    say "$c HOLD FAILED: sky autostop -i $HOLD_IDLE returned non-zero or timed out; retrying next pass ($why)"
+    every10 && notify "$c HOLD FAILED: $why"; return 0
+  fi
+  sky_row "$c"
+  if [ "$SKY_STATE" = ROW ] && printf '%s\n' "$SKY_LINE" | grep -qF "$(fmt_idle "$HOLD_IDLE") (down)"; then
+    echo "$(date '+%F %T') $why" > "$ROUND/held/$c"
+    say "$c HELD: autostop widened to ${HOLD_IDLE}m ($why). Inspect, then sky down $c -y by hand once its results are safe"
+    notify "$c HELD: $why"
+  else
+    say "$c HOLD NOT CONFIRMED (sky status $SKY_STATE: ${SKY_LINE:-no row}); retrying next pass ($why)"
+    every10 && notify "$c HOLD NOT CONFIRMED: $why"
+  fi
+}
+
+disk_ok() {  # free space on the pull root > MIN_FREE_GB + the size of the pod's manifest (if pulled); sets DISK_MSG
+  local avail need pull=0 m=$ROUND/pods/$1/manifest.tsv
+  avail=$(df -Pk "$PR" 2>/dev/null | awk 'NR == 2 { print $4 }')
+  [[ "$avail" =~ ^[0-9]+$ ]] || { DISK_MSG="free space on $PR UNREADABLE"; return 1; }
+  [ -s "$m" ] && pull=$(awk -F'\t' '{ s += $1 } END { printf "%d", s / 1024 }' "$m")
+  [[ "$pull" =~ ^[0-9]+$ ]] || { DISK_MSG="manifest size UNREADABLE: $m"; return 1; }
+  need=$((MIN_FREE_GB * 1048576 + pull))
+  DISK_MSG="disk: $((avail / 1048576)) GB free on $PR, need > $MIN_FREE_GB GB + $((pull / 1048576)) GB to pull"
+  [ "$avail" -gt "$need" ]
+}
+
+pull_meta() {  # $1 = cluster: the pod-owned metadata dir, overwritten (never --ignore-existing: no stale manifest)
+  local c=$1
+  mkdir -p "$ROUND/pods/$c" || return 1
+  tmo 900 rsync -az --timeout=120 -e "ssh $SSHO" "$c:~/sky_workdir/$ROUND/pods/$c/" "$ROUND/pods/$c/" < /dev/null >> "$LOG" 2>&1 \
+    || { say "$c rsync FAILED: pod metadata $ROUND/pods/$c"; return 1; }
+}
+
+pull_units() {  # $1 = cluster, $2 = complete|failed. Never makes an empty unit dir here: only units that exist on the pod.
+  local c=$1 mode=$2 tree env args unit flag r rc=0
   while IFS='|' read -r tree env args unit flag || [ -n "$tree" ]; do
     [ -z "$tree" ] && continue
-    mkdir -p "$unit" || { rc=1; continue; }
-    rsync -az --ignore-existing --timeout=120 -e "ssh $SSHO" "$c:~/sky_workdir/$unit/" "$unit/" < /dev/null >> "$LOG" 2>&1 \
+    beat
+    remote_test "$c" -d "$unit"; r=$?
+    if [ $r -eq 1 ]; then
+      if [ "$mode" = failed ]; then say "$c: $unit never existed on the pod; skipped"; else say "$c: $unit MISSING on the pod"; rc=1; fi
+      continue
+    elif [ $r -ne 0 ]; then
+      say "$c: cannot tell whether $unit exists on the pod (ssh exit $r)"; rc=1; continue
+    fi
+    mkdir -p "$PR/$(dirname "$unit")" || { rc=1; continue; }
+    tmo 7200 rsync -az --ignore-existing --timeout=120 -e "ssh $SSHO" "$c:~/sky_workdir/$unit/" "$PR/$unit/" < /dev/null >> "$LOG" 2>&1 \
       || { say "$c rsync FAILED: $unit"; rc=1; }
   done < "$ROUND/actions/$c.txt"
-  mkdir -p "$ROUND/pods/$c"
-  rsync -az --ignore-existing --timeout=120 -e "ssh $SSHO" "$c:~/sky_workdir/$ROUND/pods/$c/" "$ROUND/pods/$c/" < /dev/null >> "$LOG" 2>&1 \
-    || { say "$c rsync FAILED: pod logs"; rc=1; }
   return $rc
 }
 
-say "reaper starting on $ROUND (INTERVAL=${INTERVAL:-180}s${DRY:+, DRY: no teardown})"
+setup_check() {  # $1 = cluster, UP, no sentinel yet: warn when no pods dir appears SETUP_WARN_MIN after first seen UP
+  local c=$1 t0 r q
+  [ -s "$ROUND/first_up/$c" ] || date +%s > "$ROUND/first_up/$c"
+  t0=$(cat "$ROUND/first_up/$c")
+  every10 || return 0
+  [ $(( $(date +%s) - t0 )) -ge $((SETUP_WARN_MIN * 60)) ] || return 0
+  remote_test "$c" -d "$ROUND/pods/$c"; r=$?
+  case $r in
+    0) return 0 ;;
+    1) q=$(tmo "$SKY_TIMEOUT" sky queue "$c" < /dev/null 2>&1 | strip)
+       if printf '%s\n' "$q" | grep -qw FAILED_SETUP; then
+         say "$c SETUP FAILED (sky queue shows FAILED_SETUP): nothing ran; see sky logs $c, then sky down $c -y by hand"
+         [ -e "$ROUND/setup_failed/$c" ] || { touch "$ROUND/setup_failed/$c"; notify "$c SETUP FAILED"; }
+       else
+         say "WARNING $c UP for $(( ($(date +%s) - t0) / 60 )) min and its job has not started (no $ROUND/pods/$c on the pod): setup still running or failed silently; see sky queue $c"
+       fi ;;
+    *) say "$c: cannot read whether the job started (ssh exit $r)" ;;
+  esac
+}
+
+say "reaper starting on $ROUND (pid $$, INTERVAL=${INTERVAL}s, HOLD_IDLE=${HOLD_IDLE}m, MIN_FREE_GB=$MIN_FREE_GB, pull root $PR$([ "$DRY" = 1 ] && echo ', DRY: no teardown'))"
 for pass in $(seq 1 "${MAX_PASSES:-2000}"); do
+  beat
   left=0
   for af in "$ROUND"/actions/*.txt; do
     [ -f "$af" ] || continue
     c=$(basename "$af" .txt)
     [ -e "$ROUND/reaped/$c" ] && continue
     left=$((left + 1))
-    line=$(status_line "$c")
-    if [ -z "$line" ]; then say "$c NOT IN sky status (failed launch, or gone: CHECK $ROUND/pods/$c and the RunPod console)"; continue; fi
-    echo "$line" | grep -qw UP || { [ $((pass % 10)) = 1 ] && say "$c not UP yet: $line"; continue; }
-    echo "$line" | grep -qE '[0-9]+[hm] \(down\)' || say "WARNING $c has no autostop: sky autostop $c -i 240 --down -y"
-    if remote_test "$c" "$ROUND/pods/$c/JOB_COMPLETE"; then
-      say "$c reports JOB_COMPLETE; pulling"
-      pull "$c" || { say "$c PULL INCOMPLETE; leaving it up, will retry"; continue; }
-      if bash sky/v2_verify.sh "$ROUND" "$c" >> "$LOG" 2>&1; then
-        say "$c verified locally ($(tail -1 "$LOG"))"
-        if [ -n "${DRY:-}" ]; then say "DRY: would sky down $c"; touch "$ROUND/reaped/$c.dry"; continue; fi
-        sky down "$c" -y >> "$LOG" 2>&1
-        if [ -z "$(status_line "$c")" ]; then
-          echo "$(date '+%F %T') verified and down" > "$ROUND/reaped/$c"; say "$c DOWN (absent from sky status)"
+    beat
+    sky_row "$c"
+    case "$SKY_STATE" in
+      UNREADABLE) say "$c sky status UNREADABLE (sky failed, timed out or printed something unexpected); doing nothing this pass"; continue ;;
+      ABSENT)
+        if [ -e "$ROUND/verified/$c" ]; then
+          echo "$(date '+%F %T') verified, then absent from sky status" > "$ROUND/reaped/$c"; say "$c DOWN (verified earlier; now absent from sky status)"
         else
-          say "$c sky down did not remove it: $(status_line "$c")"
+          every10 && say "$c NOT IN sky status (failed launch, or gone: CHECK $ROUND/pods/$c and the RunPod console; once handled, touch $ROUND/reaped/$c)"
         fi
+        continue ;;
+    esac
+    st=$(row_status "$SKY_LINE")
+    [ "$st" = UP ] || { every10 && say "$c not UP: $SKY_LINE"; continue; }
+    if ! has_autostop "$SKY_LINE"; then
+      say "WARNING $c has no autostop: applying -i $IDLE --down"
+      tmo "$SKY_TIMEOUT" sky autostop "$c" -i "$IDLE" --down -y < /dev/null >> "$LOG" 2>&1 || say "$c: sky autostop failed; retrying next pass"
+    fi
+    remote_test "$c" -f "$ROUND/pods/$c/JOB_COMPLETE"; r=$?
+    if [ $r -eq 0 ]; then
+      say "$c reports JOB_COMPLETE; pulling"
+      pull_meta "$c" || { hold "$c" "pull of the pod metadata failed"; continue; }
+      disk_ok "$c" || { say "$c NOT PULLED: $DISK_MSG"; hold "$c" "$DISK_MSG"; continue; }
+      pull_units "$c" complete || { say "$c PULL INCOMPLETE; will retry"; hold "$c" "pull incomplete"; continue; }
+      if bash sky/v2_verify.sh "$REPO/$ROUND" "$c" "$PR" >> "$LOG" 2>&1; then
+        say "$c verified locally ($(tail -1 "$LOG"))"
+        date '+%F %T' > "$ROUND/verified/$c"
+        if [ "$DRY" = 1 ]; then say "DRY: would sky down $c"; touch "$ROUND/reaped/$c.dry"; continue; fi
+        tmo 600 sky down "$c" -y < /dev/null >> "$LOG" 2>&1
+        sky_row "$c"
+        case "$SKY_STATE" in
+          ABSENT) echo "$(date '+%F %T') verified and down" > "$ROUND/reaped/$c"; say "$c DOWN (absent from sky status)" ;;
+          ROW) say "$c sky down did not remove it: $SKY_LINE" ;;
+          *) say "$c sky down issued; sky status UNREADABLE, so not marked reaped (re-checked next pass)" ;;
+        esac
       else
-        say "$c pulled but local verification FAILED (details above); leaving it up"
+        say "$c pulled but local verification FAILED (details above)"
+        hold "$c" "verification failed"
       fi
-    elif remote_test "$c" "$ROUND/pods/$c/JOB_FAILED"; then
+      continue
+    elif [ $r -ne 1 ]; then
+      every10 && say "$c: cannot read the sentinel (ssh exit $r); doing nothing"; continue
+    fi
+    remote_test "$c" -f "$ROUND/pods/$c/JOB_FAILED"; r=$?
+    if [ $r -eq 0 ]; then
       if [ ! -e "$ROUND/failed_pulled/$c" ]; then
-        say "$c JOB_FAILED: pulling what there is; LEAVING IT UP for inspection (autostop is the backstop)"
-        pull "$c" && touch "$ROUND/failed_pulled/$c"
+        say "$c JOB_FAILED: pulling what there is, once"
+        if ! pull_meta "$c"; then say "$c: metadata pull failed; will retry"
+        elif ! disk_ok "$c"; then say "$c NOT PULLED: $DISK_MSG"
+        elif pull_units "$c" failed; then touch "$ROUND/failed_pulled/$c"; say "$c failed job pulled"
+        else say "$c: pull of the failed job incomplete; will retry"
+        fi
       fi
-      [ $((pass % 10)) = 1 ] && say "$c JOB_FAILED, still up: inspect $ROUND/pods/$c/progress.log, then sky down $c -y by hand"
+      hold "$c" "JOB_FAILED"
+      every10 && say "$c JOB_FAILED, still up: inspect $ROUND/pods/$c/progress.log, then sky down $c -y by hand"
+    elif [ $r -eq 1 ]; then
+      setup_check "$c"
+    else
+      every10 && say "$c: cannot read the sentinel (ssh exit $r); doing nothing"
     fi
   done
   [ "$left" = 0 ] && { say "every cluster of the round is reaped; reaper exiting"; exit 0; }
-  [ -n "${DRY:-}" ] && [ "$(ls "$ROUND/reaped/" | grep -c '\.dry$')" -ge "$left" ] && { say "DRY: all verified; exiting"; exit 0; }
-  sleep "${INTERVAL:-180}"
+  [ "$DRY" = 1 ] && [ "$(ls "$ROUND/reaped/" | grep -c '\.dry$')" -ge "$left" ] && { say "DRY: all verified; exiting"; exit 0; }
+  sleep "$INTERVAL"
 done
 say "reaper hit MAX_PASSES; clusters may remain"
