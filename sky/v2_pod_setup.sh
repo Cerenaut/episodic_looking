@@ -1,7 +1,9 @@
 #!/bin/bash
 # Setup of a v2 pod (run by sky/v2_pod.yaml's setup, from ~/sky_workdir). Fails loudly (non-zero exit, a "SETUP FAILED"
-# line) on anything it cannot verify, so that sky launch fails and the pod is torn down by the reaper once it has
-# proved nothing ran (sky/v2_reap.sh, launch_failed/).
+# line) on anything it cannot verify, so the job never starts. SkyPilot 0.13 detaches setup under `sky launch -d`
+# ("Setup detached"), so a failed setup shows as FAILED_SETUP in sky queue rather than as a failed sky launch; the
+# reaper checks sky queue every pass for a pod without its pods dir and tears it down once it has proved nothing ran
+# (sky/v2_reap.sh: setup_failed/).
 #
 # Phase "dataset": CIFAR-100 is fetched ON THE POD from the official URL instead of being synced from the Mac
 # (the file-mount sync crawled at 4-90 KB/s to some regions and died: pod-path re-review of 2026-10-04, N1):

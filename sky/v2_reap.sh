@@ -45,9 +45,9 @@
 # makes every cluster UNREADABLE for that pass, so nothing is done); a teardown or an autostop change is confirmed
 # with a fresh per-cluster `sky status <cluster>`.
 # Other duties each pass: heartbeat ($ROUND/reaper.heartbeat; sky/v2_status.sh reports REAPER NOT RUNNING when it is
-# older than 15 min); apply autostop (-i IDLE --down) to an UP row without one; every 10 passes, for a pod with no
-# pods dir SETUP_WARN_MIN minutes after it was first seen UP, check `sky queue` for FAILED_SETUP (then the teardown
-# above) or warn.
+# older than 15 min); apply autostop (-i IDLE --down) to an UP row without one; every pass, for a pod with no pods
+# dir SETUP_WARN_MIN minutes after it was first seen UP, check `sky queue` for FAILED_SETUP (then the teardown above;
+# SkyPilot detaches setup under -d, so a failed setup does not fail sky launch), else warn every 10 passes.
 # One reaper per round: $ROUND/reaper.lock (mkdir; holds the pid). A lock whose pid is dead is moved aside.
 #
 # Pull root: the unit trees land under the root recorded by the launcher in $ROUND/pull_root (absolute; default the
@@ -57,7 +57,7 @@
 #        (sky/v2_launch.sh starts it itself.)
 # Environment: INTERVAL (s, default 180), MAX_PASSES (default 2000), IDLE (autostop minutes applied to a row without
 # one, default 240), HOLD_IDLE (default 1440), FAILED_IDLE (default 90), ALERT_N (default 3), MIN_FREE_GB (default
-# 20), SETUP_WARN_MIN (default 30), SKY_TIMEOUT (s, default 120), DRY=1 (everything except sky down).
+# 20), SETUP_WARN_MIN (default 15; setup took 54 s on 2026-10-04), SKY_TIMEOUT (s, default 120), DRY=1 (everything except sky down).
 set -u
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
@@ -70,7 +70,7 @@ case "$ROUND" in /*|*..*) echo "round dir must be relative to the repo, without 
 LOG=$ROUND/reap.log
 INTERVAL=${INTERVAL:-180}; IDLE=${IDLE:-240}; HOLD_IDLE=${HOLD_IDLE:-1440}; MIN_FREE_GB=${MIN_FREE_GB:-20}
 FAILED_IDLE=${FAILED_IDLE:-90}; ALERT_N=${ALERT_N:-3}
-SETUP_WARN_MIN=${SETUP_WARN_MIN:-30}; DRY=${DRY:-0}
+SETUP_WARN_MIN=${SETUP_WARN_MIN:-15}; DRY=${DRY:-0}
 for v in INTERVAL IDLE HOLD_IDLE FAILED_IDLE ALERT_N MIN_FREE_GB SETUP_WARN_MIN; do
   [[ "${!v}" =~ ^[0-9]+$ ]] || { echo "$v must be a whole number, not '${!v}'" >&2; exit 2; }
 done
@@ -226,11 +226,13 @@ pull_units() {  # $1 = cluster, $2 = complete|failed. Never makes an empty unit 
   return $rc
 }
 
-setup_check() {  # $1 = cluster, UP, no sentinel yet: warn when no pods dir appears SETUP_WARN_MIN after first seen UP
+setup_check() {  # $1 = cluster, UP, no sentinel yet. From SETUP_WARN_MIN after it was first seen UP, EVERY pass while
+  # its pods dir is absent: sky queue for FAILED_SETUP (SkyPilot 0.13 detaches setup under -d, so a failed setup does
+  # not fail sky launch; it only shows in sky queue), else a warning every 10 passes. A pod past setup has its pods
+  # dir, so in a healthy round this costs one ssh test per pod per pass and no sky queue calls.
   local c=$1 t0 r q
   [ -s "$ROUND/first_up/$c" ] || date +%s > "$ROUND/first_up/$c"
   t0=$(cat "$ROUND/first_up/$c")
-  every10 || return 0
   [ $(( $(date +%s) - t0 )) -ge $((SETUP_WARN_MIN * 60)) ] || return 0
   remote_test "$c" -d "$ROUND/pods/$c"; r=$?
   case $r in
@@ -241,9 +243,9 @@ setup_check() {  # $1 = cluster, UP, no sentinel yet: warn when no pods dir appe
          say "$c SETUP FAILED (sky queue shows FAILED_SETUP; see sky logs $c)"
          teardown_if_nothing_ran "$c" "setup failed (FAILED_SETUP)" || true
        else
-         say "WARNING $c UP for $(( ($(date +%s) - t0) / 60 )) min and its job has not started (no $ROUND/pods/$c on the pod): setup still running or failed silently; see sky queue $c"
+         every10 && say "WARNING $c UP for $(( ($(date +%s) - t0) / 60 )) min and its job has not started (no $ROUND/pods/$c on the pod): setup still running or failed silently; see sky queue $c"
        fi ;;
-    *) say "$c: cannot read whether the job started (ssh exit $r)" ;;
+    *) every10 && say "$c: cannot read whether the job started (ssh exit $r)" ;;
   esac
 }
 
