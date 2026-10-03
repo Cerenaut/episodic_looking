@@ -8,11 +8,16 @@
 #   UNREADABLE          sky status failed, timed out or printed something unexpected; or ssh to the pod failed
 #   ABSENT              sky status (read successfully) does not list a cluster that is not reaped
 #   NO-AUTOSTOP         an UP or INIT row without "Nh (down)"/"Nm (down)" (it would bill indefinitely)
+#   LAUNCH_FAILED       sky/v2_launch.sh recorded a failed sky launch (launch_failed/<cluster>, with the exit code) and
+#                       the cluster is not reaped yet (the reaper tears it down once it has proved nothing ran)
+#   SETUP_FAILED        sky queue showed FAILED_SETUP (setup_failed/<cluster>), not reaped yet
 #   REAPER NOT RUNNING  clusters remain and the reaper's heartbeat is older than 15 min (or missing) and its pid is
 #                       gone; REAPER STALE if the pid is alive but the heartbeat is old (hung, or a very long pull)
 # A job that failed before copying its actions file (e.g. no UNIT_TIMEOUT) prints JOB_FAILED with "before the units".
 # A pod whose job has not started yet prints NOT-STARTED (ssh worked, no actions copy on the pod yet). Units done are
-# counted against the total, so a working zero reads "0/5". HELD, failed_pulled and SETUP_FAILED markers are shown.
+# counted against the total, so a working zero reads "0/5". HELD, failed_pulled, failed_safe (a failed job whose files
+# are verified here; short autostop) and failed_verify=FAIL markers are shown, and a count of held or failed clusters.
+# sky status is read ONCE for every cluster (sky_status_all); if that call fails every cluster shows UNREADABLE.
 # Usage: bash sky/v2_status.sh <round dir>
 set -u
 cd "$(dirname "$0")/.."
@@ -47,6 +52,7 @@ else
 fi
 
 # --- clusters -------------------------------------------------------------------------------------------
+sky_status_all
 printf '%-18s %-10s %-11s %-9s %-13s %s\n' cluster sky autostop units sentinel "last progress line"
 for af in "$ROUND"/actions/*.txt; do
   [ -f "$af" ] || { echo "UNREADABLE: no actions files in $ROUND/actions"; rc=1; continue; }
@@ -56,10 +62,13 @@ for af in "$ROUND"/actions/*.txt; do
     printf '%-18s %-10s %-11s %-9s %-13s %s\n' "$c" REAPED - - reaped "$(cat "$ROUND/reaped/$c")"; continue
   fi
   marks=""
+  [ -e "$ROUND/launch_failed/$c" ] && { marks="$marks LAUNCH_FAILED($(cat "$ROUND/launch_failed/$c" 2>/dev/null))"; rc=1; }
+  [ -e "$ROUND/setup_failed/$c" ] && { marks="$marks SETUP_FAILED"; rc=1; }
   [ -e "$ROUND/held/$c" ] && marks="$marks HELD($(cat "$ROUND/held/$c"))"
   [ -e "$ROUND/failed_pulled/$c" ] && marks="$marks failed_pulled"
-  [ -e "$ROUND/setup_failed/$c" ] && marks="$marks SETUP_FAILED"
-  sky_row "$c"
+  [ "$(cat "$ROUND/failed_verify/$c" 2>/dev/null)" = FAIL ] && marks="$marks failed_verify=FAIL"
+  [ -e "$ROUND/failed_safe/$c" ] && marks="$marks failed_safe(autostop short since $(cat "$ROUND/failed_safe/$c"))"
+  sky_row_all "$c"
   case "$SKY_STATE" in
     UNREADABLE) printf '%-18s %-10s %s\n' "$c" UNREADABLE "sky status failed or unparsable$marks"; rc=1; continue ;;
     ABSENT) printf '%-18s %-10s %s\n' "$c" ABSENT "not in sky status and not reaped: CHECK$marks"; rc=1; continue ;;
@@ -84,7 +93,12 @@ EOF
 )
   case "$r" in
     FAILED-EARLY*) printf '%-18s %-10s %-11s %-9s %-13s %s\n' "$c" UP "$au" "0/$total" JOB_FAILED "(before the units: ${r#FAILED-EARLY })$marks" ;;
-    NOT-STARTED|NOWORKDIR) printf '%-18s %-10s %-11s %-9s %-13s %s\n' "$c" UP "$au" "?/$total" "$r" "(setup still running?)$marks" ;;
+    NOT-STARTED|NOWORKDIR)
+      if [ -e "$ROUND/launch_failed/$c" ] || [ -e "$ROUND/setup_failed/$c" ]; then
+        printf '%-18s %-10s %-11s %-9s %-13s %s\n' "$c" UP "$au" "0/$total" LAUNCH_FAILED "(nothing ran: the reaper tears it down)$marks"
+      else
+        printf '%-18s %-10s %-11s %-9s %-13s %s\n' "$c" UP "$au" "?/$total" "$r" "(setup still running?)$marks"
+      fi ;;
     *)
       set -f; set -- $r; set +f   # no globbing: the progress line holds [brackets]
       if [[ "${1:-}" =~ ^[0-9]+$ ]] && [[ "${2:-}" =~ ^[0-9]+$ ]] && [ -n "${3:-}" ]; then
@@ -94,4 +108,7 @@ EOF
       fi ;;
   esac
 done
+names=$(failed_or_held "$ROUND")
+n=$(printf '%s' "$names" | grep -c .)
+[ "$n" -gt 0 ] && echo "held or failed in this round: $n ($(echo $names))$([ "$n" -ge "${ALERT_N:-3}" ] && echo '  ALERT: systematic failure?')"
 exit $rc

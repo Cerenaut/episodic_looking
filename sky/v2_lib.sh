@@ -30,6 +30,36 @@ sky_row() {
   fi
   return 0
 }
+# sky_status_all: ONE `sky status` call for every cluster (sky/v2_reap.sh calls it once per pass, not once per cluster:
+# with 20 pods and a slow API server per-cluster calls made a pass take tens of minutes). Sets SKY_ALL_OK=1 and
+# SKY_ROWS (the rows of the Clusters table, possibly empty) only when sky exited 0 and printed the Clusters section
+# in a recognised form: a line "Clusters" followed by the table header (NAME ... STATUS) or "No existing clusters.".
+# Anything else (non-zero exit, timeout, no Clusters section, another header) leaves SKY_ALL_OK=0: every cluster
+# then reads UNREADABLE from sky_row_all. Rows are taken from the Clusters table only (it ends at the first blank
+# line), so a managed job or service with the same name can never stand in for a cluster.
+sky_status_all() {
+  local out rc
+  SKY_ALL_OK=0; SKY_ROWS=""
+  out=$(tmo "$SKY_TIMEOUT" sky status 2>&1 < /dev/null); rc=$?
+  [ $rc -eq 0 ] || return 0
+  out=$(printf '%s\n' "$out" | strip)
+  # the Clusters section: its first non-empty line, then its rows up to the first blank line
+  local first
+  first=$(printf '%s\n' "$out" | awk 'p && NF { print; exit } /^Clusters[[:space:]]*$/ { p = 1 }')
+  if printf '%s\n' "$first" | grep -qx 'No existing clusters\.'; then SKY_ALL_OK=1; return 0; fi
+  printf '%s\n' "$first" | grep -qE '^NAME[[:space:]].*STATUS' || return 0
+  SKY_ROWS=$(printf '%s\n' "$out" | awk 'h && !NF { exit } h { print } p && NF && !h { h = 1 } /^Clusters[[:space:]]*$/ { p = 1 }')
+  SKY_ALL_OK=1
+}
+# sky_row_all <cluster>: SKY_STATE/SKY_LINE as sky_row sets them, from the last sky_status_all:
+#   ROW (a row whose first field is <cluster>), ABSENT (the Clusters table was read and has no such row),
+#   UNREADABLE (the last sky_status_all could not be read).
+sky_row_all() {
+  SKY_LINE=""; SKY_STATE=UNREADABLE
+  [ "${SKY_ALL_OK:-0}" = 1 ] || return 0
+  SKY_LINE=$(printf '%s\n' "$SKY_ROWS" | awk -v c="$1" '$1==c' | head -1)
+  if [ -n "$SKY_LINE" ]; then SKY_STATE=ROW; else SKY_STATE=ABSENT; fi
+}
 has_autostop() { printf '%s\n' "$1" | grep -qE '[0-9]+[hm] \(down\)'; }
 row_status() { printf '%s\n' "$1" | grep -owE 'UP|INIT|STOPPED' | head -1; }
 
@@ -59,4 +89,13 @@ env_value() {  # $1 = environment field, $2 = KEY
 # sha256 <file>: hex digest, read on stdin (no filename escaping). sha256sum (Linux, macOS 15+) or shasum.
 sha256() {
   if command -v sha256sum >/dev/null; then sha256sum < "$1" | cut -d' ' -f1; else shasum -a 256 < "$1" | cut -d' ' -f1; fi
+}
+
+# Markers of clusters that failed or were held in a round (sky/v2_reap.sh writes held/, job_failed/, setup_failed/;
+# sky/v2_launch.sh writes launch_failed/). failed_or_held <round>: prints the distinct cluster names, one per line.
+failed_or_held() {
+  local d f
+  for d in held job_failed launch_failed setup_failed; do
+    for f in "$1/$d"/*; do [ -e "$f" ] && basename "$f"; done
+  done | LC_ALL=C sort -u
 }

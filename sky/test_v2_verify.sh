@@ -2,8 +2,10 @@
 # Tests of the v2 cloud path on fake trees, with a fake run_v2.sh and fake sky, ssh, rsync, timeout and osascript: no
 # GPU, no pod, no real results. Covers the destructive predicate (sky/v2_verify.sh), the pod job's sentinels, unit
 # timeout and validation (sky/v2_pod_job.sh), the reaper's decisions (sky/v2_reap.sh: teardown, HOLD, disk guard,
-# UNREADABLE sky state, failed-pod pull, lock, setup check), the status script (sky/v2_status.sh) and the launcher's
-# refusals, DRY and launch-failure paths (sky/v2_launch.sh). Run it after any change to these scripts, before a live
+# UNREADABLE sky state, failed-pod pull, --partial verification and short autostop, launch-failed and FAILED_SETUP
+# teardown, held/failed alert, one sky status per pass, lock, setup check), the status script (sky/v2_status.sh), the
+# launcher's refusals, DRY, regions, e40 mount and launch-failure paths (sky/v2_launch.sh), and the dataset phase of
+# the pod setup with a fake download (sky/v2_pod_setup.sh). Run it after any change to these scripts, before a live
 # round. Every known-good case must pass and every known-bad one must be refused.
 # Usage: bash sky/test_v2_verify.sh <empty scratch dir>     (never a results directory)
 set -u
@@ -20,9 +22,9 @@ expect() {  # $1 = label; the rest = a test command that must succeed
   local l=$1; shift
   if "$@"; then ok "$l"; else wrong "$l"; fi
 }
-check() {  # $1 = expected (OK|FAIL), $2 = label, $3 = mac root
+check() {  # $1 = expected (OK|FAIL), $2 = label, $3 = mac root; PARTIAL=1: v2_verify.sh --partial
   local out rc got
-  out=$(bash "$SRC/sky/v2_verify.sh" "$ROUND" "$J" "$3" 2>&1); rc=$?
+  out=$(bash "$SRC/sky/v2_verify.sh" ${PARTIAL:+--partial} "$ROUND" "$J" "$3" 2>&1); rc=$?
   got=FAIL; [ $rc -eq 0 ] && got=OK
   if [ "$got" = "$1" ]; then ok "verify expect $1  $2"; else wrong "verify expect $1 got $got  $2"; echo "$out" | sed 's/^/      /'; fi
 }
@@ -160,6 +162,21 @@ make_repo "$W/podbad"; FAKE_FAIL=1 run_pod "$W/podbad"
 expect "failing pod job leaves JOB_FAILED only" pod_failed "$W/podbad"
 pull "$W/podbad" "$W/mac_bad"
 check FAIL "pull of a failed job" "$W/mac_bad"
+# --partial: every manifest file here with the same size and sha256, nothing else required
+PARTIAL=1 check OK "--partial: pull of a failed job (JOB_FAILED, no job.done)" "$W/mac_bad"
+PARTIAL=1 check OK "--partial: a complete pull passes too" "$W/mac_good"
+rm -rf "$W/mac_bad2"; cp -R "$W/mac_bad" "$W/mac_bad2"; f=$(find "$W/mac_bad2/$T" -name job.log | head -1); printf 'x' >> "$f"
+PARTIAL=1 check FAIL "--partial: a file differs in size" "$W/mac_bad2"
+rm -rf "$W/mac_bad2"; cp -R "$W/mac_bad" "$W/mac_bad2"; f=$(find "$W/mac_bad2/$T" -name job.log | head -1); perl -pi -e 's/boom/BOOM/' "$f"
+PARTIAL=1 check FAIL "--partial: a file differs in content (sha256)" "$W/mac_bad2"
+rm -rf "$W/mac_bad2"; cp -R "$W/mac_bad" "$W/mac_bad2"; f=$(find "$W/mac_bad2/$T" -name job.log | head -1); rm "$f"
+PARTIAL=1 check FAIL "--partial: a manifest file missing here" "$W/mac_bad2"
+rm -rf "$W/mac_bad2"; cp -R "$W/mac_bad" "$W/mac_bad2"; rm "$W/mac_bad2/$ROUND/pods/$J/manifest.tsv"
+PARTIAL=1 check FAIL "--partial: manifest missing" "$W/mac_bad2"
+rm -rf "$W/mac_bad2"; cp -R "$W/mac_bad" "$W/mac_bad2"; echo "x|y|pretrain a|x/u|" >> "$W/mac_bad2/$ROUND/actions/$J.txt"
+PARTIAL=1 check FAIL "--partial: pulled actions differ from the launcher's copy" "$W/mac_bad2"
+rm -rf "$W/mac_bad2"; cp -R "$W/mac_bad" "$W/mac_bad2"; echo garbage >> "$W/mac_bad2/$ROUND/pods/$J/manifest.tsv"
+PARTIAL=1 check FAIL "--partial: unparsable manifest line" "$W/mac_bad2"
 
 make_repo "$W/podmal"; printf 'only|three|fields\n' > "$W/mal.txt"; run_pod "$W/podmal" "$W/mal.txt"
 expect "malformed actions file leaves JOB_FAILED only" pod_failed "$W/podmal"
@@ -173,6 +190,12 @@ done
 make_repo "$W/podnot"; UT= run_pod "$W/podnot"
 expect "pod job without UNIT_TIMEOUT: JOB_FAILED, nothing run" \
   bash -c "[ -f '$W/podnot/$ROUND/pods/$J/JOB_FAILED' ] && [ ! -e '$W/podnot/$T' ]"
+expect "pod job that failed in its pre-flight: the EXIT trap writes an empty manifest" \
+  bash -c "[ -f '$W/podnot/$ROUND/pods/$J/manifest.tsv' ] && [ ! -s '$W/podnot/$ROUND/pods/$J/manifest.tsv' ]"
+rm -rf "$W/mac_not"; mkdir -p "$W/mac_not/$ROUND/actions" "$W/mac_not/$ROUND/pods/$J"; cp "$W/actions.txt" "$W/mac_not/$ROUND/actions/$J.txt"
+rsync -a "$W/podnot/$ROUND/pods/$J/" "$W/mac_not/$ROUND/pods/$J/"
+PARTIAL=1 check OK "--partial: job failed before copying its actions (empty manifest)" "$W/mac_not"
+check FAIL "full verify of that pull" "$W/mac_not"
 
 # A hung unit: FAKE_SLEEP far beyond UNIT_TIMEOUT. The unit is killed with its process group, the job ends JOB_FAILED.
 make_repo "$W/podslow"
@@ -184,6 +207,9 @@ t0=$(date +%s); UT=3 run_pod "$W/podslow" "$W/slow.txt"; el=$(( $(date +%s) - t0
 expect "unit timeout: JOB_FAILED, TIMEOUT logged, the fast unit done (${el}s)" \
   bash -c "[ -f '$W/podslow/$ROUND/pods/$J/JOB_FAILED' ] && grep -q 'TIMEOUT' '$W/podslow/$ROUND/pods/$J/progress.log' && [ -f '$W/podslow/$T/pretrain/rl/pair0_1/seed1/job.done' ] && [ $el -lt 30 ]"
 expect "unit timeout: the unit's children were killed too (no 'sleep 37' left)" bash -c "! pgrep -f 'sleep 37' > /dev/null"
+expect "unit timeout: a TIMEOUT line in the unit's own job.log" grep -q 'TIMEOUT: killed by the pod job' "$W/podslow/$T/stream/rl/pair0_1/seed1/fine3/job.log"
+expect "unit timeout: the manifest (written after) lists the job.log with its TIMEOUT line" \
+  bash -c "f='$T/stream/rl/pair0_1/seed1/fine3/job.log'; grep -q \"\$(cd '$W/podslow' && shasum -a 256 < \"\$f\" | cut -d' ' -f1)\" '$W/podslow/$ROUND/pods/$J/manifest.tsv'"
 
 # === the reaper, with fake sky, ssh, rsync and osascript (REAP_TEST_BIN) ==============================================
 # Fake pod = a local dir standing for ~/sky_workdir. Fake sky: a cluster is UP iff $FAKE_STATE/<c>.up exists; its
@@ -201,7 +227,17 @@ case "$1" in
     [ -f "$S/skygarbage" ] && { echo "Something unexpected"; exit 0; }
     [ -f "$S/statusfail_after_down" ] && [ -s "$S/downs" ] && exit 1
     c=${2:-}
-    if [ -n "$c" ] && [ -f "$S/$c.up" ]; then
+    if [ -z "$c" ]; then   # every cluster, as the real sky status prints it
+      printf 'Enabled Infra: runpod\n\nClusters\n'
+      n=0; for u in "$S"/*.up; do [ -f "$u" ] || continue; n=$((n + 1)); done
+      if [ $n = 0 ]; then printf 'No existing clusters.\n'
+      else
+        printf 'NAME  INFRA  RESOURCES  STATUS  AUTOSTOP  LAUNCHED\n'
+        for u in "$S"/*.up; do x=$(basename "$u" .up); au="4h (down)"; [ -f "$S/$x.autostop" ] && au=$(cat "$S/$x.autostop")
+          printf '%s  RunPod  1x(L4)  UP  %s  1m ago\n' "$x" "$au"; done
+      fi
+      printf '\nManaged jobs\nNo in-progress managed jobs.\n'
+    elif [ -f "$S/$c.up" ]; then
       au="4h (down)"; [ -f "$S/$c.autostop" ] && au=$(cat "$S/$c.autostop")
       printf 'Enabled Infra: runpod\n\nClusters\nNAME  INFRA  RESOURCES  STATUS  AUTOSTOP  LAUNCHED\n%s  RunPod  1x(L4)  UP  %s  1m ago\n' "$c" "$au"
     elif [ -n "$c" ]; then
@@ -214,7 +250,11 @@ case "$1" in
     if [ $((i % 60)) = 0 ]; then echo "$((i / 60))h (down)" > "$S/$c.autostop"; else echo "${i}m (down)" > "$S/$c.autostop"; fi ;;
   down) rm -f "$S/$2.up"; echo "$2" >> "$S/downs" ;;
   queue) if [ -f "$S/$2.failed_setup" ]; then echo " ID  NAME  STATUS"; echo " 1   v2-pod  FAILED_SETUP"; else echo " 1  v2-pod  RUNNING"; fi ;;
-  launch) c=$3; [ -f "$S/launchfail_$c" ] && { echo "launch failed" ; exit 3; }; touch "$S/$c.up"; echo "-" > "$S/$c.autostop"
+  launch) c=$3; echo "$4" >> "$S/yaml_$c"
+          [ -f "$S/launchfail_$c" ] && { echo "launch failed" ; exit 3; }
+          [ -f "$S/launchfail1_$c" ] && { rm "$S/launchfail1_$c"; echo "launch failed (no capacity)"; exit 3; }
+          [ -f "$S/launchup_fail_$c" ] && { touch "$S/$c.up"; echo "-" > "$S/$c.autostop"; echo "setup failed"; exit 5; }
+          touch "$S/$c.up"; echo "-" > "$S/$c.autostop"
           [ -f "$S/launchslow_$c" ] && { sleep 40; exit 4; } ;;
 esac
 exit 0
@@ -222,6 +262,7 @@ EOF
 cat > "$B/ssh" <<'EOF'
 #!/bin/bash
 a=("$@"); n=${#a[@]}; cmd=${a[$((n-1))]}; host=${a[$((n-2))]}
+echo "$host $cmd" >> "$FAKE_STATE/ssh_calls"
 [ -f "$FAKE_STATE/$host.sshfail" ] && exit 255
 case "$cmd" in
   "test -f ~/sky_workdir/"*) test -f "$FAKE_POD/${cmd#"test -f ~/sky_workdir/"}" ;;
@@ -266,7 +307,7 @@ reap_case() {  # $1 = expect (DOWN|UP), $2 = label, $3 = fake pod dir; set up $F
   got=UP; grep -qx "$J" "$FAKE_STATE/downs" 2>/dev/null && got=DOWN
   if [ "$got" = "$1" ]; then ok "reaper expect $1  $2"; else wrong "reaper expect $1 got $got  $2"; sed 's/^/      /' "$W/reap_out.txt"; fi
   if [ "$got" = DOWN ] && [ ! -e "$MR/$ROUND/reaped/$J" ] && [ -z "${NOREAPED:-}" ]; then wrong "reaper downed without a reaped marker ($2)"; fi
-  if [ "$got" = UP ] && [ -e "$MR/$ROUND/reaped/$J" ]; then wrong "reaper wrote a reaped marker for a pod it left up ($2)"; fi
+  if [ "$got" = UP ] && [ -e "$MR/$ROUND/reaped/$J" ] && [ -z "${REAPED_OK:-}" ]; then wrong "reaper wrote a reaped marker for a pod it left up ($2)"; fi
   if [ -n "${PREEXIST:-}" ] && ! grep -q "mac's own file" "$MR/$PREEXIST"; then wrong "reaper overwrote a file on the Mac ($2)"; fi
   [ -s "$MR/$ROUND/reaper.heartbeat" ] || wrong "reaper wrote no heartbeat ($2)"
   [ -e "$MR/$ROUND/reaper.lock" ] && wrong "reaper left its lock behind ($2)"
@@ -304,8 +345,21 @@ st "$J.up"; RENV="MIN_FREE_GB=99999999" reap_case UP "disk low" "$W/pod"
 expect "  disk low: HELD, no unit pulled, logged" bash -c "[ -e '$MR/$ROUND/held/$J' ] && [ ! -e '$MR/$T' ] && grep -q 'NOT PULLED: disk' '$MR/$ROUND/reap.log'"
 st "$J.up"; PREP='echo /nonexistent/pull_root_zz > "$MR/$ROUND/pull_root"' reap_case UP "pull root missing: free space UNREADABLE" "$W/pod"
 expect "  unreadable free space: HELD, nothing pulled" bash -c "[ -e '$MR/$ROUND/held/$J' ] && grep -q 'UNREADABLE' '$MR/$ROUND/reap.log' && [ ! -e /nonexistent/pull_root_zz ]"
-st "$J.up";              reap_case UP   "JOB_FAILED" "$W/podbad"
-expect "  JOB_FAILED: pulled once (failed_pulled) and HELD" bash -c "[ -e '$MR/$ROUND/failed_pulled/$J' ] && [ -e '$MR/$ROUND/held/$J' ]"
+st "$J.up";              reap_case UP   "JOB_FAILED, pull verified with --partial" "$W/podbad"
+expect "  JOB_FAILED + verified partial pull: autostop FAILED_IDLE (90m) confirmed, NOT held (no 24h), notified" \
+  bash -c "[ -e '$MR/$ROUND/failed_pulled/$J' ] && [ -e '$MR/$ROUND/failed_safe/$J' ] && [ \"\$(cat '$MR/$ROUND/failed_verify/$J')\" = OK ] && grep -qx '$J 90' '$FAKE_STATE/autostops' && ! grep -q '^$J 1440\$' '$FAKE_STATE/autostops' && [ ! -e '$MR/$ROUND/held/$J' ] && grep -q 'files safe' '$FAKE_STATE/notify' && [ -e '$MR/$ROUND/job_failed/$J' ]"
+st "$J.up"; PASSES=3 reap_case UP "JOB_FAILED, verified partial pull, 3 passes" "$W/podbad"
+expect "  short autostop applied once over 3 passes" bash -c "[ \"\$(grep -c '^$J 90\$' '$FAKE_STATE/autostops')\" = 1 ]"
+st "$J.up" rsyncfail;    reap_case UP   "JOB_FAILED, pull incomplete (rsync fails)" "$W/podbad"
+held_not_short() { held && ! grep -q "^$J 90\$" "$FAKE_STATE/autostops" && [ ! -e "$MR/$ROUND/failed_safe/$J" ]; }
+expect "  JOB_FAILED + incomplete pull: HELD 24h, no short autostop" held_not_short
+st "$J.up"; PREP='mkdir -p "$MR/$ROUND/held"; touch "$MR/$ROUND/held/other-a"'
+            reap_case UP   "JOB_FAILED with 1 other held pod (2 in all)" "$W/podbad"
+expect "  2 held or failed: no ALERT" bash -c "! grep -q ALERT '$MR/$ROUND/reap.log'"
+st "$J.up"; PREP='mkdir -p "$MR/$ROUND/held" "$MR/$ROUND/launch_failed"; touch "$MR/$ROUND/held/other-a" "$MR/$ROUND/launch_failed/other-b"'
+            reap_case UP   "JOB_FAILED with 2 other failed/held pods (3 in all)" "$W/podbad"
+expect "  3 held or failed: ALERT line logged and a notification with a sound" \
+  bash -c "grep -q 'ALERT: 3 clusters of this round are held or failed: other-a other-b $J' '$MR/$ROUND/reap.log' && grep -q 'ALERT.*sound name' '$FAKE_STATE/notify'"
 st "$J.up"; PASSES=3 reap_case UP "JOB_FAILED, some units never started, 3 passes" "$W/podbad_part"
 expect "  failed pod: unit dirs that never existed on the pod are not created here" \
   bash -c "[ ! -e '$MR/$T/stream/rl/pair0_1/seed1/fine3' ] && [ ! -e '$MR/$U_FEW' ] && [ -d '$MR/$U_CONT' ] && grep -q 'never existed on the pod' '$MR/$ROUND/reap.log'"
@@ -322,8 +376,28 @@ st "$J.up" statusfail_after_down; NOREAPED=1 reap_case DOWN "sky down issued, th
 expect "  no reaped marker while sky status is unreadable after down (verified marker kept)" \
   bash -c "[ ! -e '$MR/$ROUND/reaped/$J' ] && [ -e '$MR/$ROUND/verified/$J' ]"
 st "$J.up" "$J.failed_setup"; PREP='mkdir -p "$MR/$ROUND/first_up"; echo 1000 > "$MR/$ROUND/first_up/$J"'
-            reap_case UP "UP for long, no pods dir, sky queue FAILED_SETUP" "$W/pod_empty"
-expect "  setup failure logged and notified once" bash -c "grep -q 'SETUP FAILED' '$MR/$ROUND/reap.log' && [ -e '$MR/$ROUND/setup_failed/$J' ] && grep -q 'SETUP FAILED' '$FAKE_STATE/notify'"
+            reap_case DOWN "UP for long, no pods dir (test -d exit 1), sky queue FAILED_SETUP: torn down" "$W/pod_empty"
+expect "  setup failure logged and notified, reaped as 'nothing ran'" bash -c "grep -q 'SETUP FAILED' '$MR/$ROUND/reap.log' && [ -e '$MR/$ROUND/setup_failed/$J' ] && grep -q 'SETUP FAILED' '$FAKE_STATE/notify' && grep -q 'nothing ran' '$MR/$ROUND/reaped/$J'"
+# launch failed (launch_failed/<c>, written by the launcher): torn down only when test -d of the pods dir exits exactly 1
+LFPREP='mkdir -p "$MR/$ROUND/launch_failed"; echo "exit 1 at x" > "$MR/$ROUND/launch_failed/$J"'
+st "$J.up"; PREP=$LFPREP reap_case DOWN "launch failed, UP, no pods dir on the pod (test -d exit 1)" "$W/pod_empty"
+expect "  launch-failed pod: reaped marker says nothing ran" grep -q 'nothing ran; torn down' "$MR/$ROUND/reaped/$J"
+st "$J.up" "$J.sshfail"; PREP=$LFPREP reap_case UP "launch failed, UP, ssh fails (test -d exit 255)" "$W/pod_empty"
+expect "  ssh failure: nothing done, logged" grep -q 'cannot tell whether its job started (ssh exit 255)' "$MR/$ROUND/reap.log"
+st "$J.up"; PREP=$LFPREP reap_case UP "launch failed, but the job started (test -d exit 0) and is running" "$W/pod_running"
+expect "  started job: handled as a normal pod (no teardown, not held)" not_held
+st "$J.up"; PREP=$LFPREP reap_case DOWN "launch failed, but the job started and completed: pulled, verified, down" "$W/pod"
+expect "  completed despite the failed launch: verified marker" test -e "$MR/$ROUND/verified/$J"
+st;         PREP=$LFPREP REAPED_OK=1 reap_case UP "launch failed, cluster ABSENT from a readable sky status (no down: nothing to down)" "$W/pod_empty"
+expect "  absent launch-failed cluster: reaped marker, no sky down" bash -c "grep -q 'absent from sky status: nothing ran' '$MR/$ROUND/reaped/$J' && [ ! -s '$FAKE_STATE/downs' ]"
+st skyfail; PREP=$LFPREP reap_case UP "launch failed, sky status UNREADABLE" "$W/pod_empty"
+expect "  unreadable sky status: no reaped marker, no ssh" bash -c "[ ! -e '$MR/$ROUND/reaped/$J' ] && [ ! -s '$FAKE_STATE/ssh_calls' ]"
+# one sky status per pass, for every cluster
+st "$J.up"; PASSES=3 reap_case UP "job running, 3 passes" "$W/pod_running"
+expect "  exactly one sky status call per pass (3), none per cluster" bash -c "[ \"\$(grep -cx 'status' '$FAKE_STATE/sky_calls')\" = 3 ] && ! grep -q '^status .' '$FAKE_STATE/sky_calls'"
+st "$J.up" skyfail; PASSES=2 reap_case UP "sky status fails on every pass" "$W/pod"
+expect "  whole-call failure: no ssh, no autostop, no down, nothing pulled" \
+  bash -c "[ ! -s '$FAKE_STATE/ssh_calls' ] && [ ! -s '$FAKE_STATE/autostops' ] && [ ! -s '$FAKE_STATE/downs' ] && [ ! -e '$MR/$T' ] && [ \"\$(grep -c '^status' '$FAKE_STATE/sky_calls')\" = 2 ]"
 st "$J.up"; PREP='mkdir -p "$MR/$ROUND/first_up"; echo 1000 > "$MR/$ROUND/first_up/$J"'
             reap_case UP "UP for long, no pods dir, setup still running" "$W/pod_empty"
 expect "  warning logged" grep -q 'job has not started' "$MR/$ROUND/reap.log"
@@ -366,6 +440,14 @@ st "$J.up"; echo "-" > "$FAKE_STATE/$J.autostop"; status_case 1 "UP row without 
 st "$J.up" "$J.sshfail"; status_case 1 "ssh fails" "UNREADABLE (ssh failed"
 st "$J.up"; mkdir -p "$MR/$ROUND/held"; echo "2026-10-04 x" > "$MR/$ROUND/held/$J"; status_case 0 "held pod shows HELD" "HELD("
 export FAKE_POD=$W/podnot; st "$J.up"; status_case 0 "job failed before copying its actions file shows JOB_FAILED" "JOB_FAILED *(before the units"
+export FAKE_POD=$W/pod_empty; rm -f "$MR/$ROUND/held/$J"; mkdir -p "$MR/$ROUND/launch_failed"; echo "exit 1 at x" > "$MR/$ROUND/launch_failed/$J"
+st "$J.up"; status_case 1 "launch failed, pod UP with nothing run: LAUNCH_FAILED, exit 1" "LAUNCH_FAILED"
+st;         status_case 1 "launch failed, cluster absent: LAUNCH_FAILED, exit 1" "LAUNCH_FAILED(exit 1"
+rm -f "$MR/$ROUND/launch_failed/$J"; mkdir -p "$MR/$ROUND/setup_failed"; touch "$MR/$ROUND/setup_failed/$J"
+st "$J.up"; status_case 1 "FAILED_SETUP: SETUP_FAILED, exit 1" "SETUP_FAILED"
+rm -f "$MR/$ROUND/setup_failed/$J"
+st "$J.up"; status_case 0 "status reads sky status once" "NOT-STARTED"
+expect "  status: one sky status call, for every cluster" bash -c "[ \"\$(grep -c '^status' '$FAKE_STATE/sky_calls')\" = 1 ] && grep -qx status '$FAKE_STATE/sky_calls'"
 unset FAKE_POD
 
 # === the launcher (a fake git repo with the fake run_v2.sh) =================================================
@@ -378,9 +460,12 @@ LA=$W/la; mkdir -p "$LA"
 cp "$W/actions.txt" "$LA/v2t-a.txt"
 printf '%s\n' "$T|EPOCHS=1|pretrain rl \"0 1\" 2|$T/pretrain/rl/pair0_1/seed2|" > "$LA/v2t-b.txt"
 LROUND=runs_local/lround
+mkdir -p "$W/cifar" "$W/ltm"
+for f in train test meta; do echo "fake cifar $f" > "$W/cifar/$f"; done
+echo e13 > "$W/ltm/cifar_100_subclasses_12_e13.pth"; echo e40 > "$W/ltm/cifar_100_subclasses_12_e40.pth"
 launch() {  # env in the caller; prints the log
   ( cd "$LR" && env REAP_TEST_BIN="$B" FAKE_POD="$W/pod_empty" AUTOSTOP_WAIT=${AW:-5} SKY_TIMEOUT=20 INTERVAL=2 MAX_PASSES=4 \
-      bash sky/v2_launch.sh "$LROUND" "$@" ) > "$W/launch_out.txt" 2>&1
+      CIFAR_SRC="${CIFAR_SRC:-$W/cifar}" LTM_SRC="$W/ltm" bash sky/v2_launch.sh "$LROUND" "$@" ) > "$W/launch_out.txt" 2>&1
 }
 st; launch "$LA/v2t-a.txt"; r=$?
 expect "launcher refuses without UNIT_TIMEOUT" bash -c "[ $r = 2 ] && grep -q 'UNIT_TIMEOUT must be set' '$W/launch_out.txt'"
@@ -410,7 +495,17 @@ LL=$LR/$LROUND/launch.log
 expect "launch: sky launch exit code collected and logged for the failed cluster" grep -q 'v2t-b LAUNCH/SETUP FAILED: sky launch exited 3' "$LL"
 expect "launch: failed cluster marked LAUNCH FAILED only on a real empty row" grep -q 'v2t-b LAUNCH FAILED (sky status lists no such cluster' "$LL"
 expect "launch: autostop applied and confirmed on the launched cluster" bash -c "grep -qx 'v2t-a 240' '$FAKE_STATE/autostops' && grep -q 'v2t-a autostop confirmed' '$LL'"
-expect "launch: UNIT_TIMEOUT passed to sky launch" grep -q 'launch -c v2t-a sky/v2_pod.yaml .*--env UNIT_TIMEOUT=1h' "$FAKE_STATE/sky_calls"
+expect "launch: UNIT_TIMEOUT passed to sky launch" grep -q "launch -c v2t-a $LROUND/yaml/v2t-a.yaml .*--env UNIT_TIMEOUT=1h" "$FAKE_STATE/sky_calls"
+expect "launch: the Mac's CIFAR-100 sha256s passed to sky launch" \
+  grep -q "launch -c v2t-a .*--env CIFAR_SHA256_TRAIN=$(shasum -a 256 < "$W/cifar/train" | cut -d' ' -f1) --env CIFAR_SHA256_TEST=$(shasum -a 256 < "$W/cifar/test" | cut -d' ' -f1) --env CIFAR_SHA256_META=$(shasum -a 256 < "$W/cifar/meta" | cut -d' ' -f1) " "$FAKE_STATE/sky_calls"
+expect "launch: per-cluster yaml restricted to the preferred region (default RO) by any_of" \
+  bash -c "grep -qx '  any_of:' '$LR/$LROUND/yaml/v2t-a.yaml' && grep -qx '    - infra: runpod/RO' '$LR/$LROUND/yaml/v2t-a.yaml' && ! grep -q '^  infra: runpod\$' '$LR/$LROUND/yaml/v2t-a.yaml' && [ \"\$(grep -c 'infra: runpod/' '$LR/$LROUND/yaml/v2t-a.yaml')\" = 1 ]"
+expect "launch: fallback yaml has every other region except IS (avoided) and RO (preferred)" \
+  bash -c "y='$LR/$LROUND/yaml/v2t-a.fallback.yaml'; [ \"\$(grep -c 'infra: runpod/' \"\$y\")\" = 12 ] && ! grep -q 'runpod/IS\$' \"\$y\" && ! grep -q 'runpod/RO\$' \"\$y\" && grep -q 'runpod/CZ\$' \"\$y\""
+expect "launch: no LTM=e40 unit, so no e40 mount (still commented), e13 mounted, no CIFAR mount" \
+  bash -c "y='$LR/$LROUND/yaml/v2t-a.yaml'; grep -q '^  #E40 ' \"\$y\" && ! grep -q '^  ~/cifar_100_pretrain/cifar_100_subclasses_12_e40.pth:' \"\$y\" && grep -q '^  ~/cifar_100_pretrain/cifar_100_subclasses_12_e13.pth:' \"\$y\" && ! grep -q '^  ~/cifar-100-python' \"\$y\""
+expect "launch: v2t-b failed in the preferred region, was absent, and was retried with the fallback yaml (then failed: launch_failed marker)" \
+  bash -c "grep -qx '$LROUND/yaml/v2t-b.yaml' '$FAKE_STATE/yaml_v2t-b' && grep -qx '$LROUND/yaml/v2t-b.fallback.yaml' '$FAKE_STATE/yaml_v2t-b' && grep -q 'trying the fallback regions' '$LL' && grep -q '^exit 3' '$LR/$LROUND/launch_failed/v2t-b' && [ ! -e '$LR/$LROUND/launch_failed/v2t-a' ]"
 expect "launch: pull_root recorded" bash -c "[ \"\$(cat '$LR/$LROUND/pull_root')\" = \"\$(cd '$LR' && pwd -P)\" ]"
 expect "launch: reaper started under caffeinate, holding the round's lock" grep -q 'reaper started (pid' "$LL"
 RPID=$(cat "$LR/$LROUND/reaper.lock/pid" 2>/dev/null)
@@ -426,6 +521,82 @@ expect "launch: waits for a launch still running after autostop, and logs its ex
   bash -c "grep -q 'v2t-slow autostop confirmed' '$LL' && grep -q 'v2t-slow: waiting for sky launch to return' '$LL' && grep -q 'v2t-slow LAUNCH/SETUP FAILED: sky launch exited 4' '$LL'"
 RPID=$(cat "$LR/$LROUND/reaper.lock/pid" 2>/dev/null); [ -n "$RPID" ] && kill "$RPID" 2>/dev/null
 sleep 1
+# an LTM=e40 unit: the e40 checkpoint mounted; preferred region full, fallback succeeds
+printf '%s\n' "$T|LTM=e40 EPOCHS=1|pretrain rl \"0 1\" 6|$T/pretrain/rl/pair0_1/seed6|" > "$LA/v2t-e.txt"
+st launchfail1_v2t-e; AW=60 REGIONS="RO CZ" UNIT_TIMEOUT=1h launch "$LA/v2t-e.txt"
+RPID=$(cat "$LR/$LROUND/reaper.lock/pid" 2>/dev/null); [ -n "$RPID" ] && kill "$RPID" 2>/dev/null
+expect "launch: LTM=e40 unit -> e40 checkpoint mounted in both yamls; REGIONS='RO CZ' in the preferred yaml" \
+  bash -c "for y in '$LR/$LROUND/yaml/v2t-e.yaml' '$LR/$LROUND/yaml/v2t-e.fallback.yaml'; do grep -q '^  ~/cifar_100_pretrain/cifar_100_subclasses_12_e40.pth: ~/Dev/cifar_100_pretrain/cifar_100_subclasses_12_e40.pth' \"\$y\" || exit 1; done; grep -qx '    - infra: runpod/CZ' '$LR/$LROUND/yaml/v2t-e.yaml' && [ \"\$(grep -c 'infra: runpod/' '$LR/$LROUND/yaml/v2t-e.fallback.yaml')\" = 11 ]"
+expect "launch: preferred region without capacity -> fallback launch exit 0, no launch_failed marker" \
+  bash -c "grep -q 'v2t-e sky launch exited 0' '$LL' && [ ! -e '$LR/$LROUND/launch_failed/v2t-e' ] && grep -qx '$LROUND/yaml/v2t-e.fallback.yaml' '$FAKE_STATE/yaml_v2t-e'"
+# STRICT_REGIONS=1: no fallback yaml, one attempt only
+printf '%s\n' "$T|EPOCHS=1|pretrain rl \"0 1\" 7|$T/pretrain/rl/pair0_1/seed7|" > "$LA/v2t-s.txt"
+st launchfail_v2t-s; AW=30 STRICT_REGIONS=1 UNIT_TIMEOUT=1h launch "$LA/v2t-s.txt"
+RPID=$(cat "$LR/$LROUND/reaper.lock/pid" 2>/dev/null); [ -n "$RPID" ] && kill "$RPID" 2>/dev/null
+expect "launch: STRICT_REGIONS=1 -> one attempt, no fallback yaml, launch_failed recorded" \
+  bash -c "[ \"\$(grep -c . '$FAKE_STATE/yaml_v2t-s')\" = 1 ] && [ ! -e '$LR/$LROUND/yaml/v2t-s.fallback.yaml' ] && [ -e '$LR/$LROUND/launch_failed/v2t-s' ]"
+# a launch that brings the pod UP and then fails (setup): not retried elsewhere (the cluster exists), launch_failed
+printf '%s\n' "$T|EPOCHS=1|pretrain rl \"0 1\" 8|$T/pretrain/rl/pair0_1/seed8|" > "$LA/v2t-u.txt"
+st launchup_fail_v2t-u; AW=60 UNIT_TIMEOUT=1h launch "$LA/v2t-u.txt"
+RPID=$(cat "$LR/$LROUND/reaper.lock/pid" 2>/dev/null); [ -n "$RPID" ] && kill "$RPID" 2>/dev/null
+expect "launch: pod UP but sky launch failed (setup) -> NOT relaunched in other regions; launch_failed with exit 5" \
+  bash -c "[ \"\$(grep -c . '$FAKE_STATE/yaml_v2t-u')\" = 1 ] && grep -q 'NOT retrying in other regions' '$LL' && grep -q '^exit 5' '$LR/$LROUND/launch_failed/v2t-u'"
+st; UNIT_TIMEOUT=1h REGIONS="RO XX" DRY=1 launch "$LA/v2t-a.txt"; r=$?
+expect "launcher refuses an unknown region" bash -c "[ $r = 2 ] && grep -q \"unknown region 'XX'\" '$W/launch_out.txt'"
+st; UNIT_TIMEOUT=1h CIFAR_SRC=$W/nonexistent DRY=1 launch "$LA/v2t-a.txt"; r=$?
+expect "launcher refuses without the Mac's CIFAR-100 copy" bash -c "[ $r = 2 ] && grep -q 'no $W/nonexistent/train' '$W/launch_out.txt'"
+sleep 1
+
+# === the pod setup's dataset phase, with a fake download (curl on PATH) ===============================================
+SD=$W/setup; mkdir -p "$SD/src/cifar-100-python" "$SD/bin" "$SD/repo/sky"
+cp "$SRC/sky/v2_pod_setup.sh" "$SD/repo/sky/"
+for f in train test meta; do head -c 3000 /dev/urandom > "$SD/src/cifar-100-python/$f"; done
+touch "$SD/src/cifar-100-python/file.txt~"
+( cd "$SD/src" && COPYFILE_DISABLE=1 tar -czf "$SD/good.tar.gz" cifar-100-python )
+cp -R "$SD/src" "$SD/src_bad"; printf 'x' >> "$SD/src_bad/cifar-100-python/test"
+( cd "$SD/src_bad" && COPYFILE_DISABLE=1 tar -czf "$SD/bad.tar.gz" cifar-100-python )
+cat > "$SD/bin/curl" <<'EOF2'
+#!/bin/bash
+# fake curl: -o FILE URL; copies $FAKE_TGZ, or fails with FAKE_CURL_FAIL=1; logs each call
+o=""; while [ $# -gt 0 ]; do case "$1" in -o) o=$2; shift ;; esac; shift; done
+echo call >> "$SETUP_STATE/curl_calls"
+[ "${FAKE_CURL_FAIL:-0}" = 1 ] && exit 7
+cp "$FAKE_TGZ" "$o"
+EOF2
+chmod +x "$SD/bin/curl"
+md5of() { md5 -q "$1" 2>/dev/null || md5sum < "$1" | cut -d' ' -f1; }
+shaof() { shasum -a 256 < "$1" | cut -d' ' -f1; }
+GOODMD5=$(md5of "$SD/good.tar.gz"); BADMD5=$(md5of "$SD/bad.tar.gz")
+setup_run() {  # $1 = tarball, $2 = md5 to expect; env in the caller (e.g. SHA_TEST); prints the exit code
+  rm -rf "$SD/state"; mkdir -p "$SD/state"
+  ( cd "$SD/repo" && env PATH="$SD/bin:$PATH" SETUP_STATE="$SD/state" FAKE_TGZ="$1" CIFAR_MD5="$2" DATA_DIR="$SD/home/cifar-100-python" \
+      SETUP_LOG="$SD/state/setup.log" FETCH_TRIES=2 RETRY_SLEEP=0 \
+      CIFAR_SHA256_TRAIN="${SHA_TRAIN-$(shaof "$SD/src/cifar-100-python/train")}" \
+      CIFAR_SHA256_TEST="${SHA_TEST-$(shaof "$SD/src/cifar-100-python/test")}" \
+      CIFAR_SHA256_META="${SHA_META-$(shaof "$SD/src/cifar-100-python/meta")}" \
+      bash sky/v2_pod_setup.sh dataset > "$SD/state/out.txt" 2>&1 ); echo $?
+}
+mkdir -p "$SD/home"
+r=$(setup_run "$SD/good.tar.gz" "$GOODMD5")
+expect "setup: good download -> exit 0, dataset in place, byte-identical, no leftovers" \
+  bash -c "[ $r = 0 ] && cmp -s '$SD/src/cifar-100-python/train' '$SD/home/cifar-100-python/train' && grep -q 'SETUP OK' '$SD/state/setup.log' && [ -z \"\$(ls -A '$SD/home' | grep -v '^cifar-100-python\$')\" ]"
+r=$(setup_run "$SD/good.tar.gz" "$GOODMD5")
+expect "setup: dataset already present and matching -> not fetched again" bash -c "[ $r = 0 ] && [ ! -e '$SD/state/curl_calls' ] && grep -q 'not fetched' '$SD/state/setup.log'"
+rm -rf "$SD/home"; mkdir -p "$SD/home"
+r=$(setup_run "$SD/bad.tar.gz" "$BADMD5")
+expect "setup: extracted test file differs from the Mac's (md5 of the tarball fine) -> exit 1, loud, no dataset dir" \
+  bash -c "[ $r = 1 ] && grep -q 'SETUP FAILED: extracted CIFAR-100 differs from the Mac.s copy: sha256 of .*/test is' '$SD/state/setup.log' && [ ! -e '$SD/home/cifar-100-python' ] && [ -z \"\$(ls -A '$SD/home')\" ]"
+r=$(setup_run "$SD/bad.tar.gz" "$GOODMD5")
+expect "setup: md5 of the download wrong on every attempt -> exit 1 after FETCH_TRIES (2) attempts, no dataset dir" \
+  bash -c "[ $r = 1 ] && [ \"\$(grep -c . '$SD/state/curl_calls')\" = 2 ] && grep -q 'could not fetch' '$SD/state/setup.log' && [ ! -e '$SD/home/cifar-100-python' ]"
+r=$(FAKE_CURL_FAIL=1 setup_run "$SD/good.tar.gz" "$GOODMD5")
+expect "setup: download fails every time -> exit 1" bash -c "[ $r = 1 ] && grep -q 'download failed' '$SD/state/setup.log'"
+r=$(SHA_META= setup_run "$SD/good.tar.gz" "$GOODMD5")
+expect "setup: a sha256 not passed -> exit 1 before any download" bash -c "[ $r = 1 ] && [ ! -e '$SD/state/curl_calls' ] && grep -q 'CIFAR_SHA256_META not set' '$SD/state/setup.log'"
+r=$(setup_run "$SD/good.tar.gz" "$GOODMD5"); mv "$SD/home/cifar-100-python" "$SD/home/keep"; cp -R "$SD/home/keep" "$SD/home/cifar-100-python"; printf 'x' >> "$SD/home/cifar-100-python/meta"
+r=$(setup_run "$SD/good.tar.gz" "$GOODMD5")
+expect "setup: an existing mismatching dataset is moved aside and fetched again" \
+  bash -c "[ $r = 0 ] && ls -d '$SD/home'/cifar-100-python.mismatch.* > /dev/null 2>&1 && cmp -s '$SD/src/cifar-100-python/meta' '$SD/home/cifar-100-python/meta'"
 
 echo "---"; echo "$passes passed, $fails wrong"
 [ "$fails" = 0 ] && { echo "ALL TESTS PASS"; exit 0; } || { echo "$fails TEST(S) WRONG"; exit 1; }

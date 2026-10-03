@@ -15,14 +15,18 @@
 # stm_pretrain.pth is always written, since the unit's other runs need it). Reserved, refused in the environment
 # field: RUNS, PY, DRY, PRINT_UNIT, UNIT_TIMEOUT (the pod job sets them, or they would change what the unit is).
 # Each unit runs under `timeout --kill-after=120 $UNIT_TIMEOUT` (GNU timeout signals its whole process group, so the
-# Python run dies with run_v2.sh); a unit that times out is FAILED like any other, so the job ends JOB_FAILED.
+# Python run dies with run_v2.sh); a unit that times out is FAILED like any other, so the job ends JOB_FAILED, and a
+# TIMEOUT line is appended to the unit's own job.log as well as to progress.log.
 # Outputs, under the round directory (same relative path on the pod and the Mac):
 #   $ROUND/pods/$JOB/progress.log      one line per unit start/end, with elapsed seconds
 #   $ROUND/pods/$JOB/<unit>.log        run_v2.sh's stdout/stderr per unit (the unit's own job.log has the run)
 #   $ROUND/pods/$JOB/actions.txt env.txt code_commit.txt
 #   $ROUND/pods/$JOB/manifest.tsv      size<TAB>sha256<TAB>path of every file of every unit, except paths with a
 #                                      component starting with '.' (run_v2.sh's .lock dir; sky/v2_verify.sh ignores the
-#                                      same paths, e.g. a .DS_Store on the Mac)
+#                                      same paths, e.g. a .DS_Store on the Mac). Written on every exit, also a failed
+#                                      one (by the EXIT trap if the job died before writing it; empty if no unit dir
+#                                      exists), so the reaper can check a failed job's pull with v2_verify.sh --partial
+#   $ROUND/pods/$JOB/setup.log         the pod setup's log with timings (sky/v2_pod_setup.sh, $SETUP_LOG)
 # Sentinels (tested by the reaper with test -f, never parsed):
 #   $ROUND/pods/$JOB/JOB_COMPLETE  every unit has job.done and the manifest is written
 #   $ROUND/pods/$JOB/JOB_FAILED    the job ended any other way (written by the EXIT trap, so also on a crash)
@@ -43,19 +47,42 @@ RUN_V2=${RUN_V2:-run_v2.sh}
 UNIT_TIMEOUT=${UNIT_TIMEOUT:-}
 LOG=$ROUND/pods/$JOB
 mkdir -p "$LOG" || exit 1
-rm -f "$LOG/JOB_COMPLETE" "$LOG/JOB_FAILED"
-finish() {  # EXIT trap: anything other than a clean, complete end leaves JOB_FAILED
+rm -f "$LOG/JOB_COMPLETE" "$LOG/JOB_FAILED" "$LOG/manifest.tsv"
+SETUP_LOG=${SETUP_LOG:-$HOME/v2_setup.log}
+[ -f "$SETUP_LOG" ] && cp "$SETUP_LOG" "$LOG/setup.log"
+sha256() {  # $1 = file -> hex digest (sha256sum on Linux and recent macOS, shasum elsewhere); read on stdin, so no
+  # filename escaping
+  if command -v sha256sum >/dev/null; then sha256sum < "$1" | cut -d' ' -f1; else shasum -a 256 < "$1" | cut -d' ' -f1; fi
+}
+# write_manifest: size<TAB>sha256<TAB>path of every file of every unit dir of the actions file that exists (none, or
+# no actions file yet: an empty manifest). Paths contain brackets and spaces (cifar_100/continual_[3, 4]_500/...):
+# NUL-separated find, tab-separated output, one file per line. Paths with a component starting with '.' are left out
+# (header). Written to a temporary file and moved, so a manifest is never partial. Returns 1 if a file cannot be hashed.
+write_manifest() {
+  local tree env args unit flag f h
+  : > "$LOG/manifest.tsv.tmp" || return 1
+  if [ -s "$LOG/actions.txt" ]; then
+    while IFS='|' read -r tree env args unit flag || [ -n "$tree" ]; do
+      [ -z "$tree" ] && continue
+      [ -n "$unit" ] && [ -d "$unit" ] || continue
+      while IFS= read -r -d '' f; do
+        h=$(sha256 "$f"); [[ "$h" =~ ^[0-9a-f]{64}$ ]] || { echo "cannot hash $f" >&2; return 1; }
+        printf '%s\t%s\t%s\n' "$(wc -c < "$f" | tr -d ' ')" "$h" "$f" >> "$LOG/manifest.tsv.tmp"
+      done < <(find "$unit" -name '.*' -prune -o -type f -print0)
+    done < "$LOG/actions.txt"
+  fi
+  mv "$LOG/manifest.tsv.tmp" "$LOG/manifest.tsv"
+}
+finish() {  # EXIT trap: anything other than a clean, complete end leaves JOB_FAILED (and a manifest, if none yet)
   [ -f "$LOG/JOB_COMPLETE" ] && return
+  [ -f "$LOG/manifest.tsv" ] || write_manifest 2>> "$LOG/progress.log" \
+    || echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] could not write the manifest" >> "$LOG/progress.log"
   touch "$LOG/JOB_FAILED"
   echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] JOB_FAILED sentinel written" >> "$LOG/progress.log"
 }
 trap finish EXIT
 step() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" | tee -a "$LOG/progress.log"; }
 fail() { step "JOB FAILED: $*"; exit 1; }
-sha256() {  # $1 = file -> hex digest (sha256sum on Linux and recent macOS, shasum elsewhere); read on stdin, so no
-  # filename escaping
-  if command -v sha256sum >/dev/null; then sha256sum < "$1" | cut -d' ' -f1; else shasum -a 256 < "$1" | cut -d' ' -f1; fi
-}
 [[ "$UNIT_TIMEOUT" =~ ^[1-9][0-9]*[smhd]?$ ]] || fail "UNIT_TIMEOUT must be set to a positive duration (e.g. 6h), not '$UNIT_TIMEOUT'"
 command -v timeout >/dev/null || fail "no timeout(1) on this machine"
 
@@ -129,6 +156,7 @@ run_line() {  # one actions line; the unit counts as done only if run_v2.sh exit
     step "done   [$unit] $(( $(date +%s) - t0 )) s"
   elif [ $rc -eq 124 ] || [ $rc -eq 137 ]; then
     step "FAILED [$unit] TIMEOUT after $(( $(date +%s) - t0 )) s (UNIT_TIMEOUT=$UNIT_TIMEOUT, rc=$rc)"
+    [ -d "$unit" ] && echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] TIMEOUT: killed by the pod job after $(( $(date +%s) - t0 )) s (UNIT_TIMEOUT=$UNIT_TIMEOUT, rc=$rc)" >> "$unit/job.log"
   else
     step "FAILED [$unit] rc=$rc after $(( $(date +%s) - t0 )) s"
   fi
@@ -159,19 +187,9 @@ while IFS='|' read -r tree env args unit flag || [ -n "$tree" ]; do
   [ -f "$unit/job.done" ] || { missing=$((missing + 1)); step "missing job.done: $unit"; }
 done < "$A"
 
-# Manifest of every file of every unit: size<TAB>sha256<TAB>path. Written even on failure, so a failed job can be
-# pulled and checked. Paths contain brackets and spaces (cifar_100/continual_[3, 4]_500/...): NUL-separated find,
-# tab-separated output, one file per line. Paths with a component starting with '.' are left out (header).
-: > "$LOG/manifest.tsv.tmp"
-while IFS='|' read -r tree env args unit flag || [ -n "$tree" ]; do
-  [ -z "$tree" ] && continue
-  [ -d "$unit" ] || continue
-  while IFS= read -r -d '' f; do
-    h=$(sha256 "$f"); [[ "$h" =~ ^[0-9a-f]{64}$ ]] || fail "cannot hash $f"
-    printf '%s\t%s\t%s\n' "$(wc -c < "$f" | tr -d ' ')" "$h" "$f" >> "$LOG/manifest.tsv.tmp"
-  done < <(find "$unit" -name '.*' -prune -o -type f -print0)
-done < "$A"
-mv "$LOG/manifest.tsv.tmp" "$LOG/manifest.tsv" || fail "cannot write manifest"
+# Manifest of every file of every unit (write_manifest). Written even on failure, so a failed job can be pulled and
+# checked (sky/v2_verify.sh --partial).
+write_manifest || fail "cannot write the manifest"
 step "manifest: $(grep -c . "$LOG/manifest.tsv") files"
 
 [ "$missing" = 0 ] || fail "$missing unit(s) unfinished"
