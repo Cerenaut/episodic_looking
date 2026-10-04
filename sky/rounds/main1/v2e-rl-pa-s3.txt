@@ -1,0 +1,5 @@
+runs_v2|LTM=e40 SAVE_STM=1|pretrain rl "0 1" 3|runs_v2/pretrain_e40/rl/pair0_1/seed3|
+runs_v2|LTM=e40 SAVE_STM=1|baseline rl "0 1" 3|runs_v2/baseline_e40/rl/pair0_1/seed3|
+runs_v2|LTM=e40 SAVE_STM=1|continual rl "0 1" 3 "3 4 5"|runs_v2/continual_e40/rl/pair0_1/seed3/order3_4_5|
+runs_v2|LTM=e40 SAVE_STM=1|continual rl "0 1" 3 "4 5 3"|runs_v2/continual_e40/rl/pair0_1/seed3/order4_5_3|
+runs_v2|LTM=e40 SAVE_STM=1|continual rl "0 1" 3 "5 3 4"|runs_v2/continual_e40/rl/pair0_1/seed3/order5_3_4|
