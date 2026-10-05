@@ -1,11 +1,11 @@
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 
 from environment.cifar.cifar_classifier import CifarClassifier
-from environment.cifar.cifar_experiment import StmExperimentConfig
 from model.dense import DenseModel, DenseModelConfig
 from model.resnet import ResNetConfig
 from model.sparse.sparse_dense_model import SparseActivationDenseModelConfig
@@ -19,6 +19,9 @@ from util.reinforcement_learning.policy_util import (
 from util.reinforcement_learning.rl_util import (
     normalize_advantage,
 )
+
+if TYPE_CHECKING:  # for the annotations of from_experiment only, so the model module does not import the experiment module
+    from environment.cifar.cifar_experiment import StmExperimentConfig
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +66,7 @@ class CifarModelConfig:
     eval_bias:str = "sample"  # RL actor at evaluation, see CifarModel.EVAL_BIAS_*
 
     @staticmethod
-    def from_experiment(experiment:StmExperimentConfig) -> "CifarModelConfig":
+    def from_experiment(experiment:"StmExperimentConfig") -> "CifarModelConfig":
         """The STM of cifar_main_stm_training.py: the paper's settings, with the variant options of the command line."""
         return CifarModelConfig(
             encoder_ensemble_size=1,

@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -7,13 +8,15 @@ import torch.nn.functional as F
 from agent.episodic_agent import EpisodicAgent, EpisodicAgentConfig
 
 from environment.cifar.cifar_env import CifarEnv
-from environment.cifar.cifar_experiment import StmExperimentConfig
 from environment.cifar.cifar_model import CifarModel, CifarModelConfig
 from environment.cifar.cifar_results import CifarResults
 from util.log import loss_to_float_with_norm, tensor_to_float_with_norm
 from util.log_writer import ScalarLogWriter
 from util.optimizer import ModelOptimizer, ModelOptimizerConfig
 from util.reinforcement_learning.policy_util import PolicyUtil
+
+if TYPE_CHECKING:  # for the annotations of from_experiment only, so the agent module does not import the experiment module
+    from environment.cifar.cifar_experiment import StmExperimentConfig
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +32,7 @@ class CifarAgentConfig(EpisodicAgentConfig):
     ltm_obs_cache:str = "off"
 
     @staticmethod
-    def from_experiment(experiment:StmExperimentConfig, environment_id:str, image_shape:list[int]) -> "CifarAgentConfig":
+    def from_experiment(experiment:"StmExperimentConfig", environment_id:str, image_shape:list[int]) -> "CifarAgentConfig":
         """The agent of cifar_main_stm_training.py."""
         return CifarAgentConfig(
             # Logging
