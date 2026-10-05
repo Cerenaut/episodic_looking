@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -14,6 +15,9 @@ from util.log_writer import ScalarLogWriter
 from util.optimizer import ModelOptimizer, ModelOptimizerConfig
 from util.reinforcement_learning.policy_util import PolicyUtil
 
+if TYPE_CHECKING:  # for the annotations of from_experiment only, so the agent module does not import the experiment module
+    from environment.cifar.cifar_experiment import StmExperimentConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -26,6 +30,33 @@ class CifarAgentConfig(EpisodicAgentConfig):
     # frozen LTM in eval mode, so the same output). off = always recompute (the original behaviour); on = reuse;
     # check = recompute and raise unless the reused tensor is bitwise equal.
     ltm_obs_cache:str = "off"
+
+    @staticmethod
+    def from_experiment(experiment:"StmExperimentConfig", environment_id:str, image_shape:list[int]) -> "CifarAgentConfig":
+        """The agent of cifar_main_stm_training.py."""
+        return CifarAgentConfig(
+            # Logging
+            log_type="tensorboard",
+            log_path=experiment.run_root,
+            log_prefix=experiment.LOG_PREFIX,
+            log_period=experiment.LOG_PERIOD,
+            # EpisodicAgent
+            batch_size=experiment.batch_size,
+            # 0 when equal: evaluation shares the training environments
+            evaluate_batch_size=experiment.evaluate_batch_size if experiment.evaluate_batch_size != experiment.batch_size else 0,
+            history_size=experiment.CONTEXT_SIZE,
+            action_size=experiment.NUM_CLASSES,
+            observation_size=experiment.ENCODING_SIZE + experiment.BIAS_SIZE + experiment.NUM_CLASSES,
+            random_policy=False,
+            environment_id=environment_id,
+            async_env=False,
+            max_episode_steps=experiment.MAX_EPISODE_STEPS,
+            # CifarAgent
+            image_shape=image_shape,
+            learning_rate=experiment.learning_rate,
+            momentum=0.5,
+            ltm_obs_cache=experiment.ltm_obs_cache,
+        )
 
 class CifarAgent(EpisodicAgent):
     """

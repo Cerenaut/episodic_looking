@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -18,6 +19,9 @@ from util.reinforcement_learning.policy_util import (
 from util.reinforcement_learning.rl_util import (
     normalize_advantage,
 )
+
+if TYPE_CHECKING:  # for the annotations of from_experiment only, so the model module does not import the experiment module
+    from environment.cifar.cifar_experiment import StmExperimentConfig
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +64,38 @@ class CifarModelConfig:
     actor_training:str = "rl"
     loss_differentiable_scale:float = 1.0
     eval_bias:str = "sample"  # RL actor at evaluation, see CifarModel.EVAL_BIAS_*
+
+    @staticmethod
+    def from_experiment(experiment:"StmExperimentConfig") -> "CifarModelConfig":
+        """The STM of cifar_main_stm_training.py: the paper's settings, with the variant options of the command line."""
+        return CifarModelConfig(
+            encoder_ensemble_size=1,
+            encoder_sparsity=experiment.sparsity,
+            history_size=experiment.CONTEXT_SIZE,
+            model_hidden_size=1000,
+            model_hidden_size_factor=1,
+            model_nonlinearity="leaky-relu",
+            model_layers=3,
+            discount_factor=experiment.DISCOUNT,
+            normalize_advantage=True,
+            normalize_advantage_epsilon=0.0001,
+            normalize_advantage_clamp=None,
+            reward_scale=1.0,
+            reward_type=CifarModel.REWARD_TYPE_ACCURACY_IMPROVEMENT,
+            loss_actor_scale=0.01,
+            loss_critic_scale=1.0,
+            loss_entropy_scale=1.0,
+            loss_class_scale=0.01,
+            loss_huber_delta=1.0,
+            loss_actor_type=CifarModel.LOSS_TYPE_SLOW_CHANGE,
+            loss_critic_type=CifarModel.LOSS_TYPE_HUBER,
+            num_classes=experiment.NUM_CLASSES,
+            classifier_model_file=experiment.ltm_checkpoint,
+            classifier_bias_stage=experiment.BIAS_STAGE,
+            policy_std=0.5,
+            actor_training=experiment.actor_training,
+            eval_bias=experiment.eval_bias,
+        )
     
 
 class CifarModel:

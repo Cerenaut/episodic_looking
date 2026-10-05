@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import gymnasium as gym
 import numpy as np
 
-from environment.cifar.cifar_dataset import Cifar100Dataset, CifarSharedMemoryNames
+from environment.cifar.cifar_dataset import Cifar100Dataset, CifarDatasetOptions, CifarSharedMemoryNames
 from util.instrumentation import Instrumentation
 
 logger = logging.getLogger(__name__)
@@ -26,10 +26,10 @@ class CifarEnvConfig:
     exclude_classes_fine_evaluate:set[int]|None = field(default_factory=None)
     max_instances_training:int|None = None
     max_instances_evaluate:int|None = None
-    # Extra Cifar100Dataset options per mode (validation split, seeded subset; "training" to read the training file in
-    # evaluate mode, for the validation set). They must match those of the dataset that created the shared memory.
-    dataset_options_training:dict|None = None
-    dataset_options_evaluate:dict|None = None
+    # Extra Cifar100Dataset options per mode (validation split, seeded subset, which file). They must match those of
+    # the dataset that created the shared memory. None = the defaults.
+    dataset_options_training:CifarDatasetOptions|None = None
+    dataset_options_evaluate:CifarDatasetOptions|None = None
 
 
 class EvaluationSweep:
@@ -109,7 +109,7 @@ class CifarEnv(gym.Env):
             shared_memory_names:CifarSharedMemoryNames,
             exclude_classes_fine:set[int],
             max_instances:int|None,
-            dataset_options:dict|None = None,
+            dataset_options:CifarDatasetOptions|None = None,
     ):
         envs.call(
             "set_dataset_config",
@@ -135,7 +135,7 @@ class CifarEnv(gym.Env):
         shared_memory_names:CifarSharedMemoryNames,
         exclude_classes_fine:set[int],
         max_instances:int|None,
-        dataset_options:dict|None = None,
+        dataset_options:CifarDatasetOptions|None = None,
     ):
         """
         Allows all the dataset filtering options we want to vary during training to be varied in combination.
@@ -204,15 +204,15 @@ class CifarEnv(gym.Env):
         exclude_classes_fine:set[int]|None,
         max_instances:int|None,
         as_tensor:bool = False,
-        dataset_options:dict|None = None,
+        dataset_options:CifarDatasetOptions|None = None,
     ) -> Cifar100Dataset:
         # Read data file
         #logger.info(f"Loading data file: '{data_file_path}' mode:{mode} (shared mem:{shared_memory_names})...")
-        dataset_options = dict(dataset_options or {})
-        is_training = False
-        if mode == Instrumentation.MODE_TRAINING:
-            is_training = True
-        is_training = dataset_options.pop("training", is_training)  # the validation set is read from the training file
+        if dataset_options is None:
+            dataset_options = CifarDatasetOptions()
+        is_training = dataset_options.training  # True for the validation set, read from the training file
+        if is_training is None:
+            is_training = (mode == Instrumentation.MODE_TRAINING)
         dataset = Cifar100Dataset(
             file_path = data_file_path,
             label_type = Cifar100Dataset.LABEL_TYPE_COARSE,
@@ -222,7 +222,7 @@ class CifarEnv(gym.Env):
             max_instances = max_instances,
             shared_memory_names = shared_memory_names,
             as_tensor = as_tensor,  # keep as numpy
-            **dataset_options,
+            **dataset_options.get_constructor_options(),
         )
         return dataset
 
