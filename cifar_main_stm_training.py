@@ -74,7 +74,7 @@ def do_evaluate_sweep(agent:CifarAgent, episode_steps:int) -> tuple[float, dict[
     return accuracy, image_correct
 
 def main():
-    args = CifarArgs.parse_args()
+    args = CifarArgs.parse_stm_args()
 
     SEED = args.seed
     if SEED is not None:
