@@ -8,7 +8,7 @@ import torch
 
 from environment.cifar.cifar_agent import CifarAgent, CifarAgentConfig
 from environment.cifar.cifar_args import CifarArgs
-from environment.cifar.cifar_dataset import Cifar100Dataset
+from environment.cifar.cifar_dataset import Cifar100Dataset, CifarDatasetOptions
 from environment.cifar.cifar_env import CifarEnv, CifarEnvConfig, EvaluationSweep
 from environment.cifar.cifar_model import CifarModel, CifarModelConfig
 from environment.cifar.cifar_results import CifarResults
@@ -98,14 +98,11 @@ def main():
     # script, and the held-out images are evaluated alongside the test sets.
     # With --max-instances and --seed, the subset is the one the head and LTM-only scripts draw for that seed
     # (Cifar100Dataset.get_subset_mask), and environments re-derive it identically; without a seed, the old draw.
-    subset_options = Cifar100Dataset.get_subset_options(MAX_INSTANCES, SEED)
-    split_options = Cifar100Dataset.get_split_options(VAL_HOLDOUT, args.split_seed)
-    TRAINING_DATASET_OPTIONS = {**subset_options, **split_options} or None
-    VALIDATION_DATASET_OPTIONS = None  # "training": the validation set is read from the training file
-    if subset_options:
+    TRAINING_DATASET_OPTIONS = CifarDatasetOptions.for_training(MAX_INSTANCES, SEED, VAL_HOLDOUT, args.split_seed)
+    VALIDATION_DATASET_OPTIONS = CifarDatasetOptions.for_validation(VAL_HOLDOUT, args.split_seed)  # None: no split
+    if TRAINING_DATASET_OPTIONS.subset_seed is not None:
         logger.info(f"Subset of {MAX_INSTANCES} images per coarse class drawn with seed {SEED}")
-    if split_options:
-        VALIDATION_DATASET_OPTIONS = {"training": True, **split_options, "split_part": "validation"}
+    if VALIDATION_DATASET_OPTIONS is not None:
         logger.info(f"Validation split: {VAL_HOLDOUT} images per fine class held out, split seed {args.split_seed}")
 
     LOG_PREFIX = "cifar-100-bias"

@@ -8,7 +8,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from environment.cifar.cifar_args import CifarArgs
 from environment.cifar.cifar_classifier import CifarClassifier
-from environment.cifar.cifar_dataset import Cifar100Dataset
+from environment.cifar.cifar_dataset import Cifar100Dataset, CifarDatasetOptions
 from environment.cifar.cifar_results import CifarResults
 from model.resnet import ResNetConfig
 from util.device import get_device, seed_all
@@ -108,12 +108,12 @@ def main():
 
     # Validation split (--val-holdout): the training sets hold out the same images per fine class as the head script,
     # and the held-out images are evaluated alongside the test sets. The epoch count stays nominal (500 instances).
-    split_options = Cifar100Dataset.get_split_options(VAL_HOLDOUT, cifar_args.split_seed)
-    if split_options:
-        logger.info(f"Validation split: {VAL_HOLDOUT} images per fine class held out, split seed {cifar_args.split_seed}")
     # With --max-instances and --seed, the subsets are those the head and STM scripts draw for that seed.
-    subset_options = Cifar100Dataset.get_subset_options(MAX_INSTANCES, SEED)
-    if subset_options:
+    training_options = CifarDatasetOptions.for_training(MAX_INSTANCES, SEED, VAL_HOLDOUT, cifar_args.split_seed)
+    validation_options = CifarDatasetOptions.for_validation(VAL_HOLDOUT, cifar_args.split_seed)  # None: no split
+    if validation_options is not None:
+        logger.info(f"Validation split: {VAL_HOLDOUT} images per fine class held out, split seed {cifar_args.split_seed}")
+    if training_options.subset_seed is not None:
         logger.info(f"Subsets of {MAX_INSTANCES} images per coarse class drawn with seed {SEED}")
 
     dataset_training_3 = Cifar100Dataset(
@@ -124,8 +124,7 @@ def main():
         exclude_classes_fine=exclude_classes_fine_3,
         max_instances = MAX_INSTANCES,
         as_tensor=True,
-        **split_options,
-        **subset_options,
+        **training_options.get_constructor_options(),
     )
     dataset_training_4 = Cifar100Dataset(
         file_path=data_file_path, 
@@ -135,8 +134,7 @@ def main():
         exclude_classes_fine=exclude_classes_fine_4,
         max_instances = MAX_INSTANCES,
         as_tensor=True,
-        **split_options,
-        **subset_options,
+        **training_options.get_constructor_options(),
     )
     dataset_training_5 = Cifar100Dataset(
         file_path=data_file_path, 
@@ -146,8 +144,7 @@ def main():
         exclude_classes_fine=exclude_classes_fine_5,
         max_instances = MAX_INSTANCES,
         as_tensor=True,
-        **split_options,
-        **subset_options,
+        **training_options.get_constructor_options(),
     )
 
     # Evaluate on all instances in epoch
@@ -249,17 +246,16 @@ def main():
 
     # Validation sets: the held-out training images of each test group
     loaders_validation = []
-    if VAL_HOLDOUT > 0:
+    if validation_options is not None:
         for exclude_classes_fine_validation in (exclude_classes_fine_12, exclude_classes_fine_3, exclude_classes_fine_4, exclude_classes_fine_5):
             dataset_validation = Cifar100Dataset(
                 file_path=data_file_path,
                 label_type=Cifar100Dataset.LABEL_TYPE_COARSE,
-                training=True,
+                training=validation_options.training,
                 exclude_classes_coarse=exclude_classes_coarse,
                 exclude_classes_fine=exclude_classes_fine_validation,
                 as_tensor=True,
-                split_part="validation",
-                **split_options,
+                **validation_options.get_constructor_options(),
             )
             loaders_validation.append(DataLoader(
                 dataset_validation,
