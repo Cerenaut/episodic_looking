@@ -1,0 +1,23 @@
+runs_v2|SAVE_STM=1|pretrain rl "0 1" 2|runs_v2/pretrain/rl/pair0_1/seed2|
+runs_v2|SAVE_STM=1 LR=0.01 EPOCHS=65|stream rl "0 1" 2 3|runs_v2/stream/rl/pair0_1/seed2/fine3|
+runs_v2|SAVE_STM=1 LR=0.01 EPOCHS=65|stream rl "0 1" 2 4|runs_v2/stream/rl/pair0_1/seed2/fine4|
+runs_v2|SAVE_STM=1 LR=0.01 EPOCHS=65|stream rl "0 1" 2 5|runs_v2/stream/rl/pair0_1/seed2/fine5|
+runs_v2|SAVE_STM=1|continual rl "0 1" 2 "3 4 5"|runs_v2/continual/rl/pair0_1/seed2/order3_4_5|
+runs_v2|SAVE_STM=1|continual rl "0 1" 2 "4 5 3"|runs_v2/continual/rl/pair0_1/seed2/order4_5_3|
+runs_v2|SAVE_STM=1|continual rl "0 1" 2 "5 3 4"|runs_v2/continual/rl/pair0_1/seed2/order5_3_4|
+runs_v2|SAVE_STM=1|fewshot rl "0 1" 2 3 1|runs_v2/fewshot/rl/pair0_1/seed2/fine3_n1|
+runs_v2|SAVE_STM=1|fewshot rl "0 1" 2 3 4|runs_v2/fewshot/rl/pair0_1/seed2/fine3_n4|
+runs_v2|SAVE_STM=1|fewshot rl "0 1" 2 3 16|runs_v2/fewshot/rl/pair0_1/seed2/fine3_n16|
+runs_v2|SAVE_STM=1|fewshot rl "0 1" 2 3 64|runs_v2/fewshot/rl/pair0_1/seed2/fine3_n64|
+runs_v2|SAVE_STM=1|fewshot rl "0 1" 2 3 400|runs_v2/fewshot/rl/pair0_1/seed2/fine3_n400|
+runs_v2|SAVE_STM=1|fewshot rl "0 1" 2 4 1|runs_v2/fewshot/rl/pair0_1/seed2/fine4_n1|
+runs_v2|SAVE_STM=1|fewshot rl "0 1" 2 4 4|runs_v2/fewshot/rl/pair0_1/seed2/fine4_n4|
+runs_v2|SAVE_STM=1|fewshot rl "0 1" 2 4 16|runs_v2/fewshot/rl/pair0_1/seed2/fine4_n16|
+runs_v2|SAVE_STM=1|fewshot rl "0 1" 2 4 64|runs_v2/fewshot/rl/pair0_1/seed2/fine4_n64|
+runs_v2|SAVE_STM=1|fewshot rl "0 1" 2 4 400|runs_v2/fewshot/rl/pair0_1/seed2/fine4_n400|
+runs_v2|SAVE_STM=1|fewshot rl "0 1" 2 5 1|runs_v2/fewshot/rl/pair0_1/seed2/fine5_n1|
+runs_v2|SAVE_STM=1|fewshot rl "0 1" 2 5 4|runs_v2/fewshot/rl/pair0_1/seed2/fine5_n4|
+runs_v2|SAVE_STM=1|fewshot rl "0 1" 2 5 16|runs_v2/fewshot/rl/pair0_1/seed2/fine5_n16|
+runs_v2|SAVE_STM=1|fewshot rl "0 1" 2 5 64|runs_v2/fewshot/rl/pair0_1/seed2/fine5_n64|
+runs_v2|SAVE_STM=1|fewshot rl "0 1" 2 5 400|runs_v2/fewshot/rl/pair0_1/seed2/fine5_n400|
+runs_v2|SAVE_STM=1|baseline rl "0 1" 2|runs_v2/baseline/rl/pair0_1/seed2|
