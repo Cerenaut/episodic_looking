@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def main():
-    cifar_args = CifarArgs.parse_args()
+    cifar_args = CifarArgs.parse_ltm_args()
 
     SEED = cifar_args.seed
     if SEED is not None:
@@ -29,7 +29,6 @@ def main():
 
     EXPERIMENT_TYPE = cifar_args.experiment_type
     BATCH_SIZE = cifar_args.batch_size
-    #SPARSITY = cifar_args.sparsity
     MAX_INSTANCES = cifar_args.max_instances
     FINE_CLASSES = cifar_args.fine_classes
     COARSE_CLASSES = cifar_args.coarse_classes
