@@ -8,7 +8,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 from environment.cifar.cifar_args import CifarArgs
 from environment.cifar.cifar_classifier import CifarClassifier
-from environment.cifar.cifar_dataset import Cifar100Dataset, CifarDatasetOptions
+from environment.cifar.cifar_dataset import Cifar100Dataset
+from environment.cifar.cifar_experiment import LtmExperimentConfig
 from environment.cifar.cifar_results import CifarResults
 from model.resnet import ResNetConfig
 from util.device import get_device, seed_all
@@ -20,43 +21,40 @@ logger = logging.getLogger(__name__)
 
 def main():
     cifar_args = CifarArgs.parse_ltm_args()
+    experiment = LtmExperimentConfig.from_args(cifar_args)
 
-    SEED = cifar_args.seed
+    SEED = experiment.seed
     if SEED is not None:
         # Model state is loaded from the checkpoint; the randomness is the training loaders' shuffles (seeded below
         # through their own generators) and any other torch / numpy use.
         seed_all(SEED)
 
-    EXPERIMENT_TYPE = cifar_args.experiment_type
-    BATCH_SIZE = cifar_args.batch_size
-    MAX_INSTANCES = cifar_args.max_instances
-    FINE_CLASSES = cifar_args.fine_classes
-    COARSE_CLASSES = cifar_args.coarse_classes
-    LEARNING_RATE = cifar_args.learning_rate
-    VAL_HOLDOUT = cifar_args.val_holdout
-    LOADER_WORKERS = cifar_args.loader_workers
-    EVALUATE_INTERVAL_EPOCHS = cifar_args.evaluate_epochs  # evaluate at epoch % k == 0 and the last epoch of a phase
-    BN_MODE = cifar_args.bn_mode  # train (default, the draft's) | frozen (eval-mode BN, affine parameters fixed)
+    EXPERIMENT_TYPE = experiment.experiment_type
+    BATCH_SIZE = experiment.batch_size
+    MAX_INSTANCES = experiment.max_instances
+    FINE_CLASSES = experiment.fine_classes
+    COARSE_CLASSES = experiment.coarse_classes
+    LEARNING_RATE = experiment.learning_rate
+    VAL_HOLDOUT = experiment.val_holdout
+    LOADER_WORKERS = experiment.loader_workers
+    EVALUATE_INTERVAL_EPOCHS = experiment.evaluate_interval_epochs  # evaluate at epoch % k == 0 and the last epoch of a phase
+    BN_MODE = experiment.bn_mode  # train (default, the draft's) | frozen (eval-mode BN, affine parameters fixed)
 
     logger.info(f"Exp.:{EXPERIMENT_TYPE} Fine classes:{FINE_CLASSES} Batch size:{BATCH_SIZE} max. instances:{MAX_INSTANCES} LR: {LEARNING_RATE} Seed: {SEED} BN mode: {BN_MODE}")
 
-    CIFAR_DATA_FILE_PATH = "../cifar-100-python"
-    CLASSIFIER_FILE_PATH = "../cifar_100_pretrain/cifar_100_subclasses_12_e11_31.1.pth"
-    if cifar_args.ltm_checkpoint is not None:
-        CLASSIFIER_FILE_PATH = cifar_args.ltm_checkpoint
-    NUM_CLASSES = 20
+    CLASSIFIER_FILE_PATH = experiment.ltm_checkpoint
+    NUM_CLASSES = experiment.NUM_CLASSES
 
-    max_instances_description = str(MAX_INSTANCES) if MAX_INSTANCES is not None else "500"
-    EXPERIMENT_NAME = f"{EXPERIMENT_TYPE}_{FINE_CLASSES}_{max_instances_description}"
+    EXPERIMENT_NAME = experiment.experiment_name
     print(f"Experiment name: {EXPERIMENT_NAME}")
 
     run_root_path = f"cifar_100/{EXPERIMENT_NAME}"
     run_path = get_run_path(
         prefix = run_root_path, 
-        path = cifar_args.run_root,  # honour --run-root as the STM and head scripts do (default ./runs)
+        path = experiment.run_root,  # honour --run-root as the STM and head scripts do (default ./runs)
     )
     create_run_path(run_path)
-    data_file_path = CIFAR_DATA_FILE_PATH
+    data_file_path = experiment.CIFAR_DATA_FILE_PATH
 
     results_file = CifarResults(run_path = run_path, suffix=EXPERIMENT_TYPE)
     results_file.clear_file()
@@ -71,28 +69,8 @@ def main():
     MAX_STEPS_TRAINING = 0  # measure in epochs
     MAX_STEPS_EVALUATE = 0  # whole epoch
 
-    if MAX_INSTANCES is None:
-        instances_per_epoch = 500
-    else:
-        instances_per_epoch = MAX_INSTANCES
-
-    # Comparison steps: ( 25 epochs * batch 16 * 2000 steps ) / steps per episode 8
-    # = 16x 50000 / 8 
-    # = 100k exposures
-    # / 16 = 6250 steps
-    target_steps = 6250
-
-    # Epochs = target_steps / instances_per_epoch 
-    # = 12.5 epochs @ batch size 16
-    NUM_EPOCHS = int(target_steps / instances_per_epoch)
-    logger.info(f"Target steps: {target_steps} instances / epoch: {instances_per_epoch} so num. epochs: {NUM_EPOCHS}")
-    if cifar_args.epochs is not None:  # budget set by the protocol (Notes/experiments/plan.md, section 3)
-        NUM_EPOCHS = cifar_args.epochs
-        logger.info(f"Epochs per phase set by --epochs: {NUM_EPOCHS}")
-    EVALUATE_EPOCHS_SET = None  # --evaluate-points: log-spaced evaluation epochs within each phase
-    if cifar_args.evaluate_points is not None:
-        EVALUATE_EPOCHS_SET = CifarResults.evaluation_epochs(NUM_EPOCHS, cifar_args.evaluate_points)
-        logger.info(f"Evaluating at {len(EVALUATE_EPOCHS_SET)} log-spaced epochs of each phase")
+    NUM_EPOCHS = experiment.num_epochs  # int(6250 / instances per epoch) unless --epochs (LtmExperimentConfig)
+    EVALUATE_EPOCHS_SET = experiment.evaluate_epochs_set  # --evaluate-points: log-spaced evaluation epochs within each phase
 
     # Select coarse classes
     exclude_classes_coarse = set()
@@ -109,10 +87,10 @@ def main():
     # Validation split (--val-holdout): the training sets hold out the same images per fine class as the head script,
     # and the held-out images are evaluated alongside the test sets. The epoch count stays nominal (500 instances).
     # With --max-instances and --seed, the subsets are those the head and STM scripts draw for that seed.
-    training_options = CifarDatasetOptions.for_training(MAX_INSTANCES, SEED, VAL_HOLDOUT, cifar_args.split_seed)
-    validation_options = CifarDatasetOptions.for_validation(VAL_HOLDOUT, cifar_args.split_seed)  # None: no split
+    training_options = experiment.training_dataset_options
+    validation_options = experiment.validation_dataset_options  # None: no split
     if validation_options is not None:
-        logger.info(f"Validation split: {VAL_HOLDOUT} images per fine class held out, split seed {cifar_args.split_seed}")
+        logger.info(f"Validation split: {VAL_HOLDOUT} images per fine class held out, split seed {experiment.split_seed}")
     if training_options.subset_seed is not None:
         logger.info(f"Subsets of {MAX_INSTANCES} images per coarse class drawn with seed {SEED}")
 
