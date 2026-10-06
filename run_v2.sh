@@ -36,7 +36,7 @@
 # BN, every existing run. frozen = eval-mode BN with the BN affine parameters fixed (--bn-mode frozen), used for
 # single-stream (minibatch 1). Frozen results live in a separate tree with the same layout, never beside train-mode
 # ones: RUNS defaults to runs_v2_bnfrozen, a frozen launch is refused unless RUNS contains "bnfrozen", and an LTM-only
-# launch into such a tree is refused unless LTM_BN=frozen. Unit paths inside the tree are unchanged, so metrics_v2.py
+# launch into such a tree is refused unless LTM_BN=frozen. An EXTRA containing --bn-mode is refused (it would bypass this guard). Unit paths inside the tree are unchanged, so metrics_v2.py
 # reads either tree as it is.
 # Resumable: a finished unit has <unit>/job.done; the script refuses to run into an unfinished directory that already
 # holds results (move it to an archive first: results are never overwritten).
@@ -88,6 +88,10 @@ if [ "$LTM_BN" = frozen ]; then
 elif [ "$KIND" = ltm ] && [ "$SETTING" != baseline ] && [ "$RUNS_FROZEN" = 1 ]; then
   echo "$RUNS is a frozen-BN tree: set LTM_BN=frozen for LTM-only units there" >&2; exit 2
 fi
+# The BN mode is set by LTM_BN alone: an EXTRA --bn-mode would bypass the tree guard above
+case " ${EXTRA:-} " in
+  *--bn-mode*) echo "EXTRA must not contain --bn-mode: set LTM_BN=train|frozen instead (it picks the tree)" >&2; exit 2 ;;
+esac
 
 # --- the unit of work -------------------------------------------------------------------------
 case "$SETTING" in
