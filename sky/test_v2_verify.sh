@@ -7,7 +7,8 @@
 # without a sentinel (HOLD and pull), held/failed alert, one sky status per pass, lock, setup check), the status script
 # (sky/v2_status.sh), the launcher's refusals (incl. a cluster name live in another round), DRY, regions, capacity-only
 # fallback, e40 mount, LTM sha256s and launch-failure paths (sky/v2_launch.sh), and the dataset and LTM phases of the
-# pod setup with a fake download (sky/v2_pod_setup.sh). Run it after any change to these scripts, before a live
+# pod setup with a fake download (sky/v2_pod_setup.sh), and abandoned pods (sky/mark_abandoned.sh's refusals and the
+# abandoned/ marker in sky/offload_to_walter.sh's eligibility, DRY). Run it after any change to these scripts, before a live
 # round. Every known-good case must pass and every known-bad one must be refused.
 # Usage: bash sky/test_v2_verify.sh <empty scratch dir>     (never a results directory)
 set -u
@@ -752,6 +753,84 @@ r=$(E13= ltm_run);                 expect "setup ltm: no e13 hash passed -> exit
 mv "$SD/ltm/cifar_100_subclasses_12_e40.pth" "$SD/ltm/e40.away"
 r=$(E40=$L40 ltm_run);             expect "setup ltm: e40 asked but not mounted -> exit 1" bash -c "[ $r = 1 ] && grep -q 'no .*e40.pth (file mount' '$SD/state/setup.log'"
 mv "$SD/ltm/e40.away" "$SD/ltm/cifar_100_subclasses_12_e40.pth"
+
+# === abandoned pods: sky/mark_abandoned.sh and sky/offload_to_walter.sh's eligibility (DRY, fake sky and ssh) =========
+# A unit listed by two rounds: the relaunch (verified) and the abandoned pod (reaped, never pulled). The offload must
+# accept the unit only with abandoned/<c> + reaped/<c> + a non-blank reason; the helper must refuse a pulled pod.
+AR=$W/abrepo; AU=runs_v2/continual/rl/pair0_1/seed3/order3_4_5
+mkdir -p "$AR/sky" "$AR/$AU" "$AR/runs_local/rA/actions" "$AR/runs_local/rA/reaped" "$AR/runs_local/rB/actions" \
+  "$AR/runs_local/rB/reaped" "$AR/runs_local/rB/verified"
+cp "$SRC/sky/offload_to_walter.sh" "$SRC/sky/mark_abandoned.sh" "$SRC/sky/v2_lib.sh" "$AR/sky/"
+touch "$AR/$AU/job.done" "$AR/$AU/job.log"; head -c 100 /dev/zero > "$AR/$AU/stm_phase3.pth"
+echo "runs_v2|SAVE_STM=1|continual rl 0 1 3|$AU|" > "$AR/runs_local/rA/actions/abpod.txt"
+cp "$AR/runs_local/rA/actions/abpod.txt" "$AR/runs_local/rB/actions/relaunch.txt"
+echo "2026-10-06 03:00:00 verified and down" > "$AR/runs_local/rB/reaped/relaunch"; date > "$AR/runs_local/rB/verified/relaunch"
+OB=$W/offbin; mkdir -p "$OB"
+cat > "$OB/ssh" <<'EOF'
+#!/bin/bash
+a=("$@"); cmd=${a[$((${#a[@]}-1))]}
+case "$cmd" in *"echo READY"*) echo READY ;; *"echo ABSENT"*) echo ABSENT ;; *) exit 255 ;; esac
+EOF
+chmod +x "$OB/ssh"
+offl() {  # prints the offload's exit code (DRY: nothing sent, written or removed); output in $W/offl_out.txt
+  ( cd "$AR" && PATH="$OB:$PATH" DRY=1 bash sky/offload_to_walter.sh runs_v2 > "$W/offl_out.txt" 2>&1 ); echo $?
+}
+mark() {  # $1 = reason; prints the helper's exit code; output in $W/mark_out.txt
+  ( cd "$AR" && REAP_TEST_BIN="$B" bash sky/mark_abandoned.sh runs_local/rA abpod "$1" > "$W/mark_out.txt" 2>&1 ); echo $?
+}
+ABM=$AR/runs_local/rA/abandoned/abpod
+r=$(offl); expect "offload: abandoned pod not reaped, no marker -> refused (exit 3)" bash -c "[ $r = 3 ] && grep -q 'abpod of round runs_local/rA not reaped' '$W/offl_out.txt'"
+mkdir -p "$AR/runs_local/rA/abandoned"; echo "reason: never ran" > "$ABM"
+r=$(offl); expect "offload: abandoned/ marker WITHOUT reaped/ -> refused" bash -c "[ $r = 3 ] && grep -q 'abpod of round runs_local/rA not reaped' '$W/offl_out.txt' && [ -f '$AR/$AU/stm_phase3.pth' ]"
+rm -rf "$AR/runs_local/rA/abandoned"
+echo "2026-10-06 04:00:00 launch failed; absent from sky status" > "$AR/runs_local/rA/reaped/abpod"
+r=$(offl); expect "offload: reaped/ without verified/, failed_safe/ or abandoned/ -> refused (unchanged)" bash -c "[ $r = 3 ] && grep -q 'reaped without verified/, failed_safe/ or abandoned/' '$W/offl_out.txt'"
+mkdir -p "$AR/runs_local/rA/abandoned"; printf 'reason:   \nmarked: x\n' > "$ABM"
+r=$(offl); expect "offload: abandoned/ marker with a blank reason -> refused" bash -c "[ $r = 3 ] && grep -q 'abandoned/ marker without a non-blank reason' '$W/offl_out.txt'"
+: > "$ABM"
+r=$(offl); expect "offload: empty abandoned/ marker -> refused" bash -c "[ $r = 3 ] && grep -q 'abandoned/ marker without a non-blank reason' '$W/offl_out.txt'"
+rm -rf "$AR/runs_local/rA/abandoned"
+# the helper
+st;            r=$(mark "   "); expect "mark_abandoned: blank reason -> refused, no marker" bash -c "[ $r = 1 ] && grep -q 'reason is empty' '$W/mark_out.txt' && [ ! -e '$ABM' ]"
+st;            r=$(mark "$(printf 'a\nb')"); expect "mark_abandoned: two-line reason -> refused" bash -c "[ $r = 1 ] && grep -q 'reason must be one line' '$W/mark_out.txt' && [ ! -e '$ABM' ]"
+st;            r=$( (cd "$AR" && REAP_TEST_BIN="$B" bash sky/mark_abandoned.sh runs_local/rA 'ab pod' gone > "$W/mark_out.txt" 2>&1); echo $?)
+expect "mark_abandoned: cluster name with a space -> refused" bash -c "[ $r = 1 ] && grep -q 'bad cluster name' '$W/mark_out.txt'"
+st;            r=$( (cd "$AR" && REAP_TEST_BIN="$B" bash sky/mark_abandoned.sh runs_local/rA 'ab*' gone > "$W/mark_out.txt" 2>&1); echo $?)
+expect "mark_abandoned: cluster name with a glob character -> refused" bash -c "[ $r = 1 ] && grep -q 'bad cluster name' '$W/mark_out.txt'"
+st abpod.up;   r=$(mark "gone"); expect "mark_abandoned: cluster still in sky status -> refused" bash -c "[ $r = 1 ] && grep -q 'still in sky status' '$W/mark_out.txt' && [ ! -e '$ABM' ]"
+st skyfail;    r=$(mark "gone"); expect "mark_abandoned: sky status unreadable -> refused" bash -c "[ $r = 1 ] && grep -q 'UNREADABLE' '$W/mark_out.txt' && [ ! -e '$ABM' ]"
+st skygarbage; r=$(mark "gone"); expect "mark_abandoned: sky status unrecognised -> refused" bash -c "[ $r = 1 ] && grep -q 'UNREADABLE' '$W/mark_out.txt' && [ ! -e '$ABM' ]"
+mv "$AR/runs_local/rA/reaped/abpod" "$W/abpod.reaped"
+st;            r=$(mark "gone"); expect "mark_abandoned: no reaped/ -> refused" bash -c "[ $r = 1 ] && grep -q 'not marked reaped' '$W/mark_out.txt' && [ ! -e '$ABM' ]"
+mv "$W/abpod.reaped" "$AR/runs_local/rA/reaped/abpod"
+for pulled in pods/abpod failed_pulled/abpod no_sentinel_pulled/abpod verified/abpod failed_safe/abpod held/abpod failed_verify/abpod; do
+  mkdir -p "$AR/runs_local/rA/$(dirname "$pulled")"; touch "$AR/runs_local/rA/$pulled"
+  st; r=$(mark "gone"); expect "mark_abandoned: pulled pod ($pulled) -> refused" bash -c "[ $r = 1 ] && [ ! -e '$ABM' ]"
+  rm -f "$AR/runs_local/rA/$pulled"
+done
+echo "[2026-10-06 03:00:00] abpod reports JOB_COMPLETE; pulling" > "$AR/runs_local/rA/reap.log"
+st; r=$(mark "gone"); expect "mark_abandoned: reap.log shows a pull from the pod -> refused" bash -c "[ $r = 1 ] && grep -q 'reap.log shows a pull' '$W/mark_out.txt' && [ ! -e '$ABM' ]"
+echo "[2026-10-06 03:00:00] abpodX reports JOB_COMPLETE; pulling" > "$AR/runs_local/rA/reap.log"
+st; r=$(mark "launch failed, never ran; units re-run by relaunch (round rB)")
+expect "mark_abandoned: reaped, absent, nothing pulled (another pod's pull in reap.log) -> marker written with reason and checks" \
+  bash -c "[ $r = 0 ] && grep -qx 'reason: launch failed, never ran; units re-run by relaunch (round rB)' '$ABM' && grep -q '^checks: .*absent from a readable sky status' '$ABM' && grep -q '^reaped: 2026-10-06 04:00:00' '$ABM'"
+st; r=$(mark "again"); expect "mark_abandoned: marker already present -> refused, not overwritten" bash -c "[ $r = 1 ] && grep -q 'launch failed, never ran' '$ABM'"
+r=$(offl); expect "offload: abandoned/ (helper's marker) + reaped/, relaunch verified -> accepted (DRY, exit 0, file kept)" \
+  bash -c "[ $r = 0 ] && grep -q '1 eligible, 0 refused' '$W/offl_out.txt' && grep -q 'DRY: would send' '$W/offl_out.txt' && [ -f '$AR/$AU/stm_phase3.pth' ]"
+cp "$ABM" "$W/abm.keep"
+printf 'reason: x\r\nmarked: y\r\n' > "$ABM"
+r=$(offl); expect "offload: CRLF marker with a reason (reason: x\\r) -> accepted" bash -c "[ $r = 0 ] && grep -q '1 eligible, 0 refused' '$W/offl_out.txt'"
+printf 'reason:\r\nmarked: y\r\n' > "$ABM"
+r=$(offl); expect "offload: CRLF marker whose reason is only \\r -> refused" bash -c "[ $r = 3 ] && grep -q 'abandoned/ marker without a non-blank reason' '$W/offl_out.txt'"
+cp "$W/abm.keep" "$ABM"
+for pulled in pods/abpod held/abpod failed_verify/abpod failed_pulled/abpod no_sentinel_pulled/abpod; do
+  mkdir -p "$AR/runs_local/rA/$(dirname "$pulled")"; touch "$AR/runs_local/rA/$pulled"
+  r=$(offl); expect "offload: abandoned/ marker + reaped/ but $pulled exists -> refused" bash -c "[ $r = 3 ] && grep -q 'abandoned/ marker but records of a pull or hold ($pulled)' '$W/offl_out.txt'"
+  rm -f "$AR/runs_local/rA/$pulled"
+done
+r=$(offl); expect "offload: pull records removed again -> accepted" bash -c "[ $r = 0 ] && grep -q '1 eligible, 0 refused' '$W/offl_out.txt'"
+rm "$AR/runs_local/rB/verified/relaunch"
+r=$(offl); expect "offload: abandoned pod accepted but the relaunch not verified -> still refused" bash -c "[ $r = 3 ] && grep -q 'relaunch of round runs_local/rB reaped without' '$W/offl_out.txt'"
 
 echo "---"; echo "$passes passed, $fails wrong"
 [ "$fails" = 0 ] && { echo "ALL TESTS PASS"; exit 0; } || { echo "$fails TEST(S) WRONG"; exit 1; }

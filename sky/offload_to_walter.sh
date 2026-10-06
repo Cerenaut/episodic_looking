@@ -17,8 +17,12 @@
 #     sky/v2_launch.sh searches) whose pod is not reaped AND verified: <round>/reaped/<cluster> must exist, and
 #     <round>/verified/<cluster> (JOB_COMPLETE, sky/v2_verify.sh passed) or <round>/failed_safe/<cluster> (JOB_FAILED,
 #     --partial verification passed). So the reaper's verification is over before a file goes missing. A pod reaped by
-#     hand (reaped/ without verified/ or failed_safe/) is refused: decide by hand. If the round search fails, nothing
-#     is offloaded.
+#     hand (reaped/ without verified/ or failed_safe/) is refused: decide by hand. The one exception is an ABANDONED
+#     pod (torn down or never started with nothing pulled, its units re-run by a relaunch of the same actions file under
+#     another name): <round>/abandoned/<cluster>, written by sky/mark_abandoned.sh after its checks, is accepted in
+#     place of verified/ or failed_safe/, only together with reaped/<cluster>, and only if it has a "reason:" line
+#     with a non-blank reason, and never while pods/<cluster>, held/<cluster>, failed_verify/<cluster> or any
+#     *_pulled/<cluster> exists in that round (else refused). If the round search fails, nothing is offloaded.
 #
 # Per file (each step must succeed, else the Mac copy is kept, the error reported, and the run STOPS, exit 1):
 #   1. sha256 on the Mac (64 hex digits, else stop);
@@ -110,8 +114,19 @@ unit_status() {
   while IFS='	' read -r rd c; do
     [ -n "$rd" ] || continue
     if [ ! -f "$rd/reaped/$c" ]; then ok=0; why="$why pod $c of round ${rd#"$REPO/"} not reaped;"
-    elif [ ! -e "$rd/verified/$c" ] && [ ! -e "$rd/failed_safe/$c" ]; then
-      ok=0; why="$why pod $c of round ${rd#"$REPO/"} reaped without verified/ or failed_safe/ (by hand?);"
+    elif [ -e "$rd/verified/$c" ] || [ -e "$rd/failed_safe/$c" ]; then :
+    elif [ -e "$rd/abandoned/$c" ]; then
+      # accepted only with reaped/ (checked above) and a non-blank reason (sky/mark_abandoned.sh writes "reason: ...")
+      # and never for a pod that pulled anything (defence in depth against a hand-written or stale marker)
+      pulled=""
+      for x in "$rd/pods/$c" "$rd/held/$c" "$rd/failed_verify/$c" "$rd"/*_pulled/"$c"; do [ -e "$x" ] && pulled="$pulled ${x#"$rd/"}"; done
+      if [ ! -f "$rd/abandoned/$c" ] || ! grep -qE '^reason:.*[^[:space:]]' "$rd/abandoned/$c" 2>/dev/null; then
+        ok=0; why="$why pod $c of round ${rd#"$REPO/"} has an abandoned/ marker without a non-blank reason: line;"
+      elif [ -n "$pulled" ]; then
+        ok=0; why="$why pod $c of round ${rd#"$REPO/"} has an abandoned/ marker but records of a pull or hold ($(echo $pulled)): decide by hand;"
+      fi
+    else
+      ok=0; why="$why pod $c of round ${rd#"$REPO/"} reaped without verified/, failed_safe/ or abandoned/ (by hand? see sky/mark_abandoned.sh);"
     fi
   done <<< "$m"
   [ $ok = 1 ] && echo OK || echo "${why# }"
