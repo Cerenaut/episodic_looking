@@ -31,7 +31,13 @@
 # Overrides (environment): EPOCHS (per phase / per run), PRETRAIN_EPOCHS, LR, PRETRAIN_LR (STM), TRAINING_STEPS (STM), EVAL_EPOCHS
 # (evaluation interval, every model), EVAL_POINTS (log-spaced evaluation, heads and LTM-only), VAL_HOLDOUT, LTM=e13|e40, SAVE_STM=1 (keep STM checkpoints), EXTRA (appended to the script's arguments), PY, DRY=1 (print the
 # command only), PRINT_UNIT=1 (print the unit dir only and exit; sky/v2_launch.sh uses it so that the layout lives in
-# this file alone), RUNS (default runs_v2).
+# this file alone), RUNS (default runs_v2), LTM_BN=train|frozen (LTM-only only, below).
+# LTM_BN (decided 6 Oct 2026): LTM-only batch normalization while training. train (default) = the draft's training-mode
+# BN, every existing run. frozen = eval-mode BN with the BN affine parameters fixed (--bn-mode frozen), used for
+# single-stream (minibatch 1). Frozen results live in a separate tree with the same layout, never beside train-mode
+# ones: RUNS defaults to runs_v2_bnfrozen, a frozen launch is refused unless RUNS contains "bnfrozen", and an LTM-only
+# launch into such a tree is refused unless LTM_BN=frozen. Unit paths inside the tree are unchanged, so metrics_v2.py
+# reads either tree as it is.
 # Resumable: a finished unit has <unit>/job.done; the script refuses to run into an unfinished directory that already
 # holds results (move it to an archive first: results are never overwritten).
 set -u
@@ -57,7 +63,12 @@ esac
 
 VAL_HOLDOUT=${VAL_HOLDOUT:-100}
 SPLIT="--val-holdout $VAL_HOLDOUT --split-seed 0"
-RUNS=${RUNS:-runs_v2}
+LTM_BN=${LTM_BN:-train}
+case "$LTM_BN" in
+  train) RUNS=${RUNS:-runs_v2} ;;
+  frozen) RUNS=${RUNS:-runs_v2_bnfrozen} ;;
+  *) echo "unknown LTM_BN: $LTM_BN (train|frozen)" >&2; exit 2 ;;
+esac
 PAIR="pair$(echo $CC | tr ' ' '_')"
 SEEDDIR=$RUNS/$SETTING$SUFFIX/$MODEL/$PAIR/seed$SEED
 PRETRAIN_DIR=$RUNS/pretrain$SUFFIX/$MODEL/$PAIR/seed$SEED
@@ -69,6 +80,14 @@ case "$MODEL" in
   ltm) KIND=ltm ;;
   *) echo "unknown model: $MODEL" >&2; exit 2 ;;
 esac
+# Keep the two BN modes' results apart (LTM_BN above)
+case "$RUNS" in *bnfrozen*) RUNS_FROZEN=1 ;; *) RUNS_FROZEN=0 ;; esac
+if [ "$LTM_BN" = frozen ]; then
+  [ "$KIND" = ltm ] && [ "$SETTING" != baseline ] || { echo "LTM_BN=frozen applies to LTM-only training units only" >&2; exit 2; }
+  [ "$RUNS_FROZEN" = 1 ] || { echo "LTM_BN=frozen needs a RUNS tree whose path contains 'bnfrozen' (got $RUNS)" >&2; exit 2; }
+elif [ "$KIND" = ltm ] && [ "$SETTING" != baseline ] && [ "$RUNS_FROZEN" = 1 ]; then
+  echo "$RUNS is a frozen-BN tree: set LTM_BN=frozen for LTM-only units there" >&2; exit 2
+fi
 
 # --- the unit of work -------------------------------------------------------------------------
 case "$SETTING" in
@@ -104,6 +123,8 @@ fi
 HEAD_BASE="cifar_main_head_baselines.py --method $MODEL --coarse-classes $CC --seed $SEED $SPLIT --checkpoint $LTM_CKPT --run-path $UNIT_DIR"
 # LTM-only loads in the main process: worker processes are re-spawned every epoch, 7x slower for short epochs, same result
 LTM_BASE="cifar_main_ltm_fine_tuning.py --coarse-classes $CC --seed $SEED $SPLIT --ltm-checkpoint $LTM_CKPT --learning-rate ${LR:-0.001} --loader-workers 0"
+# Frozen BN only when asked, so a train-mode command is exactly the one every earlier run used
+[ "$LTM_BN" = frozen ] && LTM_BASE="$LTM_BASE --bn-mode frozen"
 # STM checkpoints after training (per phase in continual) only with SAVE_STM=1: ~44 MB each.
 save_stm() { [ "${SAVE_STM:-0}" = 1 ] && echo "--stm-checkpoint-out $1"; }
 

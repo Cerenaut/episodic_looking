@@ -210,6 +210,16 @@ class CifarArgs:
                  "off = recompute every pass (the original code path); check = recompute and fail unless identical.",
         )
 
+        parser.add_argument(
+            "--bn-mode",
+            choices=["train", "frozen"],
+            default="train",
+            help="LTM-only fine-tuning: batch normalization during training. train = training mode (batch statistics, "
+                 "running statistics updated, affine parameters trained; the draft's behaviour and the default). "
+                 "frozen = eval mode throughout (running statistics fixed) and the BN affine parameters not trained; "
+                 "all other weights train as before. Used for single-stream (minibatch 1), decided 6 Oct 2026.",
+        )
+
         args = parser.parse_args()
         logger.info("Parse args:")
         logger.info(json.dumps(vars(args), indent=4))

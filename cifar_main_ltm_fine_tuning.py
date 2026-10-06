@@ -37,8 +37,9 @@ def main():
     VAL_HOLDOUT = cifar_args.val_holdout
     LOADER_WORKERS = cifar_args.loader_workers
     EVALUATE_INTERVAL_EPOCHS = cifar_args.evaluate_epochs  # evaluate at epoch % k == 0 and the last epoch of a phase
+    BN_MODE = cifar_args.bn_mode  # train (default, the draft's) | frozen (eval-mode BN, affine parameters fixed)
 
-    logger.info(f"Exp.:{EXPERIMENT_TYPE} Fine classes:{FINE_CLASSES} Batch size:{BATCH_SIZE} max. instances:{MAX_INSTANCES} LR: {LEARNING_RATE} Seed: {SEED}")
+    logger.info(f"Exp.:{EXPERIMENT_TYPE} Fine classes:{FINE_CLASSES} Batch size:{BATCH_SIZE} max. instances:{MAX_INSTANCES} LR: {LEARNING_RATE} Seed: {SEED} BN mode: {BN_MODE}")
 
     CIFAR_DATA_FILE_PATH = "../cifar-100-python"
     CLASSIFIER_FILE_PATH = "../cifar_100_pretrain/cifar_100_subclasses_12_e11_31.1.pth"
@@ -282,7 +283,27 @@ def main():
     state_dict = torch.load(CLASSIFIER_FILE_PATH, weights_only=True)
     model.load_state_dict(state_dict)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    # --bn-mode frozen: every BatchNorm layer stays in eval mode while the rest of the model trains (running statistics
+    # fixed, set_training_mode below) and its affine parameters are not trained (requires_grad off and left out of the
+    # optimizer). train: unchanged, the optimizer gets model.parameters() exactly as before.
+    bn_modules = [m for m in model.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+    if BN_MODE == "frozen":
+        for m in bn_modules:
+            for p in m.parameters(recurse=False):
+                p.requires_grad_(False)
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        logger.info(f"BN frozen: {len(bn_modules)} BatchNorm layers in eval mode, "
+                    f"{sum(p.numel() for m in bn_modules for p in m.parameters(recurse=False))} affine parameters fixed; "
+                    f"{sum(p.numel() for p in trainable)} parameters trained")
+        optimizer = torch.optim.Adam(trainable, lr=LEARNING_RATE)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    def set_training_mode(model):
+        model.train()
+        if BN_MODE == "frozen":
+            for m in bn_modules:
+                m.eval()
     writer = SummaryWriter(log_dir=run_path)
 
     @dataclass
@@ -303,7 +324,7 @@ def main():
         log_period:int = 100,
     ) -> EpochMetrics:
         if training:
-            model.train()
+            set_training_mode(model)  # model.train(), then BN back to eval mode if --bn-mode frozen
         else:
             model.eval()
             
