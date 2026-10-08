@@ -11,8 +11,8 @@
 #                 within the phase; budget on the plateau, runs doubled up to the cap of 32x the draft, 0.03 tie
 #                 tolerance, one grid step if an edge wins by more than 0.03); repeat until it asks for nothing
 # Trees: runs_v2_pilot_sup/sup_lr<x>/continual/sup/pair0_1/seed1/order<a>_<b>_<c>/. A unit that is re-run is first moved
-# to runs_v2_pilot_sup_archive/<round>/ (never deleted or overwritten). Each learning rate runs in a lane of its own
-# (MPS). Validation only: metrics_v2.py --tables --part val (no tables, so no test numbers are printed); test numbers of
+# to runs_v2_pilot_sup_archive/<round>/ (never deleted or overwritten). One unit at a time: on the M3, three parallel
+# units were slower in aggregate than one (runs_local/sup_dev_20261009/timing2/). Validation only: metrics_v2.py --tables --part val (no tables, so no test numbers are printed); test numbers of
 # these runs are not to be read.
 # Relaunching is safe: finished units are skipped, and a round whose files exist is refused (set START_ROUND).
 # Usage: nohup caffeinate -i bash select_sup_continual.sh > runs_v2_pilot_sup/nohup.log 2>&1 &
@@ -71,10 +71,9 @@ run_actions() {  # actions file, round label, lane (the name of one tree)
   done < "$file"
 }
 
-run_round() {  # actions file, round label: each learning rate in a lane of its own
+run_round() {  # actions file, round label: one learning rate after another, one unit at a time
   local t
-  for t in $(cut -d'|' -f1 "$1" | sort -u); do run_actions "$1" "$2" "$(basename "$t")" & done
-  wait
+  for t in $(cut -d'|' -f1 "$1" | sort -u); do run_actions "$1" "$2" "$(basename "$t")"; done
 }
 
 trees() { find "$ROOT" -mindepth 1 -maxdepth 1 -type d -name 'sup_lr*' | sort; }
