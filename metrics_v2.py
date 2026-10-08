@@ -69,12 +69,15 @@ def load_run_pivot(path: str) -> pd.DataFrame | None:
 MODELS = [
     ("rl", "CLS/STM, RL"),
     ("actor", "CLS/STM, diff.\\ actor"),
+    ("sup", "CLS/STM, supervised"),
     ("linear", "Linear probe"),
     ("ncm", "NCM"),
     ("flymodel", "FlyModel"),
     ("sdmlp", "SDMLP"),
     ("ltm", "LTM-only fine-tuning"),
 ]
+# CLS/STM models: STM pre-training and baseline units of their own (sup counts its budget in passes, as the heads)
+STM_MODELS = ("rl", "actor", "sup")
 PAIRS = [("A", "pair0_1"), ("B", "pair2_3"), ("C", "pair5_6"), ("D", "pair15_16")]
 ORDERS = [(3, 4, 5), (4, 5, 3), (5, 3, 4)]
 FEWSHOT_N = [1, 4, 16, 64, 400]
@@ -130,7 +133,7 @@ def baseline_series(runs: str, setting_suffix: str, model: str, pair: str, seed:
                     part: str) -> pd.Series | None:
     """Accuracy on the four sets before the continual phases (R[0, j])."""
     suffix = "_val" if part == "val" else ""
-    if model in ("rl", "actor"):
+    if model in STM_MODELS:
         d = os.path.join(runs, f"baseline{setting_suffix}", model, pair, f"seed{seed}")
         files = glob.glob(os.path.join(glob.escape(d), "**", f"results_evaluate{suffix}.txt"), recursive=True)
     elif model == "ltm":
@@ -219,7 +222,7 @@ def table_starting(runs, part, fmt_kind):
         lines.append(f"% starting points, pair {letter}, part {part}: Model & Fine 1, 2 & Fine 3 & Fine 4 & Fine 5")
         for model, label in MODELS:
             series = []
-            if model in ("rl", "actor"):
+            if model in STM_MODELS:
                 for seed, _ in seeds_of(os.path.join(runs, "baseline", model, pair)):
                     s = baseline_series(runs, "", model, pair, seed, "", part)
                     if s is not None:
