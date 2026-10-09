@@ -5,7 +5,8 @@
 #   runs_v2/<setting>/<model>/pair<a>_<b>/seed<k>/<unit>/
 #
 #   setting  pretrain | baseline | continual | stream | fewshot   (+ "_e40" when LTM=e40)
-#   model    rl | actor | linear | ncm | flymodel | sdmlp | ltm
+#   model    rl | actor | sup | linear | ncm | flymodel | sdmlp | ltm   (sup: CLS/STM trained by supervised learning,
+#            without episodes, cifar_main_stm_supervised.py)
 #   unit     continual: order<a>_<b>_<c>; stream: fine<c>; fewshot: fine<c>_n<N>; pretrain/baseline: none
 #            (LTM-only baseline: runs_v2/baseline/ltm/pair<a>_<b>/, no seed)
 #
@@ -46,7 +47,7 @@ PY=${PY:-/Users/gideon/anaconda3/envs/episodic/bin/python}
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 
 SETTING=${1:?setting: pretrain|baseline|continual|stream|fewshot}
-MODEL=${2:?model: rl|actor|linear|ncm|flymodel|sdmlp|ltm}
+MODEL=${2:?model: rl|actor|sup|linear|ncm|flymodel|sdmlp|ltm}
 CC=${3:?coarse pair, e.g. \"0 1\"}
 SEED=${4:?seed}
 ARG5=${5:-}
@@ -76,6 +77,7 @@ STM_CKPT=$PRETRAIN_DIR/stm_pretrain.pth
 
 case "$MODEL" in
   rl|actor) KIND=stm ;;
+  sup) KIND=sup ;;
   linear|ncm|flymodel|sdmlp) KIND=head ;;
   ltm) KIND=ltm ;;
   *) echo "unknown model: $MODEL" >&2; exit 2 ;;
@@ -96,7 +98,7 @@ esac
 # --- the unit of work -------------------------------------------------------------------------
 case "$SETTING" in
   pretrain)
-    [ "$KIND" = stm ] || { echo "pretrain applies to the STM models only (heads pre-train in their own runs)" >&2; exit 2; }
+    [ "$KIND" = stm ] || [ "$KIND" = sup ] || { echo "pretrain applies to the STM models only (heads pre-train in their own runs)" >&2; exit 2; }
     UNIT_DIR=$SEEDDIR ;;
   baseline)
     # LTM-only: the frozen LTM itself, deterministic, so one per pair (the seed is ignored)
@@ -129,6 +131,10 @@ HEAD_BASE="cifar_main_head_baselines.py --method $MODEL --coarse-classes $CC --s
 LTM_BASE="cifar_main_ltm_fine_tuning.py --coarse-classes $CC --seed $SEED $SPLIT --ltm-checkpoint $LTM_CKPT --learning-rate ${LR:-0.001} --loader-workers 0"
 # Frozen BN only when asked, so a train-mode command is exactly the one every earlier run used
 [ "$LTM_BN" = frozen ] && LTM_BASE="$LTM_BASE --bn-mode frozen"
+# Supervised CLS/STM (sup): epochs are passes over the training images, as the heads' and LTM-only's; the draft has no
+# budget or learning rate for it (selected on validation). Pre-training 12 epochs at PRETRAIN_LR (default 0.01, the
+# differentiable actor's), minibatch 16, every epoch evaluated.
+SUP_BASE="cifar_main_stm_supervised.py --coarse-classes $CC --seed $SEED $SPLIT --ltm-checkpoint $LTM_CKPT --loader-workers 0"
 # STM checkpoints after training (per phase in continual) only with SAVE_STM=1: ~44 MB each.
 save_stm() { [ "${SAVE_STM:-0}" = 1 ] && echo "--stm-checkpoint-out $1"; }
 
@@ -145,6 +151,14 @@ case "$SETTING/$KIND" in
     CMD="$STM_BASE $STM_STREAM_LR --experiment-type few-shot --fine-classes $CLS --batch-size 1 --epochs ${EPOCHS:-192} --training-steps ${TRAINING_STEPS:-4000} --evaluate-epochs ${EVAL_EPOCHS:-16} --stm-checkpoint $STM_CKPT $(save_stm "$UNIT_DIR/stm_final.pth") --run-root $UNIT_DIR" ;;
   fewshot/stm)
     CMD="$STM_BASE $STM_LR --experiment-type few-shot --fine-classes $CLS --max-instances $N --epochs ${EPOCHS:-12} --stm-checkpoint $STM_CKPT $(save_stm "$UNIT_DIR/stm_final.pth") --run-root $UNIT_DIR" ;;
+  pretrain/sup)
+    CMD="$SUP_BASE --learning-rate ${PRETRAIN_LR:-0.01} --experiment-type pretrain --fine-classes 1 2 --epochs ${PRETRAIN_EPOCHS:-12} --stm-checkpoint $STM_CKPT --run-root $UNIT_DIR" ;;
+  baseline/sup)
+    CMD="$SUP_BASE --experiment-type evaluate --fine-classes 3 4 5 --stm-checkpoint $STM_CKPT --run-root $UNIT_DIR" ;;
+  continual/sup)
+    CMD="$SUP_BASE --learning-rate ${LR:-0.01} --experiment-type continual --fine-classes $ORDER --epochs ${EPOCHS:-12} --stm-checkpoint $STM_CKPT $(save_stm "$UNIT_DIR/stm") --run-root $UNIT_DIR" ;;
+  stream/sup|fewshot/sup)
+    echo "$SETTING is not set up for sup yet" >&2; exit 2 ;;
   baseline/ltm)
     CMD="eval_pretrained_baseline.py --checkpoint $LTM_CKPT --coarse-classes $CC $SPLIT --out $UNIT_DIR/results_evaluate.txt" ;;
   continual/head)
@@ -184,7 +198,7 @@ if [ -f "$UNIT_DIR/job.done" ]; then echo "done already: $UNIT_DIR"; exit 0; fi
 if [ -d "$UNIT_DIR" ] && [ -n "$(find "$UNIT_DIR" -name 'results_*.txt' -print -quit)" ]; then
   echo "unfinished results in $UNIT_DIR: move it to an archive before re-running" >&2; exit 3
 fi
-if [ "$KIND" = stm ] && [ "$SETTING" != pretrain ] && [ ! -f "$PRETRAIN_DIR/job.done" ]; then
+if { [ "$KIND" = stm ] || [ "$KIND" = sup ]; } && [ "$SETTING" != pretrain ] && [ ! -f "$PRETRAIN_DIR/job.done" ]; then
   echo "no finished pre-training for this model, pair and seed: run '${SUFFIX:+LTM=$LTM }bash run_v2.sh pretrain $MODEL \"$CC\" $SEED' first ($PRETRAIN_DIR)" >&2
   exit 3
 fi
