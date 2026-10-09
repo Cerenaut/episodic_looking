@@ -32,8 +32,14 @@ case "$TREE" in sup_lr*) ;; *) BUDGET="" ;; esac
 case "$BUDGET" in ''|*[!0-9]*) step "ABORT: no continual choice in $SEL/selection_final.txt: '$CHOICE'"; exit 1 ;; esac
 step "start: code $(git rev-parse --short HEAD)$(git diff --quiet -- '*.py' '*.sh' || echo ' +dirty'); choice $TREE (lr $LR), $BUDGET epochs per phase ($CHOICE)"
 
+FAILED=0
 unit() {  # RUNS-tree, then run_v2.sh arguments; environment from the caller
-  if bash run_v2.sh "${@:2}" >> "$1.log" 2>&1 < /dev/null; then step "done   $1: ${*:2}"; else step "FAILED $1: ${*:2} ($1.log)"; fi
+  if bash run_v2.sh "${@:2}" >> "$1.log" 2>&1 < /dev/null; then step "done   $1: ${*:2}"
+  else step "FAILED $1: ${*:2} ($1.log)"; FAILED=$((FAILED + 1)); fi
+}
+copy_unit() {  # source unit dir, destination unit dir: the contents, never a nested copy (an existing partial dest is refused)
+  if [ -e "$2" ]; then step "FAILED: $2 exists without job.done; fix by hand"; return 1; fi
+  mkdir -p "$2" && cp -R "$1/." "$2/"
 }
 
 # --- 2. confirmation -------------------------------------------------------------------------------------------------
@@ -41,12 +47,17 @@ if [ ! -f "$CONF/check_confirm.txt" ]; then
   T=$CONF/$TREE
   for s in pretrain baseline; do
     if [ ! -e "$T/$s/sup/pair0_1/seed1/job.done" ]; then
-      mkdir -p "$T/$s/sup/pair0_1" && cp -R "$SEL/shared/$s/sup/pair0_1/seed1" "$T/$s/sup/pair0_1/"
+      copy_unit "$SEL/shared/$s/sup/pair0_1/seed1" "$T/$s/sup/pair0_1/seed1" || exit 1
     fi
   done
   for o in "3 4 5" "4 5 3" "5 3 4"; do RUNS=$T EPOCHS=$BUDGET LR=$LR unit "$T" continual sup "0 1" 1 "$o"; done
-  $PY check_confirm_sup.py "$TREE" "$BUDGET" > "$CONF/check_confirm.txt" 2>&1 || step "check_confirm_sup.py failed"
-  step "confirmation: $(tail -1 "$CONF/check_confirm.txt")"
+  # the check file is written only on success, so a relaunch retries a failed confirmation
+  if $PY check_confirm_sup.py "$TREE" "$BUDGET" > "$CONF/check_confirm.tmp" 2>&1; then
+    mv "$CONF/check_confirm.tmp" "$CONF/check_confirm.txt"
+    step "confirmation: $(tail -1 "$CONF/check_confirm.txt")"
+  else
+    step "ABORT: confirmation check failed ($CONF/check_confirm.tmp)"; exit 1
+  fi
 fi
 
 # --- 3. final runs -----------------------------------------------------------------------------------------------------
@@ -60,4 +71,4 @@ for pair in "0 1" "2 3" "5 6" "15 16"; do
   done
   step "pair $pair: all seeds done"
 done
-step "final runs finished"
+step "final runs finished: $FAILED unit(s) FAILED (see FAILED lines above)"
