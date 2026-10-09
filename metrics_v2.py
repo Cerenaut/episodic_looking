@@ -70,6 +70,7 @@ MODELS = [
     ("rl", "CLS/STM, RL"),
     ("actor", "CLS/STM, diff.\\ actor"),
     ("sup", "CLS/STM, supervised"),
+    ("sup2", "CLS/STM, supervised, default init"),
     ("linear", "Linear probe"),
     ("ncm", "NCM"),
     ("flymodel", "FlyModel"),
@@ -77,7 +78,7 @@ MODELS = [
     ("ltm", "LTM-only fine-tuning"),
 ]
 # CLS/STM models: STM pre-training and baseline units of their own (sup counts its budget in passes, as the heads)
-STM_MODELS = ("rl", "actor", "sup")
+STM_MODELS = ("rl", "actor", "sup", "sup2")
 PAIRS = [("A", "pair0_1"), ("B", "pair2_3"), ("C", "pair5_6"), ("D", "pair15_16")]
 ORDERS = [(3, 4, 5), (4, 5, 3), (5, 3, 4)]
 FEWSHOT_N = [1, 4, 16, 64, 400]

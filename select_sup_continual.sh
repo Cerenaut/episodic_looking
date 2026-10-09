@@ -15,12 +15,13 @@
 # units were slower in aggregate than one (runs_local/sup_dev_20261009/timing2/). Validation only: metrics_v2.py --tables --part val (no tables, so no test numbers are printed); test numbers of
 # these runs are not to be read.
 # Relaunching is safe: finished units are skipped, and a round whose files exist is refused (set START_ROUND).
-# Usage: nohup caffeinate -i bash select_sup_continual.sh > runs_v2_pilot_sup/nohup.log 2>&1 &
+# Usage: [MODEL=sup2] nohup caffeinate -i bash select_sup_continual.sh > runs_v2_pilot_<model>/nohup.log 2>&1 &
 set -u
 cd "$(dirname "$0")"
 PY=${PY:-/Users/gideon/anaconda3/envs/episodic/bin/python}
-ROOT=${ROOT:-runs_v2_pilot_sup}
-ARCHIVE=${ARCHIVE:-runs_v2_pilot_sup_archive}
+MODEL=${MODEL:-sup}  # sup (zero-initialised output layer) or sup2 (PyTorch's default initialisation)
+ROOT=${ROOT:-runs_v2_pilot_$MODEL}
+ARCHIVE=${ARCHIVE:-runs_v2_pilot_${MODEL}_archive}
 ROUND1_EPOCHS=${ROUND1_EPOCHS:-96}  # smoke tests only: a tiny budget
 LOG=$ROOT/rounds.log
 MAX_ROUNDS=${MAX_ROUNDS:-8}
@@ -41,8 +42,8 @@ archive() {  # unit dir, round label -> moves it under $ARCHIVE/<round>/, never 
 prepare_tree() {  # tree: give it the shared STM pre-training and baseline (needed by run_v2.sh), once
   local tree=$1 s
   for s in pretrain baseline; do
-    if [ ! -e "$tree/$s/sup/pair0_1/seed1/job.done" ]; then
-      mkdir -p "$tree/$s/sup/pair0_1" && cp -R "$SHARED/$s/sup/pair0_1/seed1" "$tree/$s/sup/pair0_1/" \
+    if [ ! -e "$tree/$s/$MODEL/pair0_1/seed1/job.done" ]; then
+      mkdir -p "$tree/$s/$MODEL/pair0_1" && cp -R "$SHARED/$s/$MODEL/pair0_1/seed1" "$tree/$s/$MODEL/pair0_1/" \
         && step "copied the shared $s into $tree"
     fi
   done
@@ -80,12 +81,12 @@ run_round() {  # actions file, round label: one learning rate after another, one
   if [ "$n" != 0 ]; then step "ABORT: $n unit(s) FAILED in $2; fix the cause, then relaunch (round 1 skips finished units and archives the failed ones; from a later round, set START_ROUND to it after moving its files aside)"; exit 1; fi
 }
 
-trees() { find "$ROOT" -mindepth 1 -maxdepth 1 -type d -name 'sup_lr*' | sort; }
+trees() { find "$ROOT" -mindepth 1 -maxdepth 1 -type d -name "${MODEL}_lr*" | sort; }
 
 # --- STM pre-training and baseline, once ---------------------------------------------------------------------------
 for s in pretrain baseline; do
-  RUNS=$SHARED bash run_v2.sh $s sup "0 1" 1 >> "$SHARED.log" 2>&1 < /dev/null
-  [ -f "$SHARED/$s/sup/pair0_1/seed1/job.done" ] || { step "ABORT: shared $s failed ($SHARED.log)"; exit 1; }
+  RUNS=$SHARED bash run_v2.sh $s $MODEL "0 1" 1 >> "$SHARED.log" 2>&1 < /dev/null
+  [ -f "$SHARED/$s/$MODEL/pair0_1/seed1/job.done" ] || { step "ABORT: shared $s failed ($SHARED.log)"; exit 1; }
   step "shared $s done"
 done
 
@@ -94,7 +95,7 @@ A=$ROOT/actions_round1.txt
 if [ ! -e "$A" ]; then
   for lr in 0.003 0.01 0.03; do
     for o in "3 4 5" "4 5 3" "5 3 4"; do
-      echo "$ROOT/sup_lr$lr|EPOCHS=$ROUND1_EPOCHS LR=$lr|continual sup \"0 1\" 1 \"$o\"|$ROOT/sup_lr$lr/continual/sup/pair0_1/seed1/order${o// /_}|" >> "$A"
+      echo "$ROOT/${MODEL}_lr$lr|EPOCHS=$ROUND1_EPOCHS LR=$lr|continual $MODEL \"0 1\" 1 \"$o\"|$ROOT/${MODEL}_lr$lr/continual/$MODEL/pair0_1/seed1/order${o// /_}|" >> "$A"
     done
   done
 fi

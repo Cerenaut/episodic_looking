@@ -12,7 +12,10 @@ episode, critic, policy sampling or reward. Per image (or minibatch):
   3. perceive  the frozen LTM with gate 2*sigmoid(b), with gradient to b
   4. learn     cross-entropy on those logits; one optimizer step per minibatch (SGD, momentum 0.5, as the RL STM)
 
-The STM's output layer starts at zero, so before training the gate is exactly 1 and the model is exactly the LTM.
+--sup-init zero (default): the STM's output layer starts at zero, so before training the gate is exactly 1 and the model
+is exactly the LTM. But the hidden layers get gradient only through that layer's weights, which then stay tiny: STM
+pre-training learns little but the layer's constant term, a gate that is the same for every image and seed (diagnostic
+of 9 Oct 2026, runs_local/sup_diag_20261009/). --sup-init default: PyTorch's initialisation, as the RL actor's.
 Step 1 depends only on the image (the LTM is frozen, in eval mode, and there is no augmentation), so it is computed
 once per dataset, at batch 256, and stored beside the images.
 
@@ -24,8 +27,10 @@ types and checkpoints follow the STM script, so run_v2.sh and metrics_v2.py trea
   evaluate   the four test sets (and validation sets) before the continual phases (baseline unit)
   continual  --fine-classes in order, from --stm-checkpoint; --stm-checkpoint-out (a directory) saves after each phase
 """
+import argparse
 import logging
 import os
+import sys
 from dataclasses import dataclass
 
 import torch
@@ -61,7 +66,7 @@ EVALUATE_BATCH_SIZE = 256  # evaluation only (no training effect: the LTM is in 
 class SupervisedSTM(nn.Module):
     """The RL STM's actor network (CifarModel.create_model, sparse branch), reading [e0, z0], emitting the bias."""
 
-    def __init__(self, sparsity: int, hidden_size: int = 1000, layers: int = 3):
+    def __init__(self, sparsity: int, hidden_size: int = 1000, layers: int = 3, zero_init: bool = True):
         super().__init__()
         input_size = ENCODING_SIZE + NUM_CLASSES
         model_config = SparseActivationDenseModelConfig(
@@ -88,10 +93,11 @@ class SupervisedSTM(nn.Module):
             ensemble_size = 1,
             sparsity = sparsity,
         )
-        output_layer = self.model.get_model(0).layers[-1]
-        with torch.no_grad():  # gate exactly 1 before training: the untrained model is the LTM
-            output_layer.weight.zero_()
-            output_layer.bias.zero_()
+        if zero_init:
+            output_layer = self.model.get_model(0).layers[-1]
+            with torch.no_grad():  # gate exactly 1 before training: the untrained model is the LTM
+                output_layer.weight.zero_()
+                output_layer.bias.zero_()
 
     def get_trainable_parameters(self) -> list:
         return self.model.get_trainable_parameters()
@@ -103,6 +109,12 @@ class SupervisedSTM(nn.Module):
 
 
 def main():
+    # This script's own option, taken out before the shared CifarArgs parse
+    own = argparse.ArgumentParser(add_help=False)
+    own.add_argument("--sup-init", choices=["zero", "default"], default="zero",
+                     help="STM output layer at start: zero (untrained model = the LTM) or PyTorch's default (as the RL actor)")
+    own_args, rest = own.parse_known_args()
+    sys.argv = sys.argv[:1] + rest
     cifar_args = CifarArgs.parse_args()
 
     SEED = cifar_args.seed
@@ -234,7 +246,8 @@ def main():
     logger.info(f"Training set sizes: {[(k, len(l.dataset)) for k, l in loaders_training.items()]}; validation set "
                 f"sizes: {[(k, len(l.dataset)) for k, l in loaders_validation.items()]}")
 
-    stm = SupervisedSTM(sparsity = cifar_args.sparsity).to(device)
+    logger.info(f"STM output layer initialisation: {own_args.sup_init}")
+    stm = SupervisedSTM(sparsity = cifar_args.sparsity, zero_init = own_args.sup_init == "zero").to(device)
     if not PRETRAIN:
         logger.info(f"Loading STM from {STM_CHECKPOINT}")
         stm.load_state_dict(torch.load(STM_CHECKPOINT, map_location = "cpu", weights_only = True))

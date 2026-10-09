@@ -5,8 +5,9 @@
 #   runs_v2/<setting>/<model>/pair<a>_<b>/seed<k>/<unit>/
 #
 #   setting  pretrain | baseline | continual | stream | fewshot   (+ "_e40" when LTM=e40)
-#   model    rl | actor | sup | linear | ncm | flymodel | sdmlp | ltm   (sup: CLS/STM trained by supervised learning,
-#            without episodes, cifar_main_stm_supervised.py)
+#   model    rl | actor | sup | sup2 | linear | ncm | flymodel | sdmlp | ltm   (sup: CLS/STM trained by supervised
+#            learning, without episodes, cifar_main_stm_supervised.py, output layer zero-initialised; sup2: the same
+#            with PyTorch's default initialisation, as the RL actor)
 #   unit     continual: order<a>_<b>_<c>; stream: fine<c>; fewshot: fine<c>_n<N>; pretrain/baseline: none
 #            (LTM-only baseline: runs_v2/baseline/ltm/pair<a>_<b>/, no seed)
 #
@@ -47,7 +48,7 @@ PY=${PY:-/Users/gideon/anaconda3/envs/episodic/bin/python}
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 
 SETTING=${1:?setting: pretrain|baseline|continual|stream|fewshot}
-MODEL=${2:?model: rl|actor|sup|linear|ncm|flymodel|sdmlp|ltm}
+MODEL=${2:?model: rl|actor|sup|sup2|linear|ncm|flymodel|sdmlp|ltm}
 CC=${3:?coarse pair, e.g. \"0 1\"}
 SEED=${4:?seed}
 ARG5=${5:-}
@@ -77,7 +78,7 @@ STM_CKPT=$PRETRAIN_DIR/stm_pretrain.pth
 
 case "$MODEL" in
   rl|actor) KIND=stm ;;
-  sup) KIND=sup ;;
+  sup|sup2) KIND=sup ;;
   linear|ncm|flymodel|sdmlp) KIND=head ;;
   ltm) KIND=ltm ;;
   *) echo "unknown model: $MODEL" >&2; exit 2 ;;
@@ -135,6 +136,7 @@ LTM_BASE="cifar_main_ltm_fine_tuning.py --coarse-classes $CC --seed $SEED $SPLIT
 # budget or learning rate for it (selected on validation). Pre-training 12 epochs at PRETRAIN_LR (default 0.01, the
 # differentiable actor's), minibatch 16, every epoch evaluated.
 SUP_BASE="cifar_main_stm_supervised.py --coarse-classes $CC --seed $SEED $SPLIT --ltm-checkpoint $LTM_CKPT --loader-workers 0"
+[ "$MODEL" = sup2 ] && SUP_BASE="$SUP_BASE --sup-init default"
 # STM checkpoints after training (per phase in continual) only with SAVE_STM=1: ~44 MB each.
 save_stm() { [ "${SAVE_STM:-0}" = 1 ] && echo "--stm-checkpoint-out $1"; }
 
