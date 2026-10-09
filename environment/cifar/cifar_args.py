@@ -9,6 +9,10 @@ class CifarArgs:
     Command-line arguments of the STM (cifar_main_stm_training.py) and LTM-only (cifar_main_ltm_fine_tuning.py)
     scripts. Each script declares only the flags it honours: the flags both use (add_common_args) plus its own
     (add_stm_args, add_ltm_args), with the same names and defaults in both.
+
+    parse_args is the general parser: every flag of both kinds, as the single parser before this split had them, for
+    scripts that need flags of both kinds (e.g. cifar_main_stm_supervised.py: the STM checkpoints, --sparsity and
+    experiment types with the LTM-only data loading and evaluation flags).
     """
 
     EXPERIMENT_TYPE_PRETRAIN = "pretrain"
@@ -16,6 +20,27 @@ class CifarArgs:
     EXPERIMENT_TYPE_CONTINUAL = "continual"
     EXPERIMENT_TYPE_STREAMING = "streaming"
     EXPERIMENT_TYPE_EVALUATE = "evaluate"  # load the STM checkpoint and evaluate the four test sets once (no training)
+
+    @staticmethod
+    def parse_args(argv:list[str]|None = None) -> argparse.Namespace:
+        """
+        General parser: the union of the common, STM and LTM-only flags, with the names, defaults and choices of the
+        single parser that preceded parse_stm_args / parse_ltm_args (backward compatible: CifarArgs.parse_args() parses
+        the same command lines into the same values). For scripts that use flags of both kinds; a script that uses
+        only one kind should call parse_stm_args or parse_ltm_args, which refuse the other kind's flags.
+        The only flag both kinds define, --epochs, has the same type and default (None) in both; here it is declared
+        once, with the help of the single parser.
+        """
+        parser = argparse.ArgumentParser()
+        CifarArgs.add_common_args(parser.add_argument_group("common (STM and LTM-only)"))
+        CifarArgs._add_epochs_arg(
+            parser,
+            help="STM: epochs (per phase in continual), default 12. LTM-only: epochs per phase, default "
+                 "int(6250 / instances per epoch) (12 at 500 instances), which it previously always used.",
+        )
+        CifarArgs.add_stm_args(parser.add_argument_group("STM (cifar_main_stm_training.py)"), epochs=False)
+        CifarArgs.add_ltm_args(parser.add_argument_group("LTM-only (cifar_main_ltm_fine_tuning.py)"), epochs=False)
+        return CifarArgs._parse(parser, argv)
 
     @staticmethod
     def parse_stm_args(argv:list[str]|None = None) -> argparse.Namespace:
@@ -130,14 +155,21 @@ class CifarArgs:
         )
 
     @staticmethod
-    def add_stm_args(parser:argparse.ArgumentParser):
-        """Flags of the STM script only."""
+    def _add_epochs_arg(parser:argparse.ArgumentParser, help:str):
+        """--epochs: the same type and default (None, the script's own budget) for both kinds; the help differs."""
         parser.add_argument(
             "--epochs",
             type=int,
             default=None,
-            help="Epochs (per phase in continual) of --training-steps steps each. Default None = 12.",
+            help=help,
         )
+
+    @staticmethod
+    def add_stm_args(parser:argparse.ArgumentParser, epochs:bool = True):
+        """Flags of the STM script only (epochs=False leaves out --epochs, for a parser that declares it itself)."""
+        if epochs:
+            CifarArgs._add_epochs_arg(
+                parser, help="Epochs (per phase in continual) of --training-steps steps each. Default None = 12.")
 
         parser.add_argument(
             "--sparsity",
@@ -227,15 +259,12 @@ class CifarArgs:
         )
 
     @staticmethod
-    def add_ltm_args(parser:argparse.ArgumentParser):
-        """Flags of the LTM-only script only."""
-        parser.add_argument(
-            "--epochs",
-            type=int,
-            default=None,
-            help="Epochs per phase. Default None = int(6250 / instances per epoch) (12 at 500 instances), which it "
-                 "previously always used.",
-        )
+    def add_ltm_args(parser:argparse.ArgumentParser, epochs:bool = True):
+        """Flags of the LTM-only script only (epochs=False leaves out --epochs, for a parser that declares it itself)."""
+        if epochs:
+            CifarArgs._add_epochs_arg(
+                parser, help="Epochs per phase. Default None = int(6250 / instances per epoch) (12 at 500 instances), "
+                             "which it previously always used.")
         parser.add_argument(
             "--evaluate-points",
             type=int,
