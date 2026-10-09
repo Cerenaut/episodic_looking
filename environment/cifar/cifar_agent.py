@@ -22,11 +22,19 @@ class CifarAgentConfig(EpisodicAgentConfig):
     image_shape: list[int] = field(default_factory=list) 
     learning_rate:float = 0.1
     momentum:float = 0.0
+    # Reuse a step's obs_2 LTM pass as the next step's obs_1 tensor while no episode ended (same image, same bias,
+    # frozen LTM in eval mode, so the same output). off = always recompute (the original behaviour); on = reuse;
+    # check = recompute and raise unless the reused tensor is bitwise equal.
+    ltm_obs_cache:str = "off"
 
 class CifarAgent(EpisodicAgent):
     """
     Agent for the Cifar-100 dataset.
     """
+
+    LTM_OBS_CACHE_OFF = "off"
+    LTM_OBS_CACHE_ON = "on"
+    LTM_OBS_CACHE_CHECK = "check"
 
     def __init__(
         self, 
@@ -45,9 +53,15 @@ class CifarAgent(EpisodicAgent):
 
         self.create_optimizers()
 
-        self.reward_previous_default = self.model.get_class_reward_default(self.config.batch_size)
         self.previous_policy_data = None
         self.current_policy_data = None
+        self.sweep_correct = None  # image index -> 1/0 during an evaluation sweep, else None
+        self.bias_with_grad = None  # differentiable actor, training: the bias with its graph, until the next classifier pass
+        self.classifier_logits_with_grad = None
+
+        self.obs_1_tensor_cache = None  # see CifarAgentConfig.ltm_obs_cache
+        self.obs_1_tensor_cache_hits = 0
+        self.obs_1_tensor_cache_misses = 0
 
     def create_optimizers(self):
         optimizer_config = self.create_optimizer_config(
@@ -93,7 +107,7 @@ class CifarAgent(EpisodicAgent):
             )
             if self.instrumentation.is_mode_training():
                 self.bias_with_grad = self.output_actor.mean
-        elif self.model_config.eval_bias == "mean" and not self.instrumentation.is_mode_training():
+        elif self.model_config.eval_bias == CifarModel.EVAL_BIAS_MEAN and not self.instrumentation.is_mode_training():
             self.set_bias(
                 self.output_actor.mean.detach().clone()
             )
@@ -174,7 +188,7 @@ class CifarAgent(EpisodicAgent):
         No critic, no policy sampling. Rewards are still computed above for logging only.
         """
         optimize = self.instrumentation.is_mode_training()
-        batch_size = self.config.batch_size
+        batch_size = self.batch_size
         self.advantage = torch.zeros(batch_size, device=self.device)  # logging only
         self.advantage_normalized = self.advantage
         self.previous_policy_data = None
@@ -194,6 +208,9 @@ class CifarAgent(EpisodicAgent):
 
     def reset(self):
         super().reset()
+        # New images and zero bias in every environment: never reuse across a reset (mode switches, evaluation sweeps,
+        # dataset changes and continual phases all reset the agent before stepping).
+        self.clear_obs_1_tensor_cache()
         self.previous_policy_data = None
         self.current_policy_data = None
         self.bias_with_grad = None
@@ -204,6 +221,8 @@ class CifarAgent(EpisodicAgent):
         #self.reset_intra_episode_metrics()
 
     def state_update(self, reset_mask:torch.Tensor):
+        obs_2_tensor = self.state.obs_2_tensor
+        obs_2_image = self.state.obs_2_final[CifarEnv.OBSERVATION_KEY_IMAGE]  # the image that pass classified
         super().state_update(reset_mask)
 
         # Clear any old state on episode reset
@@ -213,6 +232,52 @@ class CifarAgent(EpisodicAgent):
         self.update_reward_previous(self.model.get_reward_current())
         self.reset_reward_previous(reset_mask)  # reset obs_2 for complete episodes 
         self.reset_bias(reset_mask)
+        self.update_obs_1_tensor_cache(obs_2_tensor, obs_2_image, reset_mask)
+
+    def clear_obs_1_tensor_cache(self):
+        if self.obs_1_tensor_cache_hits + self.obs_1_tensor_cache_misses > 0:
+            logger.info(f"LTM obs. cache ({self.config.ltm_obs_cache}): {self.obs_1_tensor_cache_hits} obs_1 passes reused, "
+                        f"{self.obs_1_tensor_cache_misses} computed")
+        self.obs_1_tensor_cache = None
+        self.obs_1_tensor_cache_hits = 0
+        self.obs_1_tensor_cache_misses = 0
+
+    def update_obs_1_tensor_cache(self, obs_2_tensor:torch.Tensor, obs_2_image:np.ndarray, reset_mask):
+        """
+        After state_update: keep this step's obs_2 pass for the next step's obs_1 if no episode ended. Then every
+        environment's obs_1 is its obs_2 (obs_2_final differs only for ended episodes) and the bias is unchanged
+        (reset_bias zeroes ended episodes only). Any ended episode: recompute the whole batch, so the reused rows
+        never come from a forward pass at another batch composition. The logits need no copy: they are part of the
+        tensor, and classifier_logits is next read after the obs_2 pass, which sets it.
+        """
+        self.obs_1_tensor_cache = None
+        if self.config.ltm_obs_cache == CifarAgent.LTM_OBS_CACHE_OFF:
+            return
+        if bool(np.any(np.asarray(reset_mask))):
+            return
+        self.obs_1_tensor_cache = (obs_2_tensor, obs_2_image, self.bias)
+
+    def observation_1_to_tensor(self) -> torch.Tensor:
+        cache = self.obs_1_tensor_cache
+        self.obs_1_tensor_cache = None  # single use
+        if cache is not None:
+            tensor, image, bias = cache
+            # Reuse only for the same bias object (set_bias() and reset() replace it; the masked reset_bias() runs only
+            # when an episode ended, which is never cached) and the same images. check mode verifies the rest.
+            if bias is not self.get_bias() or not np.array_equal(self.state.obs_1[CifarEnv.OBSERVATION_KEY_IMAGE], image):
+                cache = None
+        if cache is None:
+            if self.config.ltm_obs_cache != CifarAgent.LTM_OBS_CACHE_OFF:
+                self.obs_1_tensor_cache_misses += 1
+            return super().observation_1_to_tensor()
+
+        self.obs_1_tensor_cache_hits += 1
+        if self.config.ltm_obs_cache == CifarAgent.LTM_OBS_CACHE_CHECK:
+            obs_1_tensor = super().observation_1_to_tensor()
+            if not torch.equal(obs_1_tensor, tensor):
+                raise RuntimeError("LTM obs. cache: the reused obs_2 pass differs from a fresh obs_1 pass")
+            return obs_1_tensor
+        return tensor
 
     def reset_bias(self, reset_mask:torch.Tensor|None = None):
         if reset_mask is None:
@@ -220,7 +285,7 @@ class CifarAgent(EpisodicAgent):
             bias_size = self.model.get_bias_size()
             self.bias = torch.zeros(
                 (
-                    self.config.batch_size,
+                    self.batch_size,
                     bias_size,
                 ),
                 device = self.device,
@@ -236,6 +301,7 @@ class CifarAgent(EpisodicAgent):
 
     def reset_reward_previous(self, reset_mask:torch.Tensor|None = None):
         if reset_mask is None:
+            self.reward_previous_default = self.model.get_class_reward_default(self.batch_size)  # the mode's batch size
             self.reward_previous = self.reward_previous_default.clone()
         else:
             self.reward_previous[reset_mask] = self.reward_previous_default[reset_mask]
@@ -257,7 +323,7 @@ class CifarAgent(EpisodicAgent):
         bias_detached = self.get_bias().detach()  # current bias
         image_tensor = torch.from_numpy(image_array).to(self.device)
 
-        bias_with_grad = getattr(self, "bias_with_grad", None)
+        bias_with_grad = self.bias_with_grad
         if bias_with_grad is not None:
             # Differentiable actor, training: this is the first classifier pass after model_actions(),
             # i.e. on the observation that results from the bias just emitted. Keep the graph.
@@ -298,11 +364,11 @@ class CifarAgent(EpisodicAgent):
         target_indices = self.class_distribution_targets
         max_predicted_indices = torch.argmax(self.class_distribution_predicted, dim=1)
         is_correct = (max_predicted_indices == target_indices).long()
-        batch_indices = torch.arange(self.config.batch_size)
+        batch_indices = torch.arange(self.batch_size)
         predicted_target_probabilities = self.class_distribution_predicted[batch_indices, target_indices]
 
-        log_writer.add_scalar("freq_max_correct", tensor_to_float_with_norm(is_correct, self.config.batch_size))
-        log_writer.add_scalar("p_target_class", tensor_to_float_with_norm(predicted_target_probabilities, self.config.batch_size))
+        log_writer.add_scalar("freq_max_correct", tensor_to_float_with_norm(is_correct, self.batch_size))
+        log_writer.add_scalar("p_target_class", tensor_to_float_with_norm(predicted_target_probabilities, self.batch_size))
 
         mask_terminated = self.state.terminated != 0
         mask_truncated = self.state.truncated != 0
@@ -315,12 +381,15 @@ class CifarAgent(EpisodicAgent):
             log_writer.add_scalar("freq_max_correct_end", tensor_to_float_with_norm(is_correct_end_episode, num_end_episode_samples))
             log_writer.add_scalar("p_target_class_end", tensor_to_float_with_norm(prediction_end_episode, num_end_episode_samples))
 
-            self.cumulative_correct += is_correct_end_episode.sum()
-            self.cumulative_samples += num_end_episode_samples
+            if self.sweep_correct is not None:
+                self.record_sweep(is_correct, end_episode_mask)
+            else:
+                self.cumulative_correct += is_correct_end_episode.sum()
+                self.cumulative_samples += num_end_episode_samples
 
-        log_writer.add_scalar("reward", tensor_to_float_with_norm(self.state.rewards, self.config.batch_size))  # sum / batch_size
-        log_writer.add_scalar("advantage-normalized", tensor_to_float_with_norm(self.advantage_normalized, self.config.batch_size))
-        log_writer.add_scalar("bias-sum", tensor_to_float_with_norm(self.bias.sum(dim=1), self.config.batch_size))
+        log_writer.add_scalar("reward", tensor_to_float_with_norm(self.state.rewards, self.batch_size))  # sum / batch_size
+        log_writer.add_scalar("advantage-normalized", tensor_to_float_with_norm(self.advantage_normalized, self.batch_size))
+        log_writer.add_scalar("bias-sum", tensor_to_float_with_norm(self.bias.sum(dim=1), self.batch_size))
         log_writer.add_scalar("loss-actor", loss_to_float_with_norm(self.model.loss_actor_scaled, 1))
         log_writer.add_scalar("loss-critic", loss_to_float_with_norm(self.model.loss_critic_scaled, 1))
 
@@ -334,11 +403,11 @@ class CifarAgent(EpisodicAgent):
     def update_intra_episode_metrics(self):
         target_indices = self.class_distribution_targets
         max_predicted_indices = torch.argmax(self.class_distribution_predicted, dim=1)
-        freq_correct = (max_predicted_indices == target_indices).long().sum().item() / self.config.batch_size
-        bias_sum = self.bias.abs().sum().item() / self.config.batch_size
+        freq_correct = (max_predicted_indices == target_indices).long().sum().item() / self.batch_size
+        bias_sum = self.bias.abs().sum().item() / self.batch_size
         mean_reward = self.state.rewards.mean()
         log_probs = F.log_softmax(self.class_distribution_predicted_logits, dim=1)
-        entropy = -(self.class_distribution_predicted * log_probs).sum().item() / self.config.batch_size
+        entropy = -(self.class_distribution_predicted * log_probs).sum().item() / self.batch_size
         metrics = f"{self.episode_step},{freq_correct},{bias_sum},{mean_reward},{entropy}\n"
         self.results.append_file(text=metrics)
 
@@ -347,6 +416,28 @@ class CifarAgent(EpisodicAgent):
         self.episode_step += 1
         if self.state.completed[0]:  # all sync
             self.episode_step = 0
+
+    def start_sweep(self):
+        """Score each image once, by index, from the final info of its episode; padding episodes are skipped."""
+        self.sweep_correct = {}
+
+    def stop_sweep(self) -> dict:
+        sweep_correct = self.sweep_correct
+        self.sweep_correct = None
+        return sweep_correct
+
+    def record_sweep(self, is_correct:torch.Tensor, end_episode_mask:torch.Tensor):
+        final_info = self.state.info_2["final_info"]
+        for b in torch.nonzero(end_episode_mask).flatten().tolist():
+            if final_info["padding"][b]:
+                continue
+            image_index = int(final_info["image"]["index"][b])
+            if image_index in self.sweep_correct:
+                raise RuntimeError(f"Evaluation sweep scored image {image_index} twice")
+            correct = int(is_correct[b].item())
+            self.sweep_correct[image_index] = correct
+            self.cumulative_correct += correct
+            self.cumulative_samples += 1
 
     def reset_cumulative_accuracy(self):
         self.cumulative_correct = 0

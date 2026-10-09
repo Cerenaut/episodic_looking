@@ -50,20 +50,30 @@ def parse_args():
     p.add_argument("--out", type=str, default="runs_local/baselines/ltm_pretrained_baseline.txt",
                    help="CifarResults-format output file (its directory is created).")
     p.add_argument("--threads", type=int, default=2, help="torch CPU threads (kept small to stay out of the way).")
+    p.add_argument("--val-holdout", type=int, default=0,
+                   help="Also evaluate the validation split (the held-out training images, as --val-holdout in the "
+                        "training scripts) and write it next to --out as <out stem>_val.txt. 0 = test sets only.")
+    p.add_argument("--split-seed", type=int, default=0, help="Seed of the validation split.")
     return p.parse_args()
 
 
-def build_test_dataset(data_path: str, coarse_classes: list[int], group: list[int]) -> Cifar100Dataset:
-    """Same construction as dataset_evaluate_* in cifar_main_ltm_fine_tuning.py (all test instances)."""
+def build_test_dataset(data_path: str, coarse_classes: list[int], group: list[int],
+                       validation: dict | None = None) -> Cifar100Dataset:
+    """
+    Same construction as dataset_evaluate_* in cifar_main_ltm_fine_tuning.py (all test instances), or, with
+    validation={"val_holdout": ..., "split_seed": ...}, its validation sets (the held-out training images).
+    """
     exclude_fine = Cifar100Dataset.get_fine_classes([g for g in ALL_GROUPS if g not in group])
     exclude_coarse = Cifar100Dataset.get_coarse_classes_excluded(coarse_classes)
+    split = {} if validation is None else {**validation, "split_part": "validation"}
     return Cifar100Dataset(
         file_path=data_path,
         label_type=Cifar100Dataset.LABEL_TYPE_COARSE,
-        training=False,
+        training=validation is not None,
         exclude_classes_coarse=exclude_coarse,
         exclude_classes_fine=exclude_fine,
         as_tensor=True,
+        **split,
     )
 
 
@@ -104,23 +114,29 @@ def main():
 
     out_dir = os.path.dirname(os.path.abspath(args.out))
     os.makedirs(out_dir, exist_ok=True)
-    lines = []
-    for name in EVALUATE_NAMES:
-        ds = build_test_dataset(args.data_path, args.coarse_classes, GROUPS[name])
-        loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
-        acc = evaluate(model, loader, device)
-        release_shared_memory(ds)
-        logger.info(f"test set {name}: {len(ds)} instances, accuracy {acc:.4f}")
-        lines.append(CifarResults.get_line(
-            coarse_classes=args.coarse_classes,
-            fine_classes=[name],
-            mode=Instrumentation.MODE_EVALUATE,
-            epoch=0,
-            accuracy=acc,
-        ))
-    with open(args.out, "w") as f:
-        f.writelines(lines)
-    logger.info(f"Wrote {args.out}")
+    outputs = [(args.out, None, "test set")]
+    if args.val_holdout > 0:
+        stem, ext = os.path.splitext(args.out)
+        outputs.append((f"{stem}_val{ext}", {"val_holdout": args.val_holdout, "split_seed": args.split_seed},
+                        "validation set"))
+    for out, validation, kind in outputs:
+        lines = []
+        for name in EVALUATE_NAMES:
+            ds = build_test_dataset(args.data_path, args.coarse_classes, GROUPS[name], validation)
+            loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+            acc = evaluate(model, loader, device)
+            release_shared_memory(ds)
+            logger.info(f"{kind} {name}: {len(ds)} instances, accuracy {acc:.4f}")
+            lines.append(CifarResults.get_line(
+                coarse_classes=args.coarse_classes,
+                fine_classes=[name],
+                mode=Instrumentation.MODE_EVALUATE,
+                epoch=0,
+                accuracy=acc,
+            ))
+        with open(out, "w") as f:
+            f.writelines(lines)
+        logger.info(f"Wrote {out}")
 
 
 if __name__ == "__main__":

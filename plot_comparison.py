@@ -200,14 +200,16 @@ def load_baseline(method: str, results_path: str, baselines_dir: str) -> tuple[p
     Accuracy on each test set BEFORE the continual phase (R[0, j]). Returns (series indexed by fine name, source
     description). The series is None when no baseline file exists (the caller then falls back to the epoch-1
     evaluation, BASELINE_PROXY).
-      heads: last evaluate rows of results_pretrain.txt in the run directory.
+      heads: last evaluate rows of results_pretrain.txt in the run directory (results_pretrain_val.txt for the
+             validation files results_<type>_val.txt written with --val-holdout).
       ltm:   <baselines_dir>/ltm_pretrained_baseline.txt (eval_pretrained_baseline.py).
       stm:   <baselines_dir>/stm_pretrained_baseline.txt if present.
     """
     if method in ("ltm", "stm"):
         path = os.path.join(baselines_dir, f"{method}_pretrained_baseline.txt")
     else:
-        path = os.path.join(os.path.dirname(results_path), "results_pretrain.txt")
+        suffix = "_val" if os.path.basename(results_path).endswith("_val.txt") else ""
+        path = os.path.join(os.path.dirname(results_path), f"results_pretrain{suffix}.txt")
     if not os.path.exists(path):
         return None, BASELINE_PROXY
     piv = load_pivot(path)
@@ -307,7 +309,7 @@ CL_METRIC_DEFINITIONS = (
     "Continual-learning metrics (Lopez-Paz & Ranzato 2017 / Chaudhry et al. 2018, adapted). Phases t = 1..T (T = 3) "
     "in the run's fine-class order; test sets j = 0..T where j = 0 is fine-classes 1,2 (pre-trained on) and j = t is "
     "the fine class trained in phase t. R[t, j] = accuracy on test set j after the LAST epoch of phase t (epochs 12, "
-    "24, 36); R[0, j] = accuracy BEFORE the continual phase (heads: last evaluate rows of results_pretrain.txt; LTM: "
+    "24, 36); R[0, j] = accuracy BEFORE the continual phase (heads: last evaluate rows of results_pretrain.txt, or results_pretrain_val.txt for validation files; LTM: "
     "eval_pretrained_baseline.py output; STM: stm_pretrained_baseline.txt or, failing that, its epoch-1 evaluation as a "
     "proxy, footnoted). "
     "ACC = mean_{j=0..T} R[T, j] (= final_mean). "

@@ -21,10 +21,34 @@ class CifarEnvConfig:
     shared_memory_names_training:CifarSharedMemoryNames|None = None
     shared_memory_names_evaluate:CifarSharedMemoryNames|None = None
     exclude_classes_coarse:set[int]|None = field(default_factory=None)
+    exclude_classes_coarse_training:set[int]|None = None  # None: same as exclude_classes_coarse (evaluation)
     exclude_classes_fine_training:set[int]|None = field(default_factory=None)
     exclude_classes_fine_evaluate:set[int]|None = field(default_factory=None)
     max_instances_training:int|None = None
     max_instances_evaluate:int|None = None
+    # Extra Cifar100Dataset options per mode (validation split, seeded subset; "training" to read the training file in
+    # evaluate mode, for the validation set). They must match those of the dataset that created the shared memory.
+    dataset_options_training:dict|None = None
+    dataset_options_evaluate:dict|None = None
+
+
+class EvaluationSweep:
+    """
+    One pass over every image of the evaluation dataset, shared by all environments of a synchronous vector env:
+    each environment takes the next image at every reset. Once all are taken, resets are padding episodes (image 0,
+    flagged in the info) that the agent does not score.
+    """
+
+    def __init__(self, num_images:int):
+        self.num_images = num_images
+        self.next_index = 0
+
+    def take(self) -> int|None:
+        if self.next_index >= self.num_images:
+            return None
+        index = self.next_index
+        self.next_index += 1
+        return index
 
 
 class CifarEnv(gym.Env):
@@ -57,6 +81,8 @@ class CifarEnv(gym.Env):
         self.image_index = None  # Set on reset()
         self.state_dict = None  # Set on reset()
         self.obs_cache = None
+        self.image_sweep = None  # EvaluationSweep, or None for random images
+        self.padding = False  # this episode is sweep padding, not to be scored
 
         observation_space_dict = {}
         self._add_observation_spaces(observation_space_dict)
@@ -83,6 +109,7 @@ class CifarEnv(gym.Env):
             shared_memory_names:CifarSharedMemoryNames,
             exclude_classes_fine:set[int],
             max_instances:int|None,
+            dataset_options:dict|None = None,
     ):
         envs.call(
             "set_dataset_config",
@@ -90,7 +117,17 @@ class CifarEnv(gym.Env):
             shared_memory_names=shared_memory_names,
             exclude_classes_fine=exclude_classes_fine,
             max_instances=max_instances,
+            dataset_options=dataset_options,
         )
+
+    @staticmethod
+    def set_image_sweep_for_envs(envs, image_sweep:EvaluationSweep|None):
+        if not isinstance(envs, gym.vector.SyncVectorEnv):
+            raise ValueError("An image sweep is shared by the environments, so they must be synchronous")
+        envs.call("set_image_sweep", image_sweep=image_sweep)
+
+    def set_image_sweep(self, image_sweep:EvaluationSweep|None):
+        self.image_sweep = image_sweep
 
     def set_dataset_config(
         self,
@@ -98,6 +135,7 @@ class CifarEnv(gym.Env):
         shared_memory_names:CifarSharedMemoryNames,
         exclude_classes_fine:set[int],
         max_instances:int|None,
+        dataset_options:dict|None = None,
     ):
         """
         Allows all the dataset filtering options we want to vary during training to be varied in combination.
@@ -107,11 +145,13 @@ class CifarEnv(gym.Env):
             self.config.shared_memory_names_evaluate = shared_memory_names
             self.config.exclude_classes_fine_evaluate = exclude_classes_fine
             self.config.max_instances_evaluate = max_instances
+            self.config.dataset_options_evaluate = dataset_options
 
         elif mode == Instrumentation.MODE_TRAINING:
             self.config.shared_memory_names_training = shared_memory_names
             self.config.exclude_classes_fine_training = exclude_classes_fine
             self.config.max_instances_training = max_instances
+            self.config.dataset_options_training = dataset_options
 
         else:
             raise ValueError(f"Mode: {mode} not recognized.")
@@ -125,20 +165,27 @@ class CifarEnv(gym.Env):
         shared_memory_names = self.config.shared_memory_names_training
         exclude_classes_fine = self.config.exclude_classes_fine_training
         max_instances = self.config.max_instances_training
+        dataset_options = self.config.dataset_options_training
+        exclude_classes_coarse = self.config.exclude_classes_coarse_training
+        if exclude_classes_coarse is None:
+            exclude_classes_coarse = self.config.exclude_classes_coarse
         
         if self.mode == Instrumentation.MODE_EVALUATE:
             shared_memory_names = self.config.shared_memory_names_evaluate
             exclude_classes_fine = self.config.exclude_classes_fine_evaluate
             max_instances = self.config.max_instances_evaluate
+            dataset_options = self.config.dataset_options_evaluate
+            exclude_classes_coarse = self.config.exclude_classes_coarse
 
         #logger.info(f"create_dataset(): shared mem.: {shared_memory_name} max. instances: {max_instances}")
         self.dataset = CifarEnv.create_dataset(
             data_file_path = self.config.data_file_path,
             mode = self.mode,
             shared_memory_names = shared_memory_names,
-            exclude_classes_coarse = self.config.exclude_classes_coarse,
+            exclude_classes_coarse = exclude_classes_coarse,
             exclude_classes_fine = exclude_classes_fine,
             max_instances = max_instances,
+            dataset_options = dataset_options,
         )
 
     @staticmethod
@@ -157,12 +204,15 @@ class CifarEnv(gym.Env):
         exclude_classes_fine:set[int]|None,
         max_instances:int|None,
         as_tensor:bool = False,
+        dataset_options:dict|None = None,
     ) -> Cifar100Dataset:
         # Read data file
         #logger.info(f"Loading data file: '{data_file_path}' mode:{mode} (shared mem:{shared_memory_names})...")
+        dataset_options = dict(dataset_options or {})
         is_training = False
         if mode == Instrumentation.MODE_TRAINING:
             is_training = True
+        is_training = dataset_options.pop("training", is_training)  # the validation set is read from the training file
         dataset = Cifar100Dataset(
             file_path = data_file_path,
             label_type = Cifar100Dataset.LABEL_TYPE_COARSE,
@@ -172,6 +222,7 @@ class CifarEnv(gym.Env):
             max_instances = max_instances,
             shared_memory_names = shared_memory_names,
             as_tensor = as_tensor,  # keep as numpy
+            **dataset_options,
         )
         return dataset
 
@@ -201,7 +252,13 @@ class CifarEnv(gym.Env):
         self.image_index = image_index
 
     def set_random_image(self):
-        # Pick an image randomly. 
+        # Pick an image randomly, or the sweep's next image.
+        if self.image_sweep is not None:
+            index = self.image_sweep.take()
+            self.padding = index is None
+            self.image_index = 0 if index is None else index
+            return
+        self.padding = False
         num_images = self.get_num_images()
         self.image_index = np.random.randint(0, num_images)
     
@@ -253,6 +310,7 @@ class CifarEnv(gym.Env):
                 "index": self.image_index,
                 "class": state_dict["class"],
             },
+            "padding": self.padding,
         }
 
     def _get_obs(self) -> dict:

@@ -25,13 +25,31 @@ class CifarArgs:
         parser.add_argument(
             "--epochs",
             type=int,
-            default=12,
+            default=None,
+            help="STM: epochs (per phase in continual), default 12. LTM-only: epochs per phase, default "
+                 "int(6250 / instances per epoch) (12 at 500 instances), which it previously always used.",
         )
 
         parser.add_argument(
             "--evaluate-epochs",
             type=int,
             default=1,
+            help="Evaluate at every epoch whose index is a multiple of this, and at the last epoch (few-shot STM; every "
+                 "phase for LTM-only). 1 = every epoch. STM pre-training skips the last-epoch rule, as before.",
+        )
+        parser.add_argument(
+            "--evaluate-points",
+            type=int,
+            default=None,
+            help="LTM-only: evaluate at about this many log-spaced epochs of each phase, first and last included "
+                 "(CifarResults.evaluation_epochs), instead of --evaluate-epochs. Default None.",
+        )
+        parser.add_argument(
+            "--loader-workers",
+            type=int,
+            default=2,
+            help="LTM-only: DataLoader worker processes. Workers are re-spawned every epoch (macOS), which dominates "
+                 "short epochs; 0 loads in the main process. The data order comes from the samplers, not the workers.",
         )
 
         parser.add_argument(
@@ -91,7 +109,7 @@ class CifarArgs:
             "--ltm-checkpoint",
             type=str,
             default=None,
-            help="Frozen LTM checkpoint (default: the script's built-in path).",
+            help="Frozen LTM checkpoint (STM), or the LTM to fine-tune (LTM-only) (default: the script's built-in path).",
         )
         parser.add_argument(
             "--stm-checkpoint",
@@ -104,8 +122,16 @@ class CifarArgs:
             "--stm-checkpoint-out",
             type=str,
             default=None,
-            help="continual only: prefix for STM checkpoints saved after each phase "
-                 "(<prefix>_phase<fine class>.pth), for post-hoc analysis (analyze_stm_inspectability.py).",
+            help="STM checkpoints after training, for post-hoc analysis (analyze_stm_inspectability.py). continual: a "
+                 "prefix, one checkpoint per phase (<prefix>_phase<fine class>.pth); few-shot: the checkpoint's path.",
+        )
+        parser.add_argument(
+            "--pretrain-coarse-classes",
+            type=int,
+            nargs="+",
+            default=None,
+            help="pretrain only: coarse classes whose fine classes 1,2 the STM is pre-trained on (e.g. 0..19 = all), "
+                 "while evaluation stays on --coarse-classes. Default None = --coarse-classes.",
         )
         parser.add_argument(
             "--seed",
@@ -139,6 +165,59 @@ class CifarArgs:
             type=int,
             default=4000,
             help="agent.step() calls per reported epoch (4000 = 8,000 image exposures at batch 16, 8-step episodes).",
+        )
+
+        parser.add_argument(
+            "--val-holdout",
+            type=int,
+            default=0,
+            help="Validation split: hold out this many training images per fine class (Cifar100Dataset."
+                 "get_validation_mask, the same images as the head script's --val-holdout), train on the rest, and "
+                 "evaluate the held-out images alongside the test sets, into results_<type>_val.txt. 0 = no split.",
+        )
+        parser.add_argument(
+            "--split-seed",
+            type=int,
+            default=0,
+            help="Seed of the validation split (not the run seed).",
+        )
+        parser.add_argument(
+            "--eval-batch-size",
+            type=int,
+            default=None,
+            help="STM: parallel environments in evaluation, independent of --batch-size (separate environments). "
+                 "Default None = --batch-size, sharing the training environments as before.",
+        )
+        parser.add_argument(
+            "--eval-sweep",
+            action="store_true",
+            help="STM: evaluate with one deterministic pass over every image of each test and validation set (one "
+                 "8-step episode per image), instead of --evaluate-steps steps on images drawn with replacement.",
+        )
+        parser.add_argument(
+            "--eval-record-images",
+            action="store_true",
+            help="STM, with --eval-sweep: also write each image's result (1/0, in dataset order) per evaluation to "
+                 "results_<type>_images.txt.",
+        )
+
+        parser.add_argument(
+            "--ltm-obs-cache",
+            choices=["on", "off", "check"],
+            default="on",
+            help="STM: reuse each step's second LTM pass as the next step's first while no episode ended (same image "
+                 "and bias, frozen LTM), saving 7 of 16 LTM passes per episode; results are bitwise identical. "
+                 "off = recompute every pass (the original code path); check = recompute and fail unless identical.",
+        )
+
+        parser.add_argument(
+            "--bn-mode",
+            choices=["train", "frozen"],
+            default="train",
+            help="LTM-only fine-tuning: batch normalization during training. train = training mode (batch statistics, "
+                 "running statistics updated, affine parameters trained; the draft's behaviour and the default). "
+                 "frozen = eval mode throughout (running statistics fixed) and the BN affine parameters not trained; "
+                 "all other weights train as before. Used for single-stream (minibatch 1), decided 6 Oct 2026.",
         )
 
         args = parser.parse_args()

@@ -1,0 +1,5 @@
+runs_v2|SAVE_STM=1|pretrain rl "15 16" 3|runs_v2/pretrain/rl/pair15_16/seed3|
+runs_v2|SAVE_STM=1|baseline rl "15 16" 3|runs_v2/baseline/rl/pair15_16/seed3|
+runs_v2|SAVE_STM=1|continual rl "15 16" 3 "3 4 5"|runs_v2/continual/rl/pair15_16/seed3/order3_4_5|
+runs_v2|SAVE_STM=1|continual rl "15 16" 3 "4 5 3"|runs_v2/continual/rl/pair15_16/seed3/order4_5_3|
+runs_v2|SAVE_STM=1|continual rl "15 16" 3 "5 3 4"|runs_v2/continual/rl/pair15_16/seed3/order5_3_4|

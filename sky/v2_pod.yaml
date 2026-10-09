@@ -1,0 +1,48 @@
+# One pod job of the v2 CLS/STM runs (sky/v2_pod_job.sh). Launch with sky/v2_launch.sh, which writes a per-cluster copy
+# of this file (<round>/yaml/<cluster>.yaml: region preference, e40 mount when needed), passes JOB, ROUND, COMMIT,
+# UNIT_TIMEOUT, the actions file (ACTIONS_B64) and the Mac's CIFAR-100 and LTM checkpoint sha256s, applies autostop separately (-i/--down
+# are ignored with -d), and logs. Reap with sky/v2_reap.sh; status with sky/v2_status.sh.
+name: v2-pod
+resources:
+  # sky/v2_launch.sh replaces this infra line with an any_of list of regions (REGIONS; header of sky/v2_launch.sh).
+  infra: runpod
+  # Wide list: the cheap cards have thin capacity (running_experiments_kb.md section 10). Ordered roughly by price.
+  accelerators: {RTXA4000: 1, RTXA5000: 1, L4: 1, A40: 1, RTX3090: 1, L40S: 1, RTX4090: 1}
+  cpus: 4+
+  memory: 16+
+  disk_size: 60
+workdir: ~/Dev/episodic_looking
+file_mounts:
+  # The repo lands at ~/sky_workdir, so ../ is ~ (do not symlink the repo: section 12). CIFAR-100 is NOT mounted: the
+  # setup fetches it on the pod and checks it against the Mac's copy (sky/v2_pod_setup.sh).
+  ~/cifar_100_pretrain/cifar_100_subclasses_12_e13.pth: ~/Dev/cifar_100_pretrain/cifar_100_subclasses_12_e13.pth
+  # The e40 LTM (45 MB) only for a pod with an LTM=e40 unit: sky/v2_launch.sh uncomments the next line then.
+  #E40 ~/cifar_100_pretrain/cifar_100_subclasses_12_e40.pth: ~/Dev/cifar_100_pretrain/cifar_100_subclasses_12_e40.pth
+envs:
+  JOB: ""
+  ROUND: ""
+  COMMIT: ""
+  ACTIONS_B64: ""
+  NPROC: "3"
+  # Per-unit cap (timeout(1) syntax). Empty here on purpose: the pod job refuses to start without it, and the launcher
+  # refuses to launch without it (suggested values: sky/v2_launch.sh header).
+  UNIT_TIMEOUT: ""
+  # sha256 of the Mac's ~/Dev/datasets/cifar-100-python/{train,test,meta}, computed and passed by sky/v2_launch.sh;
+  # empty here on purpose: the setup refuses to run without them.
+  CIFAR_SHA256_TRAIN: ""
+  CIFAR_SHA256_TEST: ""
+  CIFAR_SHA256_META: ""
+  # sha256 of the Mac's LTM checkpoints (e13 always; e40 only for a pod with LTM=e40 units), passed by sky/v2_launch.sh;
+  # the setup refuses to run without the e13 one and fails on any mismatch.
+  LTM_SHA256_E13: ""
+  LTM_SHA256_E40: ""
+setup: |
+  set -e
+  df -h /dev/shm | tail -1
+  nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+  cd ~/sky_workdir
+  bash sky/v2_pod_setup.sh all
+run: |
+  cd ~/sky_workdir
+  export PY=.venv/bin/python
+  bash sky/v2_pod_job.sh

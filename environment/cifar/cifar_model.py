@@ -59,7 +59,7 @@ class CifarModelConfig:
     # Variant: how the actor (bias policy) is trained. See CifarModel.ACTOR_TRAINING_*.
     actor_training:str = "rl"
     loss_differentiable_scale:float = 1.0
-    eval_bias:str = "sample"  # RL actor at evaluation: "sample" (paper) or "mean"
+    eval_bias:str = "sample"  # RL actor at evaluation, see CifarModel.EVAL_BIAS_*
     
 
 class CifarModel:
@@ -88,6 +88,10 @@ class CifarModel:
     # Actor training
     ACTOR_TRAINING_RL = "rl"                        # paper: actor-critic on the classification reward
     ACTOR_TRAINING_DIFFERENTIABLE = "differentiable"  # cross-entropy back-propagated through the frozen LTM
+
+    # Bias of the RL actor at evaluation (the differentiable actor always uses the mean)
+    EVAL_BIAS_SAMPLE = "sample"  # paper: drawn from the policy
+    EVAL_BIAS_MEAN = "mean"      # deterministic policy mean
 
     def __init__(self, config:CifarModelConfig, device):
         super().__init__()

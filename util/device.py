@@ -1,5 +1,7 @@
 import os
+import random
 
+import numpy as np
 import torch
 
 
@@ -35,3 +37,16 @@ def set_default_device(device):
     Note: from_numpy() will still always be CPU and so should be followed with .to(device)
     """
     torch.set_default_device(device)
+
+
+def seed_all(seed:int):
+    """
+    Seed python's random, numpy's global generator and torch on every available device (CPU, MPS, CUDA).
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)

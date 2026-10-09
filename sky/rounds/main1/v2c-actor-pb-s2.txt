@@ -1,0 +1,5 @@
+runs_v2|SAVE_STM=1|pretrain actor "2 3" 2|runs_v2/pretrain/actor/pair2_3/seed2|
+runs_v2|SAVE_STM=1|baseline actor "2 3" 2|runs_v2/baseline/actor/pair2_3/seed2|
+runs_v2|SAVE_STM=1|continual actor "2 3" 2 "3 4 5"|runs_v2/continual/actor/pair2_3/seed2/order3_4_5|
+runs_v2|SAVE_STM=1|continual actor "2 3" 2 "4 5 3"|runs_v2/continual/actor/pair2_3/seed2/order4_5_3|
+runs_v2|SAVE_STM=1|continual actor "2 3" 2 "5 3 4"|runs_v2/continual/actor/pair2_3/seed2/order5_3_4|
