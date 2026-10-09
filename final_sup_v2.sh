@@ -6,7 +6,7 @@
 #   2. confirmation (decision 6): the choice re-run at its budget, pair A, seed 1, 3 orders, validation split, into
 #      runs_v2_pilot_sup_confirm/<tree>/ (the selection's STM pre-training copied in); check_confirm_sup.py writes the
 #      criterion (validation files only). The final runs go ahead either way, as the heads' did; a failure is reported.
-#   3. final runs into runs_v2/: pairs A, B, C, D x seeds 1-5: STM pre-training (12 epochs, lr 0.01), baseline, orders
+#   3. final runs into runs_v2/: pairs A, B, C, D x SEEDS (default 1-5; seeds 1-3 from 9 Oct, Gideon): STM pre-training (12 epochs, lr 0.01), baseline, orders
 #      345/453/534 at the selected learning rate and budget, SAVE_STM=1. One unit at a time (MPS).
 # Resumable: run_v2.sh skips finished units; the confirmation is skipped once its check file exists.
 # Usage: nohup caffeinate -i bash final_sup_v2.sh > runs_v2/final_sup.out 2>&1 &
@@ -14,6 +14,7 @@ set -u
 cd "$(dirname "$0")"
 PY=${PY:-/Users/gideon/anaconda3/envs/episodic/bin/python}
 SEL=runs_v2_pilot_sup
+SEEDS=${SEEDS:-1 2 3 4 5}
 CONF=runs_v2_pilot_sup_confirm
 LOG=runs_v2/final_sup.log
 mkdir -p runs_v2 "$CONF"
@@ -62,7 +63,7 @@ fi
 
 # --- 3. final runs -----------------------------------------------------------------------------------------------------
 for pair in "0 1" "2 3" "5 6" "15 16"; do
-  for seed in 1 2 3 4 5; do
+  for seed in $SEEDS; do
     unit runs_v2/final_sup_units pretrain sup "$pair" "$seed"
     unit runs_v2/final_sup_units baseline sup "$pair" "$seed"
     for o in "3 4 5" "4 5 3" "5 3 4"; do
