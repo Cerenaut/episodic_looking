@@ -72,8 +72,12 @@ run_actions() {  # actions file, round label, lane (the name of one tree)
 }
 
 run_round() {  # actions file, round label: one learning rate after another, one unit at a time
-  local t
+  local t n
   for t in $(cut -d'|' -f1 "$1" | sort -u); do run_actions "$1" "$2" "$(basename "$t")"; done
+  # A failed unit is never asked for again (the rule sees its tree as incomplete), so the other learning rates would be
+  # extended for nothing and the selection would end undecided: stop here instead, for a person to look.
+  n=$(grep -c "FAILED $2 " "$LOG")
+  if [ "$n" != 0 ]; then step "ABORT: $n unit(s) FAILED in $2; fix the cause, then relaunch (round 1 skips finished units and archives the failed ones; from a later round, set START_ROUND to it after moving its files aside)"; exit 1; fi
 }
 
 trees() { find "$ROOT" -mindepth 1 -maxdepth 1 -type d -name 'sup_lr*' | sort; }

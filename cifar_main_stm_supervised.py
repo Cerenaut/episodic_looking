@@ -22,7 +22,7 @@ types and checkpoints follow the STM script, so run_v2.sh and metrics_v2.py trea
 
   pretrain   fine 1,2; saves --stm-checkpoint (created from --seed)
   evaluate   the four test sets (and validation sets) before the continual phases (baseline unit)
-  continual  --fine-classes in order, from --stm-checkpoint; --stm-checkpoint-out saves after each phase
+  continual  --fine-classes in order, from --stm-checkpoint; --stm-checkpoint-out (a directory) saves after each phase
 """
 import logging
 import os
@@ -172,7 +172,7 @@ def main():
 
     # Frozen LTM: eval mode (BN statistics fixed), no parameter gradients; gradients reach the bias through it
     ltm = CifarClassifier(ResNetConfig(num_classes = NUM_CLASSES), bias_stage = BIAS_STAGE).to(device)
-    ltm.load_state_dict(torch.load(CLASSIFIER_FILE_PATH, weights_only = True))
+    ltm.load_state_dict(torch.load(CLASSIFIER_FILE_PATH, map_location = "cpu", weights_only = True))  # any saving device
     ltm.eval()
     for p in ltm.parameters():
         p.requires_grad_(False)
@@ -237,7 +237,7 @@ def main():
     stm = SupervisedSTM(sparsity = cifar_args.sparsity).to(device)
     if not PRETRAIN:
         logger.info(f"Loading STM from {STM_CHECKPOINT}")
-        stm.load_state_dict(torch.load(STM_CHECKPOINT, weights_only = True))
+        stm.load_state_dict(torch.load(STM_CHECKPOINT, map_location = "cpu", weights_only = True))
     optimizer = torch.optim.SGD(stm.get_trainable_parameters(), lr = LEARNING_RATE, momentum = MOMENTUM)
     logger.info(f"STM trainable parameters: {sum(p.numel() for p in stm.get_trainable_parameters())}")
 
@@ -318,8 +318,7 @@ def main():
             if evaluate_now:
                 evaluate(epoch, step)
         if not PRETRAIN and cifar_args.stm_checkpoint_out is not None:
-            out = cifar_args.stm_checkpoint_out
-            save(os.path.join(out, f"stm_after_fine{key}.pth") if len(phases) > 1 else out)
+            save(os.path.join(cifar_args.stm_checkpoint_out, f"stm_after_fine{key}.pth"))  # a directory, one file per phase
     if PRETRAIN:
         save(STM_CHECKPOINT)
 
