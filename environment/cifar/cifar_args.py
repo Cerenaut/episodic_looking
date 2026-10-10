@@ -220,6 +220,71 @@ class CifarArgs:
                  "all other weights train as before. Used for single-stream (minibatch 1), decided 6 Oct 2026.",
         )
 
+        # STM input conditioning (paper repo plan.md section 9); the defaults are the original model
+        parser.add_argument(
+            "--input-conditioning",
+            choices=["none", "centre", "centre-scale", "layernorm"],
+            default="none",
+            help="STM: conditioning of each step's observation [encoding, bias, logits]. centre = subtract a per-feature "
+                 "running mean; centre-scale = centre, then scale each part to unit expected norm; layernorm = per "
+                 "sample, per part, no statistics. Statistics are estimated in training (burn-in), then frozen and saved "
+                 "with the STM.",
+        )
+        parser.add_argument(
+            "--input-conditioning-target",
+            choices=["mask", "both"],
+            default="mask",
+            help="STM: condition only the sparse mask's key, or the model input as well.",
+        )
+        parser.add_argument(
+            "--mask-key",
+            choices=["history", "current", "first"],
+            default="history",
+            help="STM: what the sparse mask is computed from: the whole observation history (original), the current "
+                 "step's observation, or the episode's first observation (before any bias is applied).",
+        )
+        parser.add_argument(
+            "--mask-key-bias-weight",
+            type=float,
+            default=1.0,
+            help="STM: weight of the bias part of the mask key (0 removes the applied bias from the address).",
+        )
+        parser.add_argument(
+            "--mask-key-logit-weight",
+            type=float,
+            default=1.0,
+            help="STM: weight of the logits part of the mask key (0 = the sparse mask ignores the logits; the key keeps its size).",
+        )
+        parser.add_argument(
+            "--stm-encoding",
+            type=str,
+            default="bias-stage",
+            choices=["bias-stage", "stage4"],
+            help="STM: LTM encoding in the observation (model input and mask key). bias-stage = gated stage, pooled (original); stage4 = final-stage pooled features (512).",
+        )
+        parser.add_argument(
+            "--stm-no-layer-norm-affine",
+            action="store_true",
+            help="STM: input LayerNorm without the learned scale and shift (actor and critic).",
+        )
+        parser.add_argument(
+            "--stm-no-output-bias",
+            action="store_true",
+            help="STM: no bias in the output layer (actor and critic).",
+        )
+        parser.add_argument(
+            "--input-stats-burnin-samples",
+            type=int,
+            default=8000,
+            help="STM: observations over which the conditioning statistics are averaged before they are frozen.",
+        )
+        parser.add_argument(
+            "--input-stats-ema",
+            type=float,
+            default=None,
+            help="STM: keep tracking the conditioning statistics after the burn-in with this EMA rate (default: frozen).",
+        )
+
         args = parser.parse_args()
         logger.info("Parse args:")
         logger.info(json.dumps(vars(args), indent=4))

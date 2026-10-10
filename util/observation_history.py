@@ -22,6 +22,10 @@ class ObservationHistory:
 
     - new obs have shape [B, O]
     - reset_mask has shape [B] type bool
+
+    Also keeps each row's first observation since its last reset (first, [B, O]): the history drops it once
+    more than history_size observations have arrived, e.g. at the final transition of an episode exactly
+    history_size steps long (the CIFAR setting: 8 and 8).
     """
 
     def __init__(self, config, device=None, dtype=torch.float32):
@@ -37,7 +41,17 @@ class ObservationHistory:
         history_copy = deepcopy(self)
         self.history = temp
         history_copy.history = temp.detach().clone()  # use torch.clone() for tensor
+        history_copy.first = self.first.detach().clone()
+        history_copy.has_first = self.has_first.clone()
         return history_copy
+
+    def is_empty(self) -> torch.Tensor:
+        """[B] bool: rows with no observation since their last reset."""
+        return ~self.has_first
+
+    def get_first(self) -> torch.Tensor:
+        """[B, O] first observation since each row's last reset (zeros if none)."""
+        return self.first
 
     @torch.no_grad()
     def reset(self, reset_mask = None):
@@ -57,11 +71,16 @@ class ObservationHistory:
                 dtype=self.dtype,
                 device=self.device,
             )
+            self.first = torch.zeros(
+                (self.config.batch_size, self.config.observation_size), dtype=self.dtype, device=self.device)
+            self.has_first = torch.zeros(self.config.batch_size, dtype=torch.bool, device=self.device)
             return
 
         # conditional reset:        
         if reset_mask.any():
             self.history[reset_mask] = self.config.reset_value
+            self.first[reset_mask] = 0
+            self.has_first[reset_mask] = False
 
     def update(self, observation, reset_mask=None):
         """
@@ -79,6 +98,13 @@ class ObservationHistory:
 
         # 3. Insert new observations at the end
         self.history[:, -1] = observation
+
+        # 4. First observation since the last reset
+        with torch.no_grad():
+            new = ~self.has_first
+            if new.any():
+                self.first[new] = observation.detach()[new]
+                self.has_first |= new
 
     def get_tensor(self):
         """

@@ -9,6 +9,7 @@ from model.dense import DenseModel, DenseModelConfig
 from model.resnet import ResNetConfig
 from model.sparse.sparse_dense_model import SparseActivationDenseModelConfig
 from model.sparse.sparse_distributed_model import SparseDistributedModel
+from util.input_conditioner import InputConditioner
 from util.reinforcement_learning.policy_util import (
     PolicyConfig,
     PolicyData,
@@ -60,6 +61,32 @@ class CifarModelConfig:
     actor_training:str = "rl"
     loss_differentiable_scale:float = 1.0
     eval_bias:str = "sample"  # RL actor at evaluation, see CifarModel.EVAL_BIAS_*
+
+    # STM input conditioning (paper repo plan.md section 9). The defaults are the original model.
+    # input_conditioning: InputConditioner method, applied to each step's observation (empty history slots stay 0).
+    # input_conditioning_target: "mask" = only the sparse mask's key is conditioned; "both" = the model input too.
+    # mask_key: what the mask is computed from. "history" = the whole history (original); "current" = the current
+    #   step's observation; "first" = the episode's first observation (taken before any bias is applied).
+    # mask_key_bias_weight: multiplies the bias part of the key (after conditioning).
+    # mask_key_logit_weight: multiplies the logits part of the key (after conditioning); 0 = the mask ignores the logits.
+    # input_stats_*: running statistics, estimated over the first burnin_samples training observations, then frozen
+    #   (or tracked with an EMA when not frozen). The "first" key has its own statistics, from first observations.
+    input_conditioning:str = "none"
+    input_conditioning_target:str = "mask"
+    mask_key:str = "history"
+    mask_key_bias_weight:float = 1.0
+    mask_key_logit_weight:float = 1.0
+    input_stats_burnin_samples:int = 8000
+    input_stats_freeze:bool = True
+    input_stats_momentum:float = 0.001
+
+    # STM architecture ablations (defaults = original). Applied to both actor and critic.
+    # stm_encoding: the LTM encoding part of the observation (and so of the mask key). "bias-stage" = the gated stage's
+    #   output, average-pooled over space (original); "stage4" = the final stage's pooled features (512), the input of
+    #   the LTM's classifier head and of the frozen-encoding heads.
+    stm_encoding:str = "bias-stage"
+    stm_layer_norm_affine:bool = True
+    stm_output_bias:bool = True
     
 
 class CifarModel:
@@ -89,9 +116,20 @@ class CifarModel:
     ACTOR_TRAINING_RL = "rl"                        # paper: actor-critic on the classification reward
     ACTOR_TRAINING_DIFFERENTIABLE = "differentiable"  # cross-entropy back-propagated through the frozen LTM
 
+    # STM input conditioning
+    CONDITIONING_TARGET_MASK = "mask"
+    CONDITIONING_TARGET_BOTH = "both"
+    MASK_KEY_HISTORY = "history"
+    MASK_KEY_CURRENT = "current"
+    MASK_KEY_FIRST = "first"
+
     # Bias of the RL actor at evaluation (the differentiable actor always uses the mean)
     EVAL_BIAS_SAMPLE = "sample"  # paper: drawn from the policy
     EVAL_BIAS_MEAN = "mean"      # deterministic policy mean
+
+    # LTM encoding seen by the STM
+    STM_ENCODING_BIAS_STAGE = "bias-stage"
+    STM_ENCODING_STAGE4 = "stage4"
 
     def __init__(self, config:CifarModelConfig, device):
         super().__init__()
@@ -124,6 +162,9 @@ class CifarModel:
             "model_actor": self.model_actor.state_dict(),
             "model_critic": self.model_critic.state_dict(),
         }
+        if not self.is_input_original():
+            d["input_conditioner_all"] = self.input_conditioner_all.state_dict()
+            d["input_conditioner_first"] = self.input_conditioner_first.state_dict()
         return d
 
     def load_state_dict(self, state_dict):
@@ -137,6 +178,19 @@ class CifarModel:
         self.model_critic.load_state_dict(
             state_dict["model_critic"]
         )
+        if not self.is_input_original():
+            if "input_conditioner_all" in state_dict:
+                self.input_conditioner_all.load_state_dict(state_dict["input_conditioner_all"])
+                self.input_conditioner_first.load_state_dict(state_dict["input_conditioner_first"])
+                logger.info(f"Loaded input statistics: {int(self.input_conditioner_all.samples)} samples (all steps), "
+                            f"{int(self.input_conditioner_first.samples)} (first steps)")
+                for label, c in (("all steps", self.input_conditioner_all), ("first steps", self.input_conditioner_first)):
+                    if c.uses_statistics() and c.freeze and not c.is_frozen():
+                        logger.warning(f"Loaded input statistics ({label}) are not frozen yet: they keep updating")
+            else:
+                logger.warning("STM checkpoint has no input statistics: they start empty")
+        elif "input_conditioner_all" in state_dict:
+            raise ValueError("STM checkpoint has input statistics but this model uses the original input")
 
     def create_model_config(self, name:str, input_size:int, output_size:int):
         model_config = SparseActivationDenseModelConfig(
@@ -144,6 +198,7 @@ class CifarModel:
             name = name,
             nonlinearity = self.config.model_nonlinearity,
             input_layer_norm = True,
+            input_layer_norm_affine = self.config.stm_layer_norm_affine,
             input_dropout = 0,  # bad regularizer
             input_weight_clip = 0.0,
             input_size = input_size,
@@ -154,10 +209,11 @@ class CifarModel:
             layers = self.config.model_layers,
             hidden_dropout = 0,  # bad regularizer 
             bias = True,
+            output_bias = self.config.stm_output_bias,
         )
         return model_config
 
-    def create_model(self, name, input_size:int, output_size:int) -> SparseDistributedModel:
+    def create_model(self, name, input_size:int, output_size:int, key_size:int|None = None) -> SparseDistributedModel:
         logger.info(f"{name} model input:{input_size} output:{output_size}")
 
         if self.config.encoder_sparsity <= 0:
@@ -186,7 +242,7 @@ class CifarModel:
             )
             model = SparseDistributedModel(
                 model_configs = [model_config],
-                input_key_size = input_size,
+                input_key_size = input_size if key_size is None else key_size,
                 input_value_size = input_size,
                 memory_size = self.config.model_hidden_size,
                 ensemble_size = self.config.encoder_ensemble_size,
@@ -197,12 +253,18 @@ class CifarModel:
     def create_models(self):
 
         self.create_classifier()
-        encoded_size = self.model_class.get_bias_size()
+        if self.config.stm_encoding == CifarModel.STM_ENCODING_BIAS_STAGE:
+            encoded_size = self.model_class.get_bias_size()
+        elif self.config.stm_encoding == CifarModel.STM_ENCODING_STAGE4:
+            encoded_size = self.model_class.get_encoded_size()
+        else:
+            raise ValueError(f"Unknown STM encoding: {self.config.stm_encoding}")
         bias_size = self.get_bias_size()
         input_size = (encoded_size + bias_size + self.config.num_classes) * self.config.history_size  # input, and bias applied.
         logger.info(f"Encoded obs. size: {encoded_size}")
         logger.info(f"Encoder bias size: {bias_size}")
         logger.info(f"Model input size: {input_size}")
+        key_size = self.create_input_conditioning(encoded_size, bias_size)
 
         if self.config.policy_std is None:
             num_terms = 2  # mean + log_std
@@ -223,13 +285,109 @@ class CifarModel:
             name = "Actor",
             input_size = input_size,
             output_size = output_size_actor,
+            key_size = key_size,
         )
 
         self.model_critic = self.create_model(
             name = "Critic",
             input_size = input_size,
             output_size = 1,
+            key_size = key_size,
         )
+
+    def is_input_original(self) -> bool:
+        return (
+            self.config.input_conditioning == InputConditioner.METHOD_NONE
+            and self.config.mask_key == CifarModel.MASK_KEY_HISTORY
+            and self.config.mask_key_bias_weight == 1.0
+            and self.config.mask_key_logit_weight == 1.0
+        )
+
+    def create_input_conditioning(self, encoded_size:int, bias_size:int) -> int:
+        """
+        Conditioning of the STM input (see CifarModelConfig). Returns the size of the sparse mask's key.
+        """
+        self.observation_part_sizes = [encoded_size, bias_size, self.config.num_classes]
+        self.observation_size = sum(self.observation_part_sizes)
+        if self.config.input_conditioning_target not in (CifarModel.CONDITIONING_TARGET_MASK, CifarModel.CONDITIONING_TARGET_BOTH):
+            raise ValueError(f"Unknown input conditioning target: {self.config.input_conditioning_target}")
+        if self.config.mask_key not in (CifarModel.MASK_KEY_HISTORY, CifarModel.MASK_KEY_CURRENT, CifarModel.MASK_KEY_FIRST):
+            raise ValueError(f"Unknown mask key: {self.config.mask_key}")
+        if self.is_input_original():
+            return None
+        if self.config.encoder_sparsity <= 0:
+            raise ValueError("Input conditioning and mask keys apply to the sparse STM only")
+
+        def conditioner():
+            return InputConditioner(
+                part_sizes = self.observation_part_sizes,
+                method = self.config.input_conditioning,
+                burnin_samples = self.config.input_stats_burnin_samples,
+                freeze = self.config.input_stats_freeze,
+                momentum = self.config.input_stats_momentum,
+                device = self.device,
+            )
+        self.input_conditioner_all = conditioner()    # statistics of every step's observation
+        self.input_conditioner_first = conditioner()  # statistics of first observations (mask_key "first")
+
+        key_weight = torch.ones(self.observation_size, device=self.device)
+        key_weight[encoded_size:encoded_size + bias_size] = self.config.mask_key_bias_weight
+        key_weight[encoded_size + bias_size:] = self.config.mask_key_logit_weight
+        self.mask_key_weight = key_weight
+
+        if self.config.mask_key == CifarModel.MASK_KEY_HISTORY:
+            key_size = self.observation_size * self.config.history_size
+        else:
+            key_size = self.observation_size
+        logger.info(f"Input conditioning: {self.config.input_conditioning} on {self.config.input_conditioning_target}; "
+                    f"mask key: {self.config.mask_key} (size {key_size}), bias weight {self.config.mask_key_bias_weight}, logit weight {self.config.mask_key_logit_weight}; "
+                    f"statistics: burn-in {self.config.input_stats_burnin_samples} samples, "
+                    f"{'frozen' if self.config.input_stats_freeze else f'then EMA {self.config.input_stats_momentum}'}")
+        return key_size
+
+    def is_first_observation_input(self) -> bool:
+        """True if the STM input vector carries the episode's first observation after the history."""
+        return not self.is_input_original() and self.config.mask_key == CifarModel.MASK_KEY_FIRST
+
+    @torch.no_grad()
+    def update_input_statistics(self, observation:torch.Tensor, is_first:torch.Tensor):
+        """
+        observation: [B, O] the observation entering the history in training; is_first: [B] bool, first of its episode.
+        """
+        if self.is_input_original():
+            return
+        for conditioner, x, label in (
+            (self.input_conditioner_all, observation, "all steps"),
+            (self.input_conditioner_first, observation[is_first], "first steps"),
+        ):
+            if conditioner.update(x):
+                logger.info(f"Input statistics ({label}) frozen after {int(conditioner.samples)} samples")
+
+    def prepare_input(self, input:torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        input: [B, history_size * O] history vector, followed by the first observation [B, O] for the "first" key.
+        Returns (mask key, model input).
+        """
+        B = input.shape[0]
+        T, O = self.config.history_size, self.observation_size
+        history = input[:, :T * O].reshape(B, T, O)
+        filled = (history != 0).any(dim=-1, keepdim=True)  # empty slots (zeros) stay zero: the mean after centring
+        history_conditioned = self.input_conditioner_all(history) * filled
+
+        if self.config.input_conditioning_target == CifarModel.CONDITIONING_TARGET_BOTH:
+            model_input = history_conditioned.reshape(B, T * O)
+        else:
+            model_input = input[:, :T * O]
+
+        if self.config.mask_key == CifarModel.MASK_KEY_HISTORY:
+            key = (history_conditioned * self.mask_key_weight).reshape(B, T * O)
+        elif self.config.mask_key == CifarModel.MASK_KEY_CURRENT:
+            key = history_conditioned[:, -1] * self.mask_key_weight
+        else:
+            first = input[:, T * O:]
+            assert first.shape[1] == O, "the first-observation key needs the first observation after the history"
+            key = self.input_conditioner_first(first) * self.mask_key_weight
+        return key, model_input
 
     def get_bias_size(self) -> int:
         bias_size = self.model_class.get_bias_size()
@@ -262,11 +420,7 @@ class CifarModel:
         bias:torch.Tensor,
     ) -> torch.Tensor:
         with torch.no_grad():  # Never any grads during RL phase
-            logits, encoding = self.model_class(
-                x = image,
-                bias = bias,
-            )
-            return logits, encoding
+            return self.do_classifier_with_grad(image=image, bias=bias)
 
     def do_actor(
         self,
@@ -305,10 +459,10 @@ class CifarModel:
         Classifier forward pass that keeps the graph from the bias input (LTM parameters are frozen,
         so only the actor receives gradients). Used by the differentiable actor.
         """
-        logits, encoding = self.model_class(
-            x = image,
-            bias = bias,
-        )
+        features, encoding = self.model_class.features(x=image, bias=bias)
+        logits = self.model_class.classify(features)  # same as self.model_class(x, bias)
+        if self.config.stm_encoding == CifarModel.STM_ENCODING_STAGE4:
+            encoding = features
         return logits, encoding
 
     def update_differentiable_loss(
@@ -343,7 +497,10 @@ class CifarModel:
         model_index:int = 0,
     ) -> torch.Tensor:
         if key_input is None:
-            key_input = input
+            if self.is_input_original():
+                key_input = input
+            else:
+                key_input, input = self.prepare_input(input)
         if self.config.encoder_sparsity <= 0:
             output = model(input)
             active_mask_output = None

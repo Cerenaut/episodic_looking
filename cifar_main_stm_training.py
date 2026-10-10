@@ -112,7 +112,7 @@ def main():
     LOG_PERIOD = 100
 
     NUM_CLASSES = 20  # Coarse classes
-    ENCODING_SIZE = 128
+    ENCODING_SIZE = 512 if args.stm_encoding == "stage4" else 128  # stage-4 pooled features, or the bias stage's
     BIAS_SIZE = 128
     BIAS_STAGE = 2
 
@@ -296,6 +296,17 @@ def main():
         policy_std=0.5,
         actor_training=ACTOR_TRAINING,
         eval_bias=args.eval_bias,
+        input_conditioning=args.input_conditioning,
+        input_conditioning_target=args.input_conditioning_target,
+        mask_key=args.mask_key,
+        mask_key_bias_weight=args.mask_key_bias_weight,
+        mask_key_logit_weight=args.mask_key_logit_weight,
+        stm_encoding=args.stm_encoding,
+        stm_layer_norm_affine=not args.stm_no_layer_norm_affine,
+        stm_output_bias=not args.stm_no_output_bias,
+        input_stats_burnin_samples=args.input_stats_burnin_samples,
+        input_stats_freeze=args.input_stats_ema is None,
+        input_stats_momentum=args.input_stats_ema if args.input_stats_ema is not None else 0.001,
     )
 
     agent = CifarAgent(
