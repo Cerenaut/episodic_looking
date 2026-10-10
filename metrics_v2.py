@@ -69,8 +69,8 @@ def load_run_pivot(path: str) -> pd.DataFrame | None:
 MODELS = [
     ("rl", "CLS/STM, RL"),
     ("actor", "CLS/STM, diff.\\ actor"),
-    ("sup", "CLS/STM, supervised"),
-    ("sup2", "CLS/STM, supervised, default init"),
+    ("sup2", "CLS/STM, supervised"),
+    ("sup", "CLS/STM, supervised, zero init (ablation)"),
     ("linear", "Linear probe"),
     ("ncm", "NCM"),
     ("flymodel", "FlyModel"),
