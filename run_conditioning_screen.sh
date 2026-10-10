@@ -37,6 +37,8 @@ declare -A VARIANTS=(
   [original_noaffine_nooutbias]="--stm-no-layer-norm-affine --stm-no-output-bias"
   # LTM's final-stage pooled features (512) in place of the bias-stage encoding, in model input and mask key alike
   [original_stage4]="--stm-encoding stage4"
+  # both of the above (2x2 with original, original_noaffine_nooutbias, original_stage4)
+  [original_stage4_noaffine_nooutbias]="--stm-encoding stage4 --stm-no-layer-norm-affine --stm-no-output-bias"
 )
 
 SETTING=${1:?setting: pretrain|continual|list}
