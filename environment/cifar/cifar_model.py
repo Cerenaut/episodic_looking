@@ -87,6 +87,11 @@ class CifarModelConfig:
     stm_encoding:str = "bias-stage"
     stm_layer_norm_affine:bool = True
     stm_output_bias:bool = True
+    # Critic only: sparsity-aware initialisation. Layers fed by the masked hidden layer (hidden layer 2 and the output
+    # layer) see only k of their H inputs, so PyTorch's U(+-1/sqrt(H)) gives pre-activations ~sqrt(H/k) too small; their
+    # weights are scaled by sqrt(H/k) (= U(+-1/sqrt(k))) and the hidden-layer biases zeroed. No extra random draws, so
+    # every other parameter is initialised exactly as without it.
+    stm_critic_sparse_init:bool = False
     
 
 class CifarModel:
@@ -294,6 +299,18 @@ class CifarModel:
             output_size = 1,
             key_size = key_size,
         )
+        if self.config.stm_critic_sparse_init:
+            self.apply_sparse_init(self.model_critic)
+
+    def apply_sparse_init(self, model:SparseDistributedModel):
+        mlp = model.get_model(0)
+        scale = (self.config.model_hidden_size / self.config.encoder_sparsity) ** 0.5
+        logger.info(f"Sparse init of {mlp.config.name}: layers after the first scaled by {scale:.3f}, hidden biases 0")
+        with torch.no_grad():
+            for layer in mlp.layers[1:]:
+                layer.weight.mul_(scale)
+            for layer in mlp.layers[:-1]:
+                layer.bias.zero_()
 
     def is_input_original(self) -> bool:
         return (

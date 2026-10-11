@@ -268,6 +268,11 @@ class CifarArgs:
             help="STM: input LayerNorm without the learned scale and shift (actor and critic).",
         )
         parser.add_argument(
+            "--stm-critic-sparse-init",
+            action="store_true",
+            help="STM critic: weights of the layers fed by the masked hidden layer scaled by sqrt(H/k), hidden biases 0.",
+        )
+        parser.add_argument(
             "--stm-no-output-bias",
             action="store_true",
             help="STM: no bias in the output layer (actor and critic).",

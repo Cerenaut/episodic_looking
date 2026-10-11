@@ -304,6 +304,7 @@ def main():
         stm_encoding=args.stm_encoding,
         stm_layer_norm_affine=not args.stm_no_layer_norm_affine,
         stm_output_bias=not args.stm_no_output_bias,
+        stm_critic_sparse_init=args.stm_critic_sparse_init,
         input_stats_burnin_samples=args.input_stats_burnin_samples,
         input_stats_freeze=args.input_stats_ema is None,
         input_stats_momentum=args.input_stats_ema if args.input_stats_ema is not None else 0.001,

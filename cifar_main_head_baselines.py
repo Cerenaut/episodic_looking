@@ -13,6 +13,8 @@ the frozen 512-d pooled encoder features:
               Hebbian, clipped output weights (one-pass, no gradient).
     sdmlp     Bricken et al. 2023 "Sparse Distributed Memory is a Continual Learner":
               L2-normalised positive addresses, Top-K with GABA switch, SGD + CE.
+    stm       The RL STM's own network (SparseDistributedModel, as each of its actor and critic) trained as a
+              supervised classifier: one forward pass, CE, SGD with the STM's lr 0.1 and momentum 0.5.
 
 The encoder is run exactly once per (checkpoint, coarse-class pair) and the 512-d encodings
 are cached to disk, so every method/seed/order re-run is instant.
@@ -40,6 +42,8 @@ from environment.cifar.cifar_classifier import CifarClassifier
 from environment.cifar.cifar_dataset import Cifar100Dataset
 from environment.cifar.cifar_results import CifarResults
 from model.resnet import ResNetConfig
+from model.sparse.sparse_dense_model import SparseActivationDenseModelConfig
+from model.sparse.sparse_distributed_model import SparseDistributedModel
 from util.instrumentation import Instrumentation
 from util.log import create_run_path, get_run_path
 
@@ -60,8 +64,10 @@ EXPERIMENT_TYPE_STREAMING = "streaming"
 # and 0.0001 at momentum 0, weight decay 0 (runs_local/linear_val_sweep_20260927/), then confirmed with pre-training
 # fixed at 0.01 (runs_local/linear_val_sweep_pt0.01_20260927/). Weight decay made no difference. Not validated for
 # streaming or few-shot.
-METHOD_DEFAULT_LR = {"linear": 0.001, "ncm": 0.0, "flymodel": 0.2, "sdmlp": 0.05}
-METHOD_DEFAULT_MOMENTUM = {"linear": 0.0, "ncm": 0.0, "flymodel": 0.0, "sdmlp": 0.0}
+METHOD_DEFAULT_LR = {"linear": 0.001, "ncm": 0.0, "flymodel": 0.2, "sdmlp": 0.05, "stm": 0.1}
+METHOD_DEFAULT_MOMENTUM = {"linear": 0.0, "ncm": 0.0, "flymodel": 0.0, "sdmlp": 0.0, "stm": 0.5}
+# stm: the RL STM's optimizer (cifar_main_stm_training.py: SGD, lr 0.1, momentum 0.5, weight decay 0) in pre-training
+# and the continual phases alike; not tuned for supervised training.
 # Pre-training optimizer of the gradient-trained heads; the continual phases then get a fresh optimizer with --lr /
 # --momentum. SDMLP as Bricken: pre-training uses his model_params.py defaults (SGDM 0.9, lr 0.03); his continual runs
 # use plain SGD at lr 0.05 and do not reload the optimizer state. Linear probe: pre-training keeps the prior, untuned
@@ -76,7 +82,7 @@ METHOD_DEFAULT_PRETRAIN_MOMENTUM = {"sdmlp": 0.9, "linear": 0.0}
 # --------------------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--method", choices=["linear", "ncm", "flymodel", "sdmlp"], required=True)
+    p.add_argument("--method", choices=["linear", "ncm", "flymodel", "sdmlp", "stm"], required=True)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--checkpoint", type=str, default="../cifar_100_pretrain/cifar_100_subclasses_12_e11_31.1.pth",
                    help="Frozen LTM state_dict (CifarClassifier(ResNetConfig(num_classes=20), bias_stage=-1)).")
@@ -136,6 +142,7 @@ def parse_args():
                         "firing, so at k = 32 only ~25%% of neurons complete the switch in pre-training; a completed "
                         "switch (e.g. 100) made the head more plastic and forget more (Notes/stm_optimizations.md).")
     p.add_argument("--grad-clip", type=float, default=1.0, help="SDMLP: gradient-norm clip (Bricken default 1.0).")
+    # stm (hidden cells and sparsity: --nneurons, --k, shared with sdmlp; defaults 1000 and 32 as the RL STM)
     # plumbing
     p.add_argument("--run-path", type=str, default=None,
                    help="Explicit output directory (default: timestamped runs/cifar_100/<experiment name>/...).")
@@ -540,6 +547,47 @@ class SDMLPHead(Head):
                 f"lr={self.lr} momentum={self.momentum}")
 
 
+class SparseSTMHead(Head):
+    """
+    The RL STM's network, exactly as each of its actor and critic (CifarModel.create_model_config): a
+    SparseDistributedModel with input LayerNorm, two hidden layers of nneurons leaky-ReLU cells both masked to the same
+    top-k clique chosen by a fixed signed-pairs projection of the input (key = input), and a linear output layer, here
+    20 logits. Trained as a supervised classifier on the frozen 512-d features: one forward pass, cross-entropy, SGD.
+    No episodes, no bias, no LTM in the loop.
+    """
+    name = "stm"
+
+    def __init__(self, nneurons: int, k: int, lr: float, momentum: float, device):
+        config = SparseActivationDenseModelConfig(
+            weight_decay_factor=0, name="STMHead", nonlinearity="leaky-relu", input_layer_norm=True, input_dropout=0,
+            input_weight_clip=0.0, input_size=ENCODING_DIM, hidden_size=nneurons, hidden_size_factor=1,
+            output_size=NUM_CLASSES, output_nonlinearity=None, layers=3, hidden_dropout=0, bias=True)
+        self.model = SparseDistributedModel(input_key_size=ENCODING_DIM, input_value_size=ENCODING_DIM,
+                                            memory_size=nneurons, ensemble_size=1, sparsity=k,
+                                            model_configs=[config]).to(device)
+        self.params = self.model.get_trainable_parameters()
+        self.set_optimizer(lr, momentum)
+
+    def set_optimizer(self, lr: float, momentum: float):
+        """A fresh optimizer (no momentum state carried over), as the RL STM's continual phases."""
+        self.lr, self.momentum = lr, momentum
+        self.opt = torch.optim.SGD(self.params, lr=lr, momentum=momentum, weight_decay=0)
+
+    def fit_batch(self, x, y):
+        self.opt.zero_grad()
+        logits, _ = self.model.do_model(key_input=x, model_input=x)
+        F.cross_entropy(logits, y).backward()
+        self.opt.step()
+        return logits.detach()
+
+    @torch.no_grad()
+    def logits(self, x):
+        return self.model.do_model(key_input=x, model_input=x)[0]
+
+    def describe(self):
+        return f"stm lr={self.lr} momentum={self.momentum}"
+
+
 def make_head(args, device) -> Head:
     if args.method == "linear":
         w, b = load_ltm_classifier(args)
@@ -555,6 +603,8 @@ def make_head(args, device) -> Head:
         # Built with the pre-training optimizer; main() switches to --lr / --momentum for the continual phases.
         return SDMLPHead(args.nneurons, args.k, args.gaba_switch_activations, args.pretrain_lr,
                          args.pretrain_momentum, args.grad_clip, device)
+    if args.method == "stm":
+        return SparseSTMHead(args.nneurons, args.k, args.pretrain_lr, args.pretrain_momentum, device)
     raise ValueError(args.method)
 
 

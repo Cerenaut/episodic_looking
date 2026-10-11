@@ -39,6 +39,8 @@ declare -A VARIANTS=(
   [original_stage4]="--stm-encoding stage4"
   # both of the above (2x2 with original, original_noaffine_nooutbias, original_stage4)
   [original_stage4_noaffine_nooutbias]="--stm-encoding stage4 --stm-no-layer-norm-affine --stm-no-output-bias"
+  # critic sparsity-aware initialisation (layers fed by the masked hidden layer x sqrt(H/k), hidden biases 0)
+  [original_critic_sparse_init]="--stm-critic-sparse-init"
 )
 
 SETTING=${1:?setting: pretrain|continual|list}
