@@ -104,7 +104,7 @@ reaper_pid() {
 }
 
 # mtime <file>: seconds since the epoch (BSD stat, then GNU stat); empty if unreadable.
-mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }  # GNU first: GNU stat -f (file system) prints to stdout even when it fails
 
 # Words of an actions line's environment field (shell words) -> the value of KEY (last assignment wins, as with env);
 # empty if unset.
