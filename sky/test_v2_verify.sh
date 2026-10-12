@@ -603,8 +603,8 @@ expect "launch: per-cluster yaml restricted to the preferred region (default RO)
   bash -c "grep -qx '  any_of:' '$LR/$LROUND/yaml/v2t-a.yaml' && grep -qx '    - infra: runpod/RO' '$LR/$LROUND/yaml/v2t-a.yaml' && ! grep -q '^  infra: runpod\$' '$LR/$LROUND/yaml/v2t-a.yaml' && [ \"\$(grep -c 'infra: runpod/' '$LR/$LROUND/yaml/v2t-a.yaml')\" = 1 ]"
 expect "launch: fallback yaml has every other region except IS (avoided) and RO (preferred)" \
   bash -c "y='$LR/$LROUND/yaml/v2t-a.fallback.yaml'; [ \"\$(grep -c 'infra: runpod/' \"\$y\")\" = 12 ] && ! grep -q 'runpod/IS\$' \"\$y\" && ! grep -q 'runpod/RO\$' \"\$y\" && grep -q 'runpod/CZ\$' \"\$y\""
-expect "launch: no LTM=e40 unit, so no e40 mount (still commented), e13 mounted, no CIFAR mount" \
-  bash -c "y='$LR/$LROUND/yaml/v2t-a.yaml'; grep -q '^  #E40 ' \"\$y\" && ! grep -q '^  ~/cifar_100_pretrain/cifar_100_subclasses_12_e40.pth:' \"\$y\" && grep -q '^  ~/cifar_100_pretrain/cifar_100_subclasses_12_e13.pth:' \"\$y\" && ! grep -q '^  ~/cifar-100-python' \"\$y\""
+expect "launch: no LTM=e40 unit, so no e40 mount (still commented), e13 mounted, CIFAR-100 train, test, meta mounted (from 30440e7)" \
+  bash -c "y='$LR/$LROUND/yaml/v2t-a.yaml'; grep -q '^  #E40 ' \"\$y\" && ! grep -q '^  ~/cifar_100_pretrain/cifar_100_subclasses_12_e40.pth:' \"\$y\" && grep -q '^  ~/cifar_100_pretrain/cifar_100_subclasses_12_e13.pth:' \"\$y\" && [ \"\$(grep -c '^  ~/cifar-100-python/\(train\|test\|meta\): ~/Dev/datasets/cifar-100-python/' \"\$y\")\" = 3 ]"
 expect "launch: v2t-b failed in the preferred region, was absent, and was retried with the fallback yaml (then failed: launch_failed marker)" \
   bash -c "grep -qx '$LROUND/yaml/v2t-b.yaml' '$FAKE_STATE/yaml_v2t-b' && grep -qx '$LROUND/yaml/v2t-b.fallback.yaml' '$FAKE_STATE/yaml_v2t-b' && grep -q 'trying the fallback regions' '$LL' && grep -q '^exit 3' '$LR/$LROUND/launch_failed/v2t-b' && [ ! -e '$LR/$LROUND/launch_failed/v2t-a' ]"
 cp "$FAKE_STATE/sky_calls" "$FAKE_STATE.sky_calls.keep"
