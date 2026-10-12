@@ -273,6 +273,12 @@ class CifarArgs:
             help="STM critic: weights of the layers fed by the masked hidden layer scaled by sqrt(H/k), hidden biases 0.",
         )
         parser.add_argument(
+            "--stm-momentum",
+            type=float,
+            default=0.5,
+            help="STM: SGD momentum of the actor and critic optimizer, in pre-training and continual alike (default 0.5, the original).",
+        )
+        parser.add_argument(
             "--stm-no-output-bias",
             action="store_true",
             help="STM: no bias in the output layer (actor and critic).",

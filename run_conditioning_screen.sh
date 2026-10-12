@@ -41,6 +41,13 @@ declare -A VARIANTS=(
   [original_stage4_noaffine_nooutbias]="--stm-encoding stage4 --stm-no-layer-norm-affine --stm-no-output-bias"
   # critic sparsity-aware initialisation (layers fed by the masked hidden layer x sqrt(H/k), hidden biases 0)
   [original_critic_sparse_init]="--stm-critic-sparse-init"
+  # stage4 without SGD momentum (pre-training and continual); lr 0.2 keeps the steady-state step of lr 0.1 at
+  # momentum 0.5 (lr / (1 - m)). Dave, 12 Oct
+  [original_stage4_nomomentum]="--stm-encoding stage4 --stm-momentum 0"
+)
+# Training learning rate per variant (pre-training and continual); 0.1 unless listed
+declare -A VARIANT_LR=(
+  [original_stage4_nomomentum]=0.2
 )
 
 SETTING=${1:?setting: pretrain|continual|list}
@@ -48,6 +55,7 @@ if [ "$SETTING" = list ]; then for v in "${!VARIANTS[@]}"; do echo "$v: ${VARIAN
 VARIANT=${2:?variant (see: list)}
 [ -n "${VARIANTS[$VARIANT]+x}" ] || { echo "unknown variant: $VARIANT" >&2; exit 2; }
 EXTRA=${VARIANTS[$VARIANT]}
+LR=${VARIANT_LR[$VARIANT]:-0.1}
 
 PY=${PY:-../.venv/bin/python}
 LTM_CKPT=../cifar_100_pretrain/cifar_100_subclasses_12_e13.pth
@@ -82,10 +90,10 @@ run_unit() {  # <unit dir> <command>
 
 case "$SETTING" in
   pretrain)
-    run_unit "$PRETRAIN_DIR" "$STM_BASE --learning-rate 0.1 --experiment-type pretrain --fine-classes 1 2 --epochs 12 --stm-checkpoint $STM_CKPT --run-root $PRETRAIN_DIR"
+    run_unit "$PRETRAIN_DIR" "$STM_BASE --learning-rate $LR --experiment-type pretrain --fine-classes 1 2 --epochs 12 --stm-checkpoint $STM_CKPT --run-root $PRETRAIN_DIR"
     run_unit "$BASELINE_DIR" "$STM_BASE --experiment-type evaluate --fine-classes 3 4 5 --stm-checkpoint $STM_CKPT --run-root $BASELINE_DIR" ;;
   continual)
     [ -f "$PRETRAIN_DIR/job.done" ] || { echo "pre-training not finished: $PRETRAIN_DIR" >&2; exit 2; }
-    run_unit "$CONTINUAL_DIR" "$STM_BASE --learning-rate 0.1 --experiment-type continual --fine-classes 3 4 5 --epochs $CONT_EPOCHS --stm-checkpoint $STM_CKPT --stm-checkpoint-out $CONTINUAL_DIR/stm --run-root $CONTINUAL_DIR" ;;
+    run_unit "$CONTINUAL_DIR" "$STM_BASE --learning-rate $LR --experiment-type continual --fine-classes 3 4 5 --epochs $CONT_EPOCHS --stm-checkpoint $STM_CKPT --stm-checkpoint-out $CONTINUAL_DIR/stm --run-root $CONTINUAL_DIR" ;;
   *) echo "unknown setting: $SETTING" >&2; exit 2 ;;
 esac
