@@ -69,6 +69,7 @@ def load_run_pivot(path: str) -> pd.DataFrame | None:
 MODELS = [
     ("rl", "CLS/STM, RL"),
     ("actor", "CLS/STM, diff.\\ actor"),
+    ("stm", "Supervised STM head"),  # cifar_main_head_baselines.py --method stm (13 Oct; few-shot from 14 Oct)
     ("linear", "Linear probe"),
     ("ncm", "NCM"),
     ("flymodel", "FlyModel"),
@@ -332,7 +333,7 @@ SELECTION_CLASSES = (3, 4, 5)   # single-stream and few-shot selection average f
 FOUR_SETS = ["12", "3", "4", "5"]
 # Seeds each (setting, N) must have before its selection is decided, beyond those found on disk (decided 29 Sep: at
 # small N one seed is one draw of N images, so the heads' few-shot runs at N = 1 and 4 use seeds 1 to 3).
-HEADS = ("linear", "ncm", "flymodel", "sdmlp")
+HEADS = ("linear", "ncm", "flymodel", "sdmlp", "stm")
 EXPECTED_SEEDS = {("fewshot", 1): [1, 2, 3], ("fewshot", 4): [1, 2, 3]}
 GRID_EXTENSION_MARK = "grid_extension"  # file in a tree created by a grid-edge step (only one step is taken)
 
