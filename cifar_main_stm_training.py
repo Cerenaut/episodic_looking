@@ -2,15 +2,17 @@
 import logging
 import math
 import os
+from dataclasses import dataclass
 
 import gymnasium as gym
 import torch
 
 from environment.cifar.cifar_agent import CifarAgent, CifarAgentConfig
 from environment.cifar.cifar_args import CifarArgs
-from environment.cifar.cifar_dataset import Cifar100Dataset
+from environment.cifar.cifar_dataset import Cifar100Dataset, CifarDatasetOptions
 from environment.cifar.cifar_env import CifarEnv, CifarEnvConfig, EvaluationSweep
-from environment.cifar.cifar_model import CifarModel, CifarModelConfig
+from environment.cifar.cifar_experiment import StmExperimentConfig
+from environment.cifar.cifar_model import CifarModelConfig
 from environment.cifar.cifar_results import CifarResults
 from util.device import get_device, seed_all
 from util.instrumentation import Instrumentation
@@ -73,99 +75,152 @@ def do_evaluate_sweep(agent:CifarAgent, episode_steps:int) -> tuple[float, dict[
     logger.info(f"Mode:{mode} sweep of {num_images} images Accuracy:{accuracy}")
     return accuracy, image_correct
 
-def main():
-    args = CifarArgs.parse_args()
+@dataclass
+class StmRun:
+    """
+    What every experiment type shares: the settings, the agent, the class filters of the environments' first datasets
+    and the results files.
+    """
+    experiment:StmExperimentConfig
+    agent:CifarAgent
+    exclude_classes_coarse:set[int]
+    exclude_classes_fine:set[int]|None  # all fine classes but --fine-classes
+    dataset_evaluate:Cifar100Dataset  # the environments' first evaluation dataset: the test images of --fine-classes
+    results_file:CifarResults
+    results_file_val:CifarResults|None  # same format and epochs as results_file, on the validation sets
+    results_file_images:CifarResults|None  # per-image results of every evaluation sweep
 
-    SEED = args.seed
-    if SEED is not None:
-        # Model init and policy sampling (torch), env image sampling and dataset subsets (numpy global RNG,
-        # envs are synchronous so they share it), python's random for completeness.
-        seed_all(SEED)
+    def create_dataset(
+        self,
+        mode:str,
+        exclude_classes_fine:set[int]|None,
+        max_instances:int|None,
+        dataset_options:CifarDatasetOptions|None = None,
+    ) -> Cifar100Dataset:
+        """A dataset of the --coarse-classes, in new shared memory that the environments can attach to."""
+        return CifarEnv.create_dataset(
+            data_file_path = self.experiment.CIFAR_DATA_FILE_PATH,
+            mode = mode,
+            shared_memory_names = None,
+            exclude_classes_coarse = self.exclude_classes_coarse,
+            exclude_classes_fine = exclude_classes_fine,
+            max_instances = max_instances,
+            dataset_options = dataset_options,
+        )
 
-    EXPERIMENT_TYPE = args.experiment_type
-    BATCH_SIZE = args.batch_size
-    SPARSITY = args.sparsity
-    MAX_INSTANCES = args.max_instances
-    FINE_CLASSES = args.fine_classes
-    COARSE_CLASSES = args.coarse_classes
-    LEARNING_RATE = args.learning_rate
-    NUM_EPOCHS = args.epochs if args.epochs is not None else 12  # --epochs defaults to None, for LTM-only's rule
-    EVALUATE_INTERVAL_EPOCHS = args.evaluate_epochs
-    VAL_HOLDOUT = args.val_holdout
-    logger.info(f"Exp.:{EXPERIMENT_TYPE} Fine classes:{FINE_CLASSES} Batch size:{BATCH_SIZE} max. instances:{MAX_INSTANCES} LR: {LEARNING_RATE} Seed: {SEED}")
+    def train_on(self, exclude_classes_fine:set[int]|None, description:str):
+        """Switch the training environments to the training images of the fine classes not excluded."""
+        experiment = self.experiment
+        dataset_training = self.create_dataset(
+            mode = Instrumentation.MODE_TRAINING,
+            exclude_classes_fine = exclude_classes_fine,
+            max_instances = experiment.max_instances,
+            dataset_options = experiment.training_dataset_options,
+        )
+        logger.info(f"{description}: {len(dataset_training)} images")
 
-    # Validation split (--val-holdout): every training set holds out the same images per fine class as the head
-    # script, and the held-out images are evaluated alongside the test sets.
-    # With --max-instances and --seed, the subset is the one the head and LTM-only scripts draw for that seed
-    # (Cifar100Dataset.get_subset_mask), and environments re-derive it identically; without a seed, the old draw.
-    subset_options = Cifar100Dataset.get_subset_options(MAX_INSTANCES, SEED)
-    split_options = Cifar100Dataset.get_split_options(VAL_HOLDOUT, args.split_seed)
-    TRAINING_DATASET_OPTIONS = {**subset_options, **split_options} or None
-    VALIDATION_DATASET_OPTIONS = None  # "training": the validation set is read from the training file
-    if subset_options:
-        logger.info(f"Subset of {MAX_INSTANCES} images per coarse class drawn with seed {SEED}")
-    if split_options:
-        VALIDATION_DATASET_OPTIONS = {"training": True, **split_options, "split_part": "validation"}
-        logger.info(f"Validation split: {VAL_HOLDOUT} images per fine class held out, split seed {args.split_seed}")
+        CifarEnv.set_dataset_config_for_envs(
+            envs = self.agent.get_envs(Instrumentation.MODE_TRAINING),
+            mode = Instrumentation.MODE_TRAINING,
+            shared_memory_names = dataset_training.get_shared_memory_names(),
+            exclude_classes_fine = exclude_classes_fine,
+            max_instances = experiment.max_instances,  # as dataset_training (None: all); continual was given None, which failed
+            dataset_options = experiment.training_dataset_options,
+        )
 
-    LOG_PREFIX = "cifar-100-bias"
-    LOG_PERIOD = 100
+    def train_epoch(self) -> float:
+        return do_training(agent = self.agent, num_steps = self.experiment.training_steps)
 
-    NUM_CLASSES = 20  # Coarse classes
-    ENCODING_SIZE = 128
-    BIAS_SIZE = 128
-    BIAS_STAGE = 2
+    def append_training_line(self, fine_classes:list[int], epoch:int, accuracy:float, coarse_classes:list[int]|None = None):
+        # The training line goes into the validation file too, so both files have the head script's layout.
+        if coarse_classes is None:
+            coarse_classes = self.experiment.coarse_classes
+        for results in (self.results_file, self.results_file_val):
+            if results is None:
+                continue
+            results.append_line(
+                coarse_classes = str(coarse_classes),
+                fine_classes = str(fine_classes),
+                mode = Instrumentation.MODE_TRAINING,
+                epoch = epoch,
+                accuracy = accuracy,
+            )
 
-    CONTEXT_SIZE = 8
-    DISCOUNT = 0.5
-    MAX_EPISODE_STEPS = 8
+    def evaluate_current(self, record_label:str, epoch:int) -> float:
+        """Evaluate the environments' current evaluation dataset, by sweep or by --evaluate-steps steps."""
+        if not self.experiment.eval_sweep:
+            return do_evaluate(agent = self.agent, num_steps = self.experiment.evaluate_steps)
+        accuracy, image_correct = do_evaluate_sweep(self.agent, self.experiment.MAX_EPISODE_STEPS)
+        if self.results_file_images is not None:
+            bits = "".join(str(image_correct[i]) for i in range(len(image_correct)))
+            self.results_file_images.append_file(f"{record_label}, {epoch}, {bits}\n")
+        return accuracy
 
-    CIFAR_DATA_FILE_PATH = "../cifar-100-python"
-    CLASSIFIER_FILE_PATH = "../cifar_100_pretrain/cifar_100_subclasses_12_e11_31.1.pth"
-    STM_PRETRAIN_FILE_PATH = "../cifar_100_pretrain/cifar_100_cc56_subclasses_12_stm_pretrain_e12.pth"
-    if args.ltm_checkpoint is not None:
-        CLASSIFIER_FILE_PATH = args.ltm_checkpoint
-    if args.stm_checkpoint is not None:
-        STM_PRETRAIN_FILE_PATH = args.stm_checkpoint
-    ACTOR_TRAINING = args.actor_training
-    logger.info(f"LTM checkpoint: {CLASSIFIER_FILE_PATH} STM checkpoint: {STM_PRETRAIN_FILE_PATH} actor training: {ACTOR_TRAINING}")
+    def save_stm(self, file_path:str, description:str):
+        os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
+        torch.save(self.agent.model.state_dict(), file_path)
+        logger.info(f"Wrote STM {description} to: {file_path}")
 
-    # The episodic environment doesn't pull from the dataset until exhaustion, because all samples
-    # have to be constantly fed with data which persists for multiple steps.
-    # Instead, track steps and break periodically for evaluation. We still call these breaks "epochs"
-    # although they aren't true epochs in the data.
-    TRAINING_STEPS = args.training_steps  # 4000 by default
-    EVALUATE_STEPS = args.evaluate_steps  # default 1600 = 200 test images x 8 steps
-    # --eval-sweep replaces EVALUATE_STEPS by one pass over every image; --eval-batch-size sets the evaluation
-    # environments apart from the training batch.
-    EVAL_SWEEP = args.eval_sweep
-    EVALUATE_BATCH_SIZE = args.eval_batch_size if args.eval_batch_size is not None else BATCH_SIZE
-    logger.info(f"Evaluation: {'one pass over every image' if EVAL_SWEEP else f'{EVALUATE_STEPS} steps'}, "
-                f"{EVALUATE_BATCH_SIZE} environments")
-    if args.eval_record_images and not EVAL_SWEEP:
-        raise ValueError("--eval-record-images needs --eval-sweep")
 
-    # Construct all the objects needed for the experiment, including model and envs
-    max_instances_description = (
-        str(MAX_INSTANCES) if MAX_INSTANCES is not None else "500"
-    )
-    EXPERIMENT_NAME = f"{EXPERIMENT_TYPE}_{FINE_CLASSES}_{max_instances_description}"
-    run_root_path = f"cifar_100/{EXPERIMENT_NAME}"
+@dataclass
+class EvaluationGroup:
+    """Fine classes evaluated together: their test set and, with the validation split, their validation set."""
+    name:str  # in the results files, e.g. "['12']"
+    exclude_classes_fine:set[int]|None
+    dataset_test:Cifar100Dataset
+    dataset_validation:Cifar100Dataset|None = None
+
+
+def evaluate_groups(run:StmRun, groups:list[EvaluationGroup], epoch:int):
+    """Evaluate every group's test set, into the results file, then every group's validation set, into its own."""
+    for part, results in (("test", run.results_file), ("validation", run.results_file_val)):
+        dataset_options = None if part == "test" else run.experiment.validation_dataset_options
+        for group in groups:
+            dataset = group.dataset_test if part == "test" else group.dataset_validation
+            if dataset is None:
+                continue
+            logger.info(f"Evaluating ({part}) @ epoch {epoch} fine classes {group.name}...")
+            CifarEnv.set_dataset_config_for_envs(
+                envs = run.agent.get_envs(Instrumentation.MODE_EVALUATE),
+                mode = Instrumentation.MODE_EVALUATE,
+                shared_memory_names = dataset.get_shared_memory_names(),
+                exclude_classes_fine = group.exclude_classes_fine,
+                max_instances = None,  # All instances
+                dataset_options = dataset_options,
+            )
+            accuracy_evaluate = run.evaluate_current(f"{part}, {group.name}", epoch)
+            results.append_line(
+                coarse_classes = str(run.experiment.coarse_classes),
+                fine_classes = group.name,
+                mode = Instrumentation.MODE_EVALUATE,
+                epoch = epoch,
+                accuracy = accuracy_evaluate,
+            )
+
+
+def create_run(experiment:StmExperimentConfig) -> StmRun:
+    """Construct all the objects needed for the experiment, including model and envs, and the results files."""
+    EXPERIMENT_TYPE = experiment.experiment_type
+    FINE_CLASSES = experiment.fine_classes
+    COARSE_CLASSES = experiment.coarse_classes
+    CIFAR_DATA_FILE_PATH = experiment.CIFAR_DATA_FILE_PATH
+
+    run_root_path = f"cifar_100/{experiment.experiment_name}"
     run_path = get_run_path(
         prefix=run_root_path,
-        path=args.run_root,
+        path=experiment.run_root,
     )
     create_run_path(run_path)
     logger.info(f"Run path: {run_path}")
 
     results_file = CifarResults(run_path = run_path, suffix=EXPERIMENT_TYPE)
     results_file.clear_file()
-    results_file_val = None  # same format and epochs as results_file, on the validation sets
-    if VAL_HOLDOUT > 0:
+    results_file_val = None
+    if experiment.val_holdout > 0:
         results_file_val = CifarResults(run_path = run_path, suffix=f"{EXPERIMENT_TYPE}_val")
         results_file_val.clear_file()
-    results_file_images = None  # per-image results of every evaluation sweep
-    if args.eval_record_images:
+    results_file_images = None
+    if experiment.eval_record_images:
         results_file_images = CifarResults(run_path = run_path, suffix=f"{EXPERIMENT_TYPE}_images")
         results_file_images.clear_file()
 
@@ -192,9 +247,9 @@ def main():
     )
     # D.15: pre-train on the fine classes of a broader set of coarse classes; evaluation stays on COARSE_CLASSES.
     exclude_classes_coarse_training = None
-    if EXPERIMENT_TYPE == CifarArgs.EXPERIMENT_TYPE_PRETRAIN and args.pretrain_coarse_classes is not None:
-        exclude_classes_coarse_training = Cifar100Dataset.get_coarse_classes_excluded(args.pretrain_coarse_classes)
-        logger.info(f"Pre-training on coarse classes: {args.pretrain_coarse_classes} (evaluation on {COARSE_CLASSES})")
+    if EXPERIMENT_TYPE == CifarArgs.EXPERIMENT_TYPE_PRETRAIN and experiment.pretrain_coarse_classes is not None:
+        exclude_classes_coarse_training = Cifar100Dataset.get_coarse_classes_excluded(experiment.pretrain_coarse_classes)
+        logger.info(f"Pre-training on coarse classes: {experiment.pretrain_coarse_classes} (evaluation on {COARSE_CLASSES})")
 
     dataset_training = CifarEnv.create_dataset(
         data_file_path=CIFAR_DATA_FILE_PATH,
@@ -202,8 +257,8 @@ def main():
         shared_memory_names=None,
         exclude_classes_coarse=exclude_classes_coarse if exclude_classes_coarse_training is None else exclude_classes_coarse_training,
         exclude_classes_fine=exclude_classes_fine,
-        max_instances=MAX_INSTANCES,
-        dataset_options=TRAINING_DATASET_OPTIONS,
+        max_instances=experiment.max_instances,
+        dataset_options=experiment.training_dataset_options,
     )
 
     dataset_evaluate = CifarEnv.create_dataset(
@@ -215,22 +270,19 @@ def main():
         max_instances=None,
     )
 
-    shared_memory_names_training = dataset_training.get_shared_memory_names()
-    shared_memory_names_evaluate = dataset_evaluate.get_shared_memory_names()
-
     env_config = CifarEnvConfig(
         data_file_path=CIFAR_DATA_FILE_PATH,
         image_shape=image_shape,
-        num_classes=NUM_CLASSES,
-        max_steps=MAX_EPISODE_STEPS,
-        shared_memory_names_training=shared_memory_names_training,
-        shared_memory_names_evaluate=shared_memory_names_evaluate,
+        num_classes=experiment.NUM_CLASSES,
+        max_steps=experiment.MAX_EPISODE_STEPS,
+        shared_memory_names_training=dataset_training.get_shared_memory_names(),
+        shared_memory_names_evaluate=dataset_evaluate.get_shared_memory_names(),
         exclude_classes_coarse=exclude_classes_coarse,
         exclude_classes_coarse_training=exclude_classes_coarse_training,
         exclude_classes_fine_training=exclude_classes_fine,
         exclude_classes_fine_evaluate=exclude_classes_fine,
-        dataset_options_training=TRAINING_DATASET_OPTIONS,
-        max_instances_training=MAX_INSTANCES,  # as dataset_training, which the environments attach to
+        dataset_options_training=experiment.training_dataset_options,
+        max_instances_training=experiment.max_instances,  # as dataset_training, which the environments attach to
     )
 
     class NoArgCifarEnv(CifarEnv):
@@ -246,373 +298,217 @@ def main():
         entry_point=NoArgCifarEnv,
     )
 
-    config = CifarAgentConfig(
-        # Logging
-        log_type="tensorboard",
-        log_path=args.run_root,
-        log_prefix=LOG_PREFIX,
-        log_period=LOG_PERIOD,
-        # EpisodicAgent
-        batch_size=BATCH_SIZE,
-        evaluate_batch_size=EVALUATE_BATCH_SIZE if EVALUATE_BATCH_SIZE != BATCH_SIZE else 0,
-        history_size=CONTEXT_SIZE,
-        action_size=NUM_CLASSES,
-        observation_size=ENCODING_SIZE + BIAS_SIZE + NUM_CLASSES,
-        random_policy=False,
-        environment_id=NoArgCifarEnv.ENV_NAME,
-        async_env=False,
-        max_episode_steps=MAX_EPISODE_STEPS,
-        # CifarAgent
-        image_shape=image_shape,
-        learning_rate=LEARNING_RATE,
-        momentum=0.5,
-        ltm_obs_cache=args.ltm_obs_cache,
-    )
-
-    model_config = CifarModelConfig(
-        encoder_ensemble_size=1,
-        encoder_sparsity=SPARSITY,
-        history_size=CONTEXT_SIZE,
-        model_hidden_size=1000,
-        model_hidden_size_factor=1,
-        model_nonlinearity="leaky-relu",
-        model_layers=3,
-        discount_factor=DISCOUNT,
-        normalize_advantage=True,
-        normalize_advantage_epsilon=0.0001,
-        normalize_advantage_clamp=None,
-        reward_scale=1.0,
-        reward_type=CifarModel.REWARD_TYPE_ACCURACY_IMPROVEMENT,
-        loss_actor_scale=0.01,
-        loss_critic_scale=1.0,
-        loss_entropy_scale=1.0,
-        loss_class_scale=0.01,
-        loss_huber_delta=1.0,
-        loss_actor_type=CifarModel.LOSS_TYPE_SLOW_CHANGE,
-        loss_critic_type=CifarModel.LOSS_TYPE_HUBER,
-        num_classes=NUM_CLASSES,
-        classifier_model_file=CLASSIFIER_FILE_PATH,
-        classifier_bias_stage=BIAS_STAGE,
-        policy_std=0.5,
-        actor_training=ACTOR_TRAINING,
-        eval_bias=args.eval_bias,
-    )
-
     agent = CifarAgent(
-        config=config,
-        model_config=model_config,
+        config=CifarAgentConfig.from_experiment(
+            experiment = experiment,
+            environment_id = NoArgCifarEnv.ENV_NAME,
+            image_shape = image_shape,
+        ),
+        model_config=CifarModelConfig.from_experiment(experiment),
     )
-    if SEED is not None:
+    if experiment.seed is not None:
         for envs in {id(e): e for e in (agent.get_envs(Instrumentation.MODE_TRAINING), agent.get_envs(Instrumentation.MODE_EVALUATE))}.values():
-            envs.action_space.seed(SEED)  # only used by the random-action path of the agent
-            envs.single_action_space.seed(SEED)
+            envs.action_space.seed(experiment.seed)  # only used by the random-action path of the agent
+            envs.single_action_space.seed(experiment.seed)
 
-    def evaluate_current(record_label:str, epoch:int) -> float:
-        """Evaluate the environments' current evaluation dataset, by sweep or by EVALUATE_STEPS steps."""
-        if not EVAL_SWEEP:
-            return do_evaluate(agent = agent, num_steps = EVALUATE_STEPS)
-        accuracy, image_correct = do_evaluate_sweep(agent, MAX_EPISODE_STEPS)
-        if results_file_images is not None:
-            bits = "".join(str(image_correct[i]) for i in range(len(image_correct)))
-            results_file_images.append_file(f"{record_label}, {epoch}, {bits}\n")
-        return accuracy
+    return StmRun(
+        experiment = experiment,
+        agent = agent,
+        exclude_classes_coarse = exclude_classes_coarse,
+        exclude_classes_fine = exclude_classes_fine,
+        dataset_evaluate = dataset_evaluate,
+        results_file = results_file,
+        results_file_val = results_file_val,
+        results_file_images = results_file_images,
+    )
 
-    if EXPERIMENT_TYPE == CifarArgs.EXPERIMENT_TYPE_PRETRAIN:
-        # Training rows record the coarse classes the training accuracy was measured over (D.15: the broader set).
-        coarse_classes_training = COARSE_CLASSES if args.pretrain_coarse_classes is None else args.pretrain_coarse_classes
 
-        dataset_validation_pretrain = None
-        if VAL_HOLDOUT > 0:
-            dataset_validation_pretrain = CifarEnv.create_dataset(
-                data_file_path=CIFAR_DATA_FILE_PATH,
-                mode=Instrumentation.MODE_EVALUATE,
-                shared_memory_names=None,
-                exclude_classes_coarse=exclude_classes_coarse,
-                exclude_classes_fine=exclude_classes_fine,
-                max_instances=None,
-                dataset_options=VALIDATION_DATASET_OPTIONS,
-            )
+def run_pretrain(run:StmRun):
+    """Train the STM on --fine-classes (1 2), evaluate on their test (and validation) images, save the STM."""
+    experiment = run.experiment
+    # Training rows record the coarse classes the training accuracy was measured over (D.15: the broader set).
+    coarse_classes_training = experiment.coarse_classes if experiment.pretrain_coarse_classes is None else experiment.pretrain_coarse_classes
 
-        for epoch in range(NUM_EPOCHS):
-            accuracy_training = do_training(agent = agent, num_steps = TRAINING_STEPS)
-            for results in (results_file, results_file_val):
-                if results is None:
-                    continue
-                results.append_line(
-                    coarse_classes = str(coarse_classes_training),
-                    fine_classes = str(FINE_CLASSES),
-                    mode = Instrumentation.MODE_TRAINING,
-                    epoch = epoch,
-                    accuracy = accuracy_training,            
-                )
+    group = EvaluationGroup(
+        name = str(experiment.fine_classes),
+        exclude_classes_fine = run.exclude_classes_fine,
+        dataset_test = run.dataset_evaluate,
+    )
+    if experiment.validation_dataset_options is not None:
+        group.dataset_validation = run.create_dataset(
+            mode = Instrumentation.MODE_EVALUATE,
+            exclude_classes_fine = run.exclude_classes_fine,
+            max_instances = None,
+            dataset_options = experiment.validation_dataset_options,
+        )
 
-            if EVALUATE_INTERVAL_EPOCHS > 1 and (epoch % EVALUATE_INTERVAL_EPOCHS != 0):
-                continue  # Option to skip evals during pretraining, useful with small batch size
+    evaluate_interval_epochs = experiment.evaluate_interval_epochs
+    for epoch in range(experiment.num_epochs):
+        accuracy_training = run.train_epoch()
+        run.append_training_line(experiment.fine_classes, epoch, accuracy_training, coarse_classes = coarse_classes_training)
 
-            if dataset_validation_pretrain is not None:
-                # The environments' evaluation dataset is switched between the test and validation sets.
-                CifarEnv.set_dataset_config_for_envs(
-                    envs = agent.get_envs(Instrumentation.MODE_EVALUATE),
-                    mode = Instrumentation.MODE_EVALUATE,
-                    shared_memory_names = shared_memory_names_evaluate,
-                    exclude_classes_fine = exclude_classes_fine,
-                    max_instances = None,
-                )
-            accuracy_evaluate = evaluate_current(f"test, {FINE_CLASSES}", epoch)
-            results_file.append_line(
-                coarse_classes = str(COARSE_CLASSES),
-                fine_classes = str(FINE_CLASSES),
+        if evaluate_interval_epochs > 1 and (epoch % evaluate_interval_epochs != 0):
+            continue  # Option to skip evals during pretraining, useful with small batch size
+
+        evaluate_groups(run, [group], epoch)
+
+    # Test save / load STM
+    run.save_stm(experiment.stm_checkpoint, "after pre-training")
+
+
+def load_stm(run:StmRun):
+    file_path = run.experiment.stm_checkpoint
+    logger.info(f"Reading STM from: {file_path}")
+    state_dict = torch.load(file_path, weights_only=True, map_location="cpu")  # checkpoints move between CUDA/MPS machines
+    run.agent.model.load_state_dict(state_dict)
+
+
+# Test (and validation) sets per group of fine classes: 1,2 together, as they were pre-trained, then 3, 4, 5.
+EXCLUDE_CLASSES_FINE_EVALUATE_BY_KEY = {
+    "12": Cifar100Dataset.get_fine_classes([    3,4,5,]),
+    "3":  Cifar100Dataset.get_fine_classes([1,2,  4,5,]),
+    "4":  Cifar100Dataset.get_fine_classes([1,2,3,  5,]),
+    "5":  Cifar100Dataset.get_fine_classes([1,2,3,4,  ]),
+}
+
+
+def create_evaluation_groups(run:StmRun) -> list[EvaluationGroup]:
+    """
+    Create shared copies of the evaluate dataset for fine classes 1-5, 1 and 2 grouped together as they were
+    pre-trained, and with the validation split, of the validation sets (held-out training images).
+    """
+    groups = []
+    for key, exclude_classes_fine_evaluate in EXCLUDE_CLASSES_FINE_EVALUATE_BY_KEY.items():
+        groups.append(EvaluationGroup(
+            name = str([key]),
+            exclude_classes_fine = exclude_classes_fine_evaluate,
+            dataset_test = run.create_dataset(
                 mode = Instrumentation.MODE_EVALUATE,
-                epoch = epoch,
-                accuracy = accuracy_evaluate,            
+                exclude_classes_fine = exclude_classes_fine_evaluate,
+                max_instances = None,  # For evaluate, always all
+            ),
+        ))
+    logger.info("Eval. individual fine classes using datasets:")
+    for group in groups:
+        logger.info(f"Fine classes: {group.name} --> shared memory: {group.dataset_test.shared_memory_names} size: {len(group.dataset_test)}")
+
+    if run.experiment.validation_dataset_options is not None:
+        for group in groups:
+            group.dataset_validation = run.create_dataset(
+                mode = Instrumentation.MODE_EVALUATE,
+                exclude_classes_fine = group.exclude_classes_fine,
+                max_instances = None,
+                dataset_options = run.experiment.validation_dataset_options,
             )
+            logger.info(f"Validation, fine classes: {group.name} --> size: {len(group.dataset_validation)}")
+    return groups
 
-            if dataset_validation_pretrain is not None:
-                CifarEnv.set_dataset_config_for_envs(
-                    envs = agent.get_envs(Instrumentation.MODE_EVALUATE),
-                    mode = Instrumentation.MODE_EVALUATE,
-                    shared_memory_names = dataset_validation_pretrain.get_shared_memory_names(),
-                    exclude_classes_fine = exclude_classes_fine,
-                    max_instances = None,
-                    dataset_options = VALIDATION_DATASET_OPTIONS,
-                )
-                accuracy_validation = evaluate_current(f"validation, {FINE_CLASSES}", epoch)
-                results_file_val.append_line(
-                    coarse_classes = str(COARSE_CLASSES),
-                    fine_classes = str(FINE_CLASSES),
-                    mode = Instrumentation.MODE_EVALUATE,
-                    epoch = epoch,
-                    accuracy = accuracy_validation,
-                )
 
-        # Test save / load STM
-        logger.info(f"Writing STM to: {STM_PRETRAIN_FILE_PATH}")
-        os.makedirs(os.path.dirname(os.path.abspath(STM_PRETRAIN_FILE_PATH)), exist_ok=True)
-        torch.save(agent.model.state_dict(), STM_PRETRAIN_FILE_PATH)
-        return  # End of this experiment type
-    else:
-        logger.info(f"Reading STM from: {STM_PRETRAIN_FILE_PATH}")
-        state_dict = torch.load(STM_PRETRAIN_FILE_PATH, weights_only=True, map_location="cpu")  # checkpoints move between CUDA/MPS machines
-        agent.model.load_state_dict(state_dict)
+def run_evaluate(run:StmRun, groups:list[EvaluationGroup]):
+    """Evaluate the loaded STM checkpoint on the four test (and validation) sets once, no training."""
+    evaluate_groups(run, groups, epoch=0)
 
-    # Utilities for other experiment types
-    # Create shared copies of evaluate dataset for individual fine classes 1-5. 1 and 2 grouped together as were pretrained.
-    # dataset_options: VALIDATION_DATASET_OPTIONS for the validation sets (held-out training images), else test sets.
-    def create_evaluate_individual_fine_class_dataset(exclude_classes_fine_evaluate, dataset_options=None):
-        evaluate_dataset = CifarEnv.create_dataset(
-            data_file_path = CIFAR_DATA_FILE_PATH,
-            mode = Instrumentation.MODE_EVALUATE,
-            shared_memory_names = None,
-            exclude_classes_coarse = exclude_classes_coarse,
-            exclude_classes_fine = exclude_classes_fine_evaluate,
-            max_instances = None,  # For evaluate, always all
-            dataset_options = dataset_options,
-        )
-        return evaluate_dataset
 
-    def do_evaluate_individual_fine_class(
-        epoch:int,
-        evaluate_individual_datasets,
-        evaluate_individual_dataset_key:str,
-        exclude_classes_fine_evaluate,
-        results = results_file,
-        dataset_options = None,
-    ):
-        dataset_evaluate = evaluate_individual_datasets[evaluate_individual_dataset_key]
-        shared_memory_names_evaluate = dataset_evaluate.get_shared_memory_names()
+def run_few_shot(run:StmRun, groups:list[EvaluationGroup]):
+    """
+    Train on --max-instances images per coarse class of one fine class, 3, 4 or 5 (single-stream: all of them at
+    batch 1), and evaluate all five, reported separately.
+    """
+    experiment = run.experiment
+    FINE_CLASSES = experiment.fine_classes
+    exclude_classes_fine_few_shot_training = None
+    if FINE_CLASSES == [3]:
+        exclude_classes_fine_few_shot_training = Cifar100Dataset.get_fine_classes([1,2, 4,5,])
+    elif FINE_CLASSES == [4]:
+        exclude_classes_fine_few_shot_training = Cifar100Dataset.get_fine_classes([1,2,3, 5,])
+    elif FINE_CLASSES == [5]:
+        exclude_classes_fine_few_shot_training = Cifar100Dataset.get_fine_classes([1,2,3,4, ])
+    run.train_on(exclude_classes_fine_few_shot_training, "Few-shot training set")
 
-        CifarEnv.set_dataset_config_for_envs(
-            envs = agent.get_envs(Instrumentation.MODE_EVALUATE),
-            mode = Instrumentation.MODE_EVALUATE,
-            shared_memory_names = shared_memory_names_evaluate,
-            exclude_classes_fine = exclude_classes_fine_evaluate,
-            max_instances = None,  # All instances
-            dataset_options = dataset_options,
-        )
-        part = "test" if dataset_options is None else "validation"
-        accuracy_evaluate = evaluate_current(f"{part}, ['{evaluate_individual_dataset_key}']", epoch)
-        results.append_line(
-            coarse_classes = str(COARSE_CLASSES),
-            fine_classes = str([evaluate_individual_dataset_key]),
-            mode = Instrumentation.MODE_EVALUATE,
-            epoch = epoch,
-            accuracy = accuracy_evaluate,            
-        )        
+    num_epochs = experiment.num_epochs
+    evaluate_interval_epochs = experiment.evaluate_interval_epochs
+    for epoch in range(num_epochs):
+        accuracy_training = run.train_epoch()
+        run.append_training_line(FINE_CLASSES, epoch, accuracy_training)
 
-    # Test (and validation) sets per group of fine classes: 1,2 together, as they were pre-trained, then 3, 4, 5.
-    exclude_classes_fine_evaluate_by_key = {
-        "12": Cifar100Dataset.get_fine_classes([    3,4,5,]),
-        "3":  Cifar100Dataset.get_fine_classes([1,2,  4,5,]),
-        "4":  Cifar100Dataset.get_fine_classes([1,2,3,  5,]),
-        "5":  Cifar100Dataset.get_fine_classes([1,2,3,4,  ]),
+        is_last_epoch = (epoch == num_epochs - 1)
+        if evaluate_interval_epochs > 1 and (epoch % evaluate_interval_epochs != 0) and not is_last_epoch:
+            continue  # Option to skip evals during pretraining, useful with small batch size
+
+        # Always evaluate on the final epoch, so the last measured point sits at the full
+        # training budget rather than at the last multiple of evaluate_interval_epochs.
+        evaluate_groups(run, groups, epoch)
+
+    if experiment.stm_checkpoint_out is not None:
+        run.save_stm(experiment.stm_checkpoint_out, "after few-shot training")
+
+
+def run_continual(run:StmRun, groups:list[EvaluationGroup]):
+    """Train on fine classes 3, 4, 5 in the order of --fine-classes, num_epochs each, evaluating every epoch."""
+    experiment = run.experiment
+    continual_exclusions = {
+        3: Cifar100Dataset.get_fine_classes([1,2, 4,5,]),
+        4: Cifar100Dataset.get_fine_classes([1,2,3, 5,]),
+        5: Cifar100Dataset.get_fine_classes([1,2,3,4, ]),
     }
 
-    evaluate_individual_datasets = {}
-    for key, exclude_classes_fine_evaluate in exclude_classes_fine_evaluate_by_key.items():
-        evaluate_individual_datasets[key] = create_evaluate_individual_fine_class_dataset(
-            exclude_classes_fine_evaluate = exclude_classes_fine_evaluate,
-        )
-    logger.info("Eval. individual fine classes using datasets:")
-    for key, value in evaluate_individual_datasets.items():
-        logger.info(f"Fine classes: {key} --> shared memory: {value.shared_memory_names} size: {len(value)}")
+    start_epoch = 0
+    for fine_class in experiment.fine_classes:
+        logger.info(f"Training fine class {fine_class}")
+        run.train_on(continual_exclusions[fine_class], f"Continual training set, fine class {[fine_class]}")
 
-    validation_individual_datasets = {}
-    if VAL_HOLDOUT > 0:
-        for key, exclude_classes_fine_evaluate in exclude_classes_fine_evaluate_by_key.items():
-            validation_individual_datasets[key] = create_evaluate_individual_fine_class_dataset(
-                exclude_classes_fine_evaluate = exclude_classes_fine_evaluate,
-                dataset_options = VALIDATION_DATASET_OPTIONS,
-            )
-        for key, value in validation_individual_datasets.items():
-            logger.info(f"Validation, fine classes: {key} --> size: {len(value)}")
+        for epoch in range(experiment.num_epochs):
+            accuracy_training = run.train_epoch()
+            run.append_training_line([fine_class], epoch, accuracy_training)
+            evaluate_groups(run, groups, start_epoch + epoch)
+        start_epoch += experiment.num_epochs
 
-    def do_evaluate_individual_fine_classes(epoch:int):
-        for key, exclude_classes_fine_evaluate in exclude_classes_fine_evaluate_by_key.items():
-            logger.info(f"Evaluating @ epoch {epoch} fine classes {key}...")
-            do_evaluate_individual_fine_class(
-                epoch = epoch,
-                evaluate_individual_datasets = evaluate_individual_datasets, 
-                evaluate_individual_dataset_key = key,
-                exclude_classes_fine_evaluate = exclude_classes_fine_evaluate,
-            )
-        for key, exclude_classes_fine_evaluate in exclude_classes_fine_evaluate_by_key.items():
-            if key not in validation_individual_datasets:
-                continue
-            logger.info(f"Validating @ epoch {epoch} fine classes {key}...")
-            do_evaluate_individual_fine_class(
-                epoch = epoch,
-                evaluate_individual_datasets = validation_individual_datasets,
-                evaluate_individual_dataset_key = key,
-                exclude_classes_fine_evaluate = exclude_classes_fine_evaluate,
-                results = results_file_val,
-                dataset_options = VALIDATION_DATASET_OPTIONS,
-            )
+        if experiment.stm_checkpoint_out is not None:
+            run.save_stm(f"{experiment.stm_checkpoint_out}_phase{fine_class}.pth", f"after fine class {fine_class}")
 
-    def append_training_line(fine_classes:list[int], epoch:int, accuracy:float):
-        # The training line goes into the validation file too, so both files have the head script's layout.
-        for results in (results_file, results_file_val):
-            if results is None:
-                continue
-            results.append_line(
-                coarse_classes = str(COARSE_CLASSES),
-                fine_classes = str(fine_classes),
-                mode = Instrumentation.MODE_TRAINING,
-                epoch = epoch,
-                accuracy = accuracy,
-            )
+        steps_complete_training = run.agent.instrumentation.get_steps(mode = Instrumentation.MODE_TRAINING)
+        steps_complete_evaluate = run.agent.instrumentation.get_steps(mode = Instrumentation.MODE_EVALUATE)    
+        logger.info(f"Fine class {fine_class} complete @ {steps_complete_training} (training) / {steps_complete_evaluate} (evaluate)")
 
-    if EXPERIMENT_TYPE == CifarArgs.EXPERIMENT_TYPE_EVALUATE:
-        # Evaluate the loaded STM checkpoint on the four test sets once, no training.
-        do_evaluate_individual_fine_classes(epoch=0)
+
+def main():
+    args = CifarArgs.parse_stm_args()
+    experiment = StmExperimentConfig.from_args(args)
+
+    if experiment.seed is not None:
+        # Model init and policy sampling (torch), env image sampling and dataset subsets (numpy global RNG,
+        # envs are synchronous so they share it), python's random for completeness.
+        seed_all(experiment.seed)
+
+    logger.info(f"Exp.:{experiment.experiment_type} Fine classes:{experiment.fine_classes} Batch size:{experiment.batch_size} max. instances:{experiment.max_instances} LR: {experiment.learning_rate} Seed: {experiment.seed}")
+    # Validation split (--val-holdout): every training set holds out the same images per fine class as the head
+    # script, and the held-out images are evaluated alongside the test sets.
+    # With --max-instances and --seed, the subset is the one the head and LTM-only scripts draw for that seed
+    # (Cifar100Dataset.get_subset_mask), and environments re-derive it identically; without a seed, the old draw.
+    if experiment.training_dataset_options.subset_seed is not None:
+        logger.info(f"Subset of {experiment.max_instances} images per coarse class drawn with seed {experiment.seed}")
+    if experiment.validation_dataset_options is not None:
+        logger.info(f"Validation split: {experiment.val_holdout} images per fine class held out, split seed {experiment.split_seed}")
+    logger.info(f"LTM checkpoint: {experiment.ltm_checkpoint} STM checkpoint: {experiment.stm_checkpoint} actor training: {experiment.actor_training}")
+    logger.info(f"Evaluation: {'one pass over every image' if experiment.eval_sweep else f'{experiment.evaluate_steps} steps'}, "
+                f"{experiment.evaluate_batch_size} environments")
+
+    run = create_run(experiment)
+
+    EXPERIMENT_TYPE = experiment.experiment_type
+    if EXPERIMENT_TYPE == CifarArgs.EXPERIMENT_TYPE_PRETRAIN:
+        run_pretrain(run)
         return
 
-    if EXPERIMENT_TYPE == CifarArgs.EXPERIMENT_TYPE_FEW_SHOT:
-
-        # Vary fine classes for training.
-        # Train: X instances of 3, 4, or 5.
-        # Evaluate: All 5, reported separately.
-        # Over minibatches to saturation
-
-        exclude_classes_fine_few_shot_training = None
-        if FINE_CLASSES == [3]:
-            exclude_classes_fine_few_shot_training = Cifar100Dataset.get_fine_classes([1,2, 4,5,])
-        elif FINE_CLASSES == [4]:
-            exclude_classes_fine_few_shot_training = Cifar100Dataset.get_fine_classes([1,2,3, 5,])
-        elif FINE_CLASSES == [5]:
-            exclude_classes_fine_few_shot_training = Cifar100Dataset.get_fine_classes([1,2,3,4, ])
-
-        dataset_few_shot_training = CifarEnv.create_dataset(
-            data_file_path = CIFAR_DATA_FILE_PATH,
-            mode = Instrumentation.MODE_TRAINING,
-            shared_memory_names = None,
-            exclude_classes_coarse = exclude_classes_coarse,
-            exclude_classes_fine = exclude_classes_fine_few_shot_training,
-            max_instances = MAX_INSTANCES,
-            dataset_options = TRAINING_DATASET_OPTIONS,
-        )
-        shared_memory_names_few_shot_training = dataset_few_shot_training.get_shared_memory_names()
-        logger.info(f"Few-shot training set: {len(dataset_few_shot_training)} images")
-
-        CifarEnv.set_dataset_config_for_envs(
-            envs = agent.get_envs(Instrumentation.MODE_TRAINING),
-            mode = Instrumentation.MODE_TRAINING,
-            shared_memory_names = shared_memory_names_few_shot_training,
-            exclude_classes_fine = exclude_classes_fine_few_shot_training,
-            max_instances = MAX_INSTANCES,
-            dataset_options = TRAINING_DATASET_OPTIONS,
-        )
-
-        for epoch in range(NUM_EPOCHS):
-            accuracy_training = do_training(agent = agent, num_steps = TRAINING_STEPS)
-            append_training_line(FINE_CLASSES, epoch, accuracy_training)
-
-            is_last_epoch = (epoch == NUM_EPOCHS - 1)
-            if EVALUATE_INTERVAL_EPOCHS > 1 and (epoch % EVALUATE_INTERVAL_EPOCHS != 0) and not is_last_epoch:
-                continue  # Option to skip evals during pretraining, useful with small batch size
-
-            # Always evaluate on the final epoch, so the last measured point sits at the full
-            # training budget rather than at the last multiple of EVALUATE_INTERVAL_EPOCHS.
-            do_evaluate_individual_fine_classes(epoch=epoch)
-
-        if args.stm_checkpoint_out is not None:
-            os.makedirs(os.path.dirname(os.path.abspath(args.stm_checkpoint_out)), exist_ok=True)
-            torch.save(agent.model.state_dict(), args.stm_checkpoint_out)
-            logger.info(f"Wrote STM after few-shot training to: {args.stm_checkpoint_out}")
-
-    def do_continual_learning(class_fine:list[int], exclude_classes_fine_continual, start_epoch:int):
-        dataset_training_continual = CifarEnv.create_dataset(
-            data_file_path = CIFAR_DATA_FILE_PATH,
-            mode = Instrumentation.MODE_TRAINING,
-            shared_memory_names = None,
-            exclude_classes_coarse = exclude_classes_coarse,
-            exclude_classes_fine = exclude_classes_fine_continual,
-            max_instances = MAX_INSTANCES,
-            dataset_options = TRAINING_DATASET_OPTIONS,
-        )
-        shared_memory_names_continual = dataset_training_continual.get_shared_memory_names()
-        logger.info(f"Continual training set, fine class {class_fine}: {len(dataset_training_continual)} images")
-
-        CifarEnv.set_dataset_config_for_envs(
-            envs = agent.get_envs(Instrumentation.MODE_TRAINING),
-            mode = Instrumentation.MODE_TRAINING,
-            shared_memory_names = shared_memory_names_continual,
-            exclude_classes_fine = exclude_classes_fine_continual,
-            max_instances = MAX_INSTANCES,  # as dataset_training_continual (None: all); was None, which failed
-            dataset_options = TRAINING_DATASET_OPTIONS,
-        )
-
-        for epoch in range(NUM_EPOCHS):
-            accuracy_training = do_training(agent = agent, num_steps = TRAINING_STEPS)
-            append_training_line(class_fine, epoch, accuracy_training)
-
-            do_evaluate_individual_fine_classes(
-                epoch = start_epoch + epoch
-            )
-
-    if EXPERIMENT_TYPE == CifarArgs.EXPERIMENT_TYPE_CONTINUAL:
-        continual_exclusions = {
-            3: Cifar100Dataset.get_fine_classes([1,2, 4,5,]),
-            4: Cifar100Dataset.get_fine_classes([1,2,3, 5,]),
-            5: Cifar100Dataset.get_fine_classes([1,2,3,4, ]),
-        }
-
-        start_epoch = 0
-        for fine_class in FINE_CLASSES:
-            logger.info(f"Training fine class {fine_class}")
-            exclude_classes_fine_continual = continual_exclusions[fine_class]
-
-            do_continual_learning([fine_class], exclude_classes_fine_continual, start_epoch)
-            start_epoch += NUM_EPOCHS
-
-            if args.stm_checkpoint_out is not None:
-                phase_path = f"{args.stm_checkpoint_out}_phase{fine_class}.pth"
-                os.makedirs(os.path.dirname(os.path.abspath(phase_path)), exist_ok=True)
-                torch.save(agent.model.state_dict(), phase_path)
-                logger.info(f"Wrote STM after fine class {fine_class} to: {phase_path}")
-
-            steps_complete_training = agent.instrumentation.get_steps(mode = Instrumentation.MODE_TRAINING)
-            steps_complete_evaluate = agent.instrumentation.get_steps(mode = Instrumentation.MODE_EVALUATE)    
-            logger.info(f"Fine class {fine_class} complete @ {steps_complete_training} (training) / {steps_complete_evaluate} (evaluate)")
+    load_stm(run)
+    groups = create_evaluation_groups(run)
+    if EXPERIMENT_TYPE == CifarArgs.EXPERIMENT_TYPE_EVALUATE:
+        run_evaluate(run, groups)
+    elif EXPERIMENT_TYPE == CifarArgs.EXPERIMENT_TYPE_FEW_SHOT:
+        run_few_shot(run, groups)
+    elif EXPERIMENT_TYPE == CifarArgs.EXPERIMENT_TYPE_CONTINUAL:
+        run_continual(run, groups)
+    # streaming: no code path of its own (single-stream runs use few-shot at batch 1)
 
 if __name__ == "__main__":
     main()

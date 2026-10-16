@@ -22,6 +22,45 @@ class CifarSharedMemoryNames:
     labels_fine: str | None = None
 
 
+@dataclass(frozen=True)
+class CifarDatasetOptions:
+    """
+    Cifar100Dataset options beyond the class filter and max_instances: the validation split (--val-holdout,
+    --split-seed), the seeded subset (--max-instances with --seed) and which file to read. An environment attaching to
+    a dataset's shared memory must use the same options as the dataset that created it. The defaults change nothing.
+    """
+    training:bool|None = None  # read the training file; None = by mode (training mode reads it, evaluate mode not)
+    val_holdout:int = 0
+    split_seed:int = 0
+    split_part:str = "train"
+    subset_seed:int|None = None
+
+    @staticmethod
+    def for_training(max_instances:int|None, seed:int|None, val_holdout:int, split_seed:int) -> "CifarDatasetOptions":
+        """The training sets: the images left by the validation split, subsampled with the seed under --max-instances."""
+        return CifarDatasetOptions(
+            **Cifar100Dataset.get_subset_options(max_instances, seed),
+            **Cifar100Dataset.get_split_options(val_holdout, split_seed),
+        )
+
+    @staticmethod
+    def for_validation(val_holdout:int, split_seed:int) -> "CifarDatasetOptions|None":
+        """The validation sets: the held-out images, read from the training file in any mode. None without a split."""
+        split_options = Cifar100Dataset.get_split_options(val_holdout, split_seed)
+        if not split_options:
+            return None
+        return CifarDatasetOptions(training=True, split_part="validation", **split_options)
+
+    def get_constructor_options(self) -> dict:
+        """Cifar100Dataset keyword arguments, except training."""
+        return {
+            "val_holdout": self.val_holdout,
+            "split_seed": self.split_seed,
+            "split_part": self.split_part,
+            "subset_seed": self.subset_seed,
+        }
+
+
 class Cifar100Dataset(Dataset):
     """
     Dataset for processing the Cifar-100 dataset, which is described here:
