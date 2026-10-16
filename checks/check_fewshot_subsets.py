@@ -223,7 +223,8 @@ def main():
 
                         ltm_argv = ["--experiment-type", "few-shot", "--fine-classes", str(args.fine_class),
                                     "--coarse-classes", "0", "1", "--max-instances", str(n), "--seed", str(seed),
-                                    "--run-root", os.path.join(run_root, f"ltm_h{holdout}_s{seed}_n{n}")]
+                                    "--run-root", os.path.join(run_root, f"ltm_h{holdout}_s{seed}_n{n}"),
+                                    "--ltm-checkpoint", args.ltm_checkpoint]
                         if holdout:
                             ltm_argv += ["--val-holdout", str(holdout)]
                         datasets = run_ltm(ltm_argv)
