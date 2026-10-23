@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from single_stream import datasets, metrics
-from single_stream.models import LTMOnly, ReplayLTM, build_net
+from single_stream.models import ContinualBackprop, LTMOnly, ReplayLTM, build_net
 from single_stream.stream import ClusteredStream, run_lengths
 
 
@@ -41,6 +41,9 @@ def parse_args(argv=None):
     p.add_argument("--momentum", type=float, default=0.0)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--steps", type=int, default=1, help="gradient steps per stream step")
+    p.add_argument("--cbp-rate", type=float, default=0.0, help="continual backprop replacement rate; 0 = off")
+    p.add_argument("--cbp-decay", type=float, default=0.99)
+    p.add_argument("--cbp-maturity", type=int, default=100)
     p.add_argument("--replay-capacity", type=int, default=1000)
     p.add_argument("--replay-batch", type=int, default=10)
     p.add_argument("--n-log-checkpoints", type=int, default=12)
@@ -55,7 +58,12 @@ def parse_args(argv=None):
 def build_model(args, train):
     widths = [int(w) for w in args.widths.split(",")]
     net = build_net(args.net, train.x.shape[1], train.num_classes, widths, args.blocks)
-    common = dict(lr=args.lr, steps=args.steps, momentum=args.momentum, weight_decay=args.weight_decay)
+    cbp = None
+    if args.cbp_rate > 0:
+        if args.net != "mlp":
+            raise ValueError("continual backprop is implemented for --net mlp only")
+        cbp = ContinualBackprop(net, args.cbp_rate, args.cbp_decay, args.cbp_maturity)
+    common = dict(lr=args.lr, steps=args.steps, momentum=args.momentum, weight_decay=args.weight_decay, cbp=cbp)
     if args.model == "ltm":
         return LTMOnly(net, **common)
     return ReplayLTM(net, capacity=args.replay_capacity, replay_batch=args.replay_batch,
@@ -170,6 +178,8 @@ def main(argv=None):
     with open(os.path.join(args.out, "checkpoints.jsonl")) as f:
         records = [json.loads(line) for line in f]
     summary = metrics.summarize(records)
+    if getattr(model, "cbp", None) is not None:
+        summary["cbp_replaced_units"] = model.cbp.replaced
     summary.update({"exposures": t, "memory_bytes": model.memory_bytes(), "train_time": train_time,
                     "eval_time": eval_time, "ms_per_step": 1000 * train_time / max(t // b, 1)})
     with open(os.path.join(args.out, "summary.json"), "w") as f:

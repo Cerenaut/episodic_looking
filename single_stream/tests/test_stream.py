@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from single_stream import metrics
-from single_stream.models import LTMOnly, MLP, ReplayLTM
+from single_stream.models import ContinualBackprop, LTMOnly, MLP, ReplayLTM
 from single_stream.stream import ClusteredStream, run_lengths
 
 
@@ -116,6 +116,36 @@ class TestModels(unittest.TestCase):
         self.assertEqual(model.seen, 100)
         params = sum(p.numel() * 4 for p in model.net.parameters())
         self.assertEqual(model.memory_bytes(), params + 10 * 4 * 4 + 10 * 8)
+
+
+    def test_continual_backprop_replacement(self):
+        torch.manual_seed(0)
+        net = MLP(6, [50, 50], 3)
+        cbp = ContinualBackprop(net, rate=0.01, decay=0.9, maturity=10)
+        model = LTMOnly(net, lr=0.01, cbp=cbp)
+        x = torch.randn(64, 6)
+        before = model.predict(x)
+        for i in range(10):
+            model.observe(x[i:i + 1], torch.tensor([i % 3]))
+        self.assertEqual(cbp.replaced, 0)  # nothing is mature yet
+        for i in range(400):
+            model.observe(x[i % 64:i % 64 + 1], torch.tensor([i % 3]))
+        # rate 0.01 x at most 100 eligible units (2 layers of 50) x ~390 mature steps: at most ~390, fewer
+        # because replaced units are immature again for 10 steps
+        self.assertGreater(cbp.replaced, 300)
+        self.assertLessEqual(cbp.replaced, 400)
+        self.assertTrue(torch.all(cbp.age[0] <= 410))
+
+    def test_replacement_preserves_function_approximately(self):
+        # replacing a unit zeroes its outgoing weights and folds its mean contribution into the next bias
+        torch.manual_seed(0)
+        net = MLP(4, [8], 2)
+        cbp = ContinualBackprop(net, rate=1.0, decay=0.0, maturity=0)
+        x = torch.randn(1, 4)
+        y0 = net(x).detach()
+        cbp.step()  # decay 0: utility = current contribution, mean = current activation; replaces 8 units
+        y1 = net(x).detach()
+        torch.testing.assert_close(y0, y1, atol=1e-5, rtol=0)
 
 
 if __name__ == "__main__":

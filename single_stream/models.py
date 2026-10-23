@@ -41,9 +41,77 @@ class MLP(nn.Module):
             nn.init.zeros_(layer.bias)
 
     def forward(self, x):
+        self.acts = []
         for layer in self.hidden:
             x = F.relu(layer(x))
+            self.acts.append(x.detach())
         return self.out(x)
+
+
+class ContinualBackprop:
+    """
+    Continual backprop (Dohare et al. 2024, Nature; generate-and-test on the hidden units of an MLP). After each
+    optimizer step: update each hidden unit's contribution utility, a running average (decay `decay`) of
+    |activation| x sum of |outgoing weights|, and its running mean activation; units older than `maturity` steps
+    are eligible; a fractional count accumulates at `rate` x (number eligible) per step, and when it reaches 1 the
+    eligible units with the lowest bias-corrected utility are replaced: incoming weights re-initialised (Kaiming
+    normal, zero bias), the unit's mean contribution folded into the next layer's bias, outgoing weights zeroed,
+    utility and age reset. Phase-blind: runs every step, independent of the stream's structure.
+    """
+
+    def __init__(self, net, rate=1e-4, decay=0.99, maturity=100):
+        self.net = net
+        self.rate = rate
+        self.decay = decay
+        self.maturity = maturity
+        sizes = [layer.out_features for layer in net.hidden]
+        self.util = [torch.zeros(n) for n in sizes]
+        self.mean_act = [torch.zeros(n) for n in sizes]
+        self.age = [torch.zeros(n, dtype=torch.long) for n in sizes]
+        self.pending = [0.0 for _ in sizes]
+        self.replaced = 0
+
+    def _next_layer(self, i):
+        layers = list(self.net.hidden) + [self.net.out]
+        return layers[i + 1]
+
+    @torch.no_grad()
+    def step(self):
+        d = self.decay
+        for i, layer in enumerate(self.net.hidden):
+            nxt = self._next_layer(i)
+            act = self.net.acts[i].mean(0)
+            contribution = act.abs() * nxt.weight.abs().sum(0)
+            self.util[i].mul_(d).add_((1 - d) * contribution)
+            self.mean_act[i].mul_(d).add_((1 - d) * act)
+            self.age[i] += 1
+
+            eligible = self.age[i] > self.maturity
+            n_eligible = int(eligible.sum())
+            if n_eligible == 0:
+                continue
+            self.pending[i] += self.rate * n_eligible
+            if self.pending[i] < 1:
+                continue
+            k = min(int(self.pending[i]), n_eligible)
+            self.pending[i] -= k
+
+            correction = 1 - d ** self.age[i].double()
+            corrected = (self.util[i] / correction).float()
+            corrected[~eligible] = float("inf")
+            units = torch.topk(corrected, k, largest=False).indices
+
+            mean = (self.mean_act[i][units] / correction[units].float())
+            nxt.bias += nxt.weight[:, units] @ mean
+            nxt.weight[:, units] = 0.0
+            new_w = torch.empty(k, layer.in_features)
+            nn.init.kaiming_normal_(new_w, nonlinearity="relu")
+            layer.weight[units] = new_w
+            layer.bias[units] = 0.0
+            self.util[i][units] = 0.0
+            self.mean_act[i][units] = 0.0
+            self.age[i][units] = 0
+            self.replaced += k
 
 
 class ResidualMLP(nn.Module):
@@ -77,10 +145,18 @@ def build_net(name, input_size, num_classes, widths=(2000, 2000, 2000), blocks=3
 class LTMOnly(StreamModel):
     """The LTM trained directly on the stream with SGD, `steps` gradient steps per exposure."""
 
-    def __init__(self, net, lr, steps=1, momentum=0.0, weight_decay=0.0):
+    def __init__(self, net, lr, steps=1, momentum=0.0, weight_decay=0.0, cbp=None):
         self.net = net
         self.steps = steps
         self.opt = torch.optim.SGD(net.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+        self.cbp = cbp  # optional ContinualBackprop, applied after every optimizer step
+
+    def _step(self, loss):
+        self.opt.zero_grad(set_to_none=True)
+        loss.backward()
+        self.opt.step()
+        if self.cbp is not None:
+            self.cbp.step()
 
     def _train_batch(self, x, y):
         pred = None
@@ -89,10 +165,7 @@ class LTMOnly(StreamModel):
             logits = self.net(x)
             if pred is None:
                 pred = logits.detach().argmax(1)
-            loss = F.cross_entropy(logits, y)
-            self.opt.zero_grad(set_to_none=True)
-            loss.backward()
-            self.opt.step()
+            self._step(F.cross_entropy(logits, y))
         return pred
 
     def observe(self, x, y):
@@ -114,8 +187,8 @@ class ReplayLTM(LTMOnly):
     """
 
     def __init__(self, net, lr, capacity, replay_batch, input_shape, steps=1, momentum=0.0, weight_decay=0.0,
-                 seed=0):
-        super().__init__(net, lr, steps, momentum, weight_decay)
+                 seed=0, cbp=None):
+        super().__init__(net, lr, steps, momentum, weight_decay, cbp)
         self.capacity = capacity
         self.replay_batch = replay_batch
         self.buf_x = torch.zeros((capacity,) + tuple(input_shape))
@@ -136,10 +209,7 @@ class ReplayLTM(LTMOnly):
             logits = self.net(bx)
             if pred is None:
                 pred = logits[:len(x)].detach().argmax(1)
-            loss = F.cross_entropy(logits, by)
-            self.opt.zero_grad(set_to_none=True)
-            loss.backward()
-            self.opt.step()
+            self._step(F.cross_entropy(logits, by))
         self._reservoir_add(x, y)
         return pred
 
