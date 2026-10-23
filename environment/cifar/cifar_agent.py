@@ -258,6 +258,23 @@ class CifarAgent(EpisodicAgent):
         self.obs_1_tensor_cache = (obs_2_tensor, obs_2_image, self.bias)
 
     def observation_1_to_tensor(self) -> torch.Tensor:
+        obs_1_tensor = self.observation_1_to_tensor_cached()
+        # STM input statistics (conditioning): every observation enters the history once, as some step's obs_1
+        if self.instrumentation.is_mode_training():
+            self.model.update_input_statistics(
+                observation = obs_1_tensor,
+                is_first = self.observation_history.is_empty(),
+            )
+        return obs_1_tensor
+
+    def observation_history_to_tensor(self, observation_history) -> torch.Tensor:
+        history_vector = observation_history.get_tensor_vector()
+        if self.model.is_first_observation_input():
+            # The mask key "first" reads the episode's first observation, which the history drops at the last step
+            return torch.cat([history_vector, observation_history.get_first()], dim=1)
+        return history_vector
+
+    def observation_1_to_tensor_cached(self) -> torch.Tensor:
         cache = self.obs_1_tensor_cache
         self.obs_1_tensor_cache = None  # single use
         if cache is not None:

@@ -13,8 +13,13 @@ resources:
   disk_size: 60
 workdir: ~/Dev/episodic_looking
 file_mounts:
-  # The repo lands at ~/sky_workdir, so ../ is ~ (do not symlink the repo: section 12). CIFAR-100 is NOT mounted: the
-  # setup fetches it on the pod and checks it against the Mac's copy (sky/v2_pod_setup.sh).
+  # The repo lands at ~/sky_workdir, so ../ is ~ (do not symlink the repo: section 12). CIFAR-100 is mounted from the
+  # launching machine's copy (~180 MB; = CIFAR_SRC of sky/v2_launch.sh): the official server served ~90 KB/s on 13 Oct
+  # 2026, under the setup's 100 KB/s floor, and the fetch failed. The setup still checks each file's sha256 against
+  # the launcher's (sky/v2_pod_setup.sh) and fetches only if the mounted copy is absent or does not match.
+  ~/cifar-100-python/train: ~/Dev/datasets/cifar-100-python/train
+  ~/cifar-100-python/test: ~/Dev/datasets/cifar-100-python/test
+  ~/cifar-100-python/meta: ~/Dev/datasets/cifar-100-python/meta
   ~/cifar_100_pretrain/cifar_100_subclasses_12_e13.pth: ~/Dev/cifar_100_pretrain/cifar_100_subclasses_12_e13.pth
   # The e40 LTM (45 MB) only for a pod with an LTM=e40 unit: sky/v2_launch.sh uncomments the next line then.
   #E40 ~/cifar_100_pretrain/cifar_100_subclasses_12_e40.pth: ~/Dev/cifar_100_pretrain/cifar_100_subclasses_12_e40.pth

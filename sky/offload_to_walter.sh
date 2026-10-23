@@ -70,7 +70,7 @@ MANIFEST=${MANIFEST:-$REPO/runs_local/offload_manifest.tsv}
 say() { echo "[$(date '+%F %T')] $*"; }
 die() { say "OFFLOAD REFUSED: $*" >&2; exit 2; }
 sha256() { shasum -a 256 < "$1" | cut -d' ' -f1; }
-fsize() { stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null; }
+fsize() { stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null; }  # GNU first, as mtime in v2_lib.sh
 is_hex64() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
 
 CM="$HOME/.ssh/offload-%C"   # connection sharing: one ssh login for the whole run

@@ -1,0 +1,7 @@
+runs_v2_fs_rl/rl_lr0.1|LR=0.1|pretrain rl "0 1" 9|runs_v2_fs_rl/rl_lr0.1/pretrain/rl/pair0_1/seed9|
+runs_v2_fs_rl/rl_lr0.1|LR=0.1 EPOCHS=24|fewshot rl "0 1" 9 3 4|runs_v2_fs_rl/rl_lr0.1/fewshot/rl/pair0_1/seed9/fine3_n4|
+runs_v2_fs_rl/rl_lr0.1|LR=0.1 EPOCHS=24|fewshot rl "0 1" 9 4 4|runs_v2_fs_rl/rl_lr0.1/fewshot/rl/pair0_1/seed9/fine4_n4|
+runs_v2_fs_rl/rl_lr0.1|LR=0.1 EPOCHS=24|fewshot rl "0 1" 9 5 4|runs_v2_fs_rl/rl_lr0.1/fewshot/rl/pair0_1/seed9/fine5_n4|
+runs_v2_fs_rl/rl_lr0.1|LR=0.1 EPOCHS=1|fewshot rl "0 1" 9 3 1|runs_v2_fs_rl/rl_lr0.1/fewshot/rl/pair0_1/seed9/fine3_n1|
+runs_v2_fs_rl/rl_lr0.1|LR=0.1 EPOCHS=1|fewshot rl "0 1" 9 4 1|runs_v2_fs_rl/rl_lr0.1/fewshot/rl/pair0_1/seed9/fine4_n1|
+runs_v2_fs_rl/rl_lr0.1|LR=0.1 EPOCHS=1|fewshot rl "0 1" 9 5 1|runs_v2_fs_rl/rl_lr0.1/fewshot/rl/pair0_1/seed9/fine5_n1|

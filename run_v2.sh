@@ -76,7 +76,7 @@ STM_CKPT=$PRETRAIN_DIR/stm_pretrain.pth
 
 case "$MODEL" in
   rl|actor) KIND=stm ;;
-  linear|ncm|flymodel|sdmlp) KIND=head ;;
+  linear|ncm|flymodel|sdmlp|stm) KIND=head ;;  # stm: the supervised STM head (cifar_main_head_baselines.py --method stm)
   ltm) KIND=ltm ;;
   *) echo "unknown model: $MODEL" >&2; exit 2 ;;
 esac

@@ -1,0 +1,5 @@
+runs_v2_stage4|SAVE_STM=1 EXTRA="--stm-encoding stage4"|pretrain rl "0 1" 3|runs_v2_stage4/pretrain/rl/pair0_1/seed3|
+runs_v2_stage4|SAVE_STM=1 EXTRA="--stm-encoding stage4"|baseline rl "0 1" 3|runs_v2_stage4/baseline/rl/pair0_1/seed3|
+runs_v2_stage4|SAVE_STM=1 EXTRA="--stm-encoding stage4"|continual rl "0 1" 3 "3 4 5"|runs_v2_stage4/continual/rl/pair0_1/seed3/order3_4_5|
+runs_v2_stage4|SAVE_STM=1 EXTRA="--stm-encoding stage4"|continual rl "0 1" 3 "4 5 3"|runs_v2_stage4/continual/rl/pair0_1/seed3/order4_5_3|
+runs_v2_stage4|SAVE_STM=1 EXTRA="--stm-encoding stage4"|continual rl "0 1" 3 "5 3 4"|runs_v2_stage4/continual/rl/pair0_1/seed3/order5_3_4|

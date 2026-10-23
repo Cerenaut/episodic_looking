@@ -21,6 +21,8 @@ class DenseModelConfig:
     layers: int = 0
     hidden_dropout: float = 0.0
     bias: bool = True
+    input_layer_norm_affine: bool = True  # False = input LayerNorm without the learned scale and shift
+    output_bias: bool|None = None  # bias of the output layer; None = same as bias
 
 class DenseModel(nn.Module):
     """
@@ -37,7 +39,8 @@ class DenseModel(nn.Module):
         self.trainable_modules = nn.ModuleDict()
 
         if self.config.input_layer_norm:
-            self.ln = nn.LayerNorm(self.config.input_size, device=self.device)
+            self.ln = nn.LayerNorm(self.config.input_size, elementwise_affine=self.config.input_layer_norm_affine,
+                                   device=self.device)
             ln_name = self.get_module_name("dense-input-layer-norm")
             self.trainable_modules[ln_name] = self.ln
         else:
@@ -63,7 +66,10 @@ class DenseModel(nn.Module):
             else:  # last layer
                 y = self.config.output_size
 
-            fc = nn.Linear(x, y, bias=self.config.bias, device=self.device)
+            bias = self.config.bias
+            if layer == (self.config.layers -1) and self.config.output_bias is not None:
+                bias = self.config.output_bias
+            fc = nn.Linear(x, y, bias=bias, device=self.device)
             layer_name = self.get_module_name("dense-layer-"+str(layer))
             self.trainable_modules[layer_name] = fc
             self.layers.append(fc)
