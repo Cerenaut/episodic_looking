@@ -1,0 +1,95 @@
+"""
+Checkpoint schedule, held-out evaluation and the summary metrics of single_stream_paper plan.md section 4:
+final and anytime accuracy, few-shot exposure efficiency E(n) / E(q), retention curve R(a), effective few-shot
+exposures N_x and retention time tau.
+"""
+import numpy as np
+import torch
+
+
+def checkpoint_schedule(epoch_len, epochs, n_log, grid_per_epoch, step=1):
+    """
+    Exposure counts at which to evaluate. Log-spaced points over the first epoch (to resolve few-shot learning)
+    plus a uniform grid of `grid_per_epoch` points per epoch (ending at each epoch end). Rounded up to whole
+    steps of `step` exposures. Returns (sorted exposure counts, set of those on the uniform grid).
+    """
+    def to_step(t):
+        return int(min(np.ceil(t / step) * step, epoch_len * epochs))
+
+    grid = {to_step(epoch_len * e + epoch_len * (i + 1) / grid_per_epoch)
+            for e in range(epochs) for i in range(grid_per_epoch)}
+    log = set()
+    if n_log > 0:
+        log = {to_step(t) for t in np.geomspace(step, epoch_len, n_log)}
+    return sorted(grid | log), grid
+
+
+@torch.no_grad()
+def evaluate(model, data, batch_size=2000):
+    """Per-sample correctness on `data` (bool array), with the model in prediction mode."""
+    correct = []
+    for i in range(0, len(data), batch_size):
+        logits = model.predict(data.x[i:i + batch_size])
+        correct.append((logits.argmax(1) == data.y[i:i + batch_size]).numpy())
+    return np.concatenate(correct)
+
+
+def per_group_accuracy(correct, groups, group_ids):
+    return np.array([correct[groups == g].mean() for g in group_ids])
+
+
+def log2_bin(values):
+    """Bin edges 0, 1, 2-3, 4-7, ...: bin index 0 for value 0, else floor(log2(v)) + 1."""
+    values = np.asarray(values, dtype=np.float64)
+    out = np.zeros(values.shape, dtype=np.int64)
+    pos = values > 0
+    out[pos] = np.floor(np.log2(values[pos])).astype(np.int64) + 1
+    return out
+
+
+def binned_curve(x, acc):
+    """Mean accuracy per log2 bin of x. Returns list of (bin lower edge, mean accuracy, count)."""
+    bins = log2_bin(x)
+    curve = []
+    for b in np.unique(bins):
+        sel = bins == b
+        lower = 0 if b == 0 else 2 ** (b - 1)
+        curve.append((int(lower), float(np.mean(acc[sel])), int(sel.sum())))
+    return curve
+
+
+def summarize(records):
+    """
+    Summary of one run from its checkpoint records (dicts with t, grid, acc, group_acc, n, q, age; age < 0 means
+    the group has not been presented yet).
+    """
+    grid_acc = [r["acc"] for r in records if r["grid"]]
+    n = np.concatenate([r["n"] for r in records])
+    q = np.concatenate([r["q"] for r in records])
+    age = np.concatenate([r["age"] for r in records])
+    gacc = np.concatenate([r["group_acc"] for r in records])
+    seen = age >= 0
+    return {
+        "final_acc": records[-1]["acc"],
+        "anytime_acc": float(np.mean(grid_acc)) if grid_acc else None,
+        "exposure_efficiency": binned_curve(n, gacc),
+        "visit_efficiency": binned_curve(q, gacc),
+        "retention": binned_curve(age[seen], gacc[seen]),
+    }
+
+
+def effective_fewshot_exposures(curve, iid_acc, fraction=0.9):
+    """Smallest bin edge n at which E(n) reaches `fraction` of the iid final accuracy (None if never)."""
+    for lower, acc, _ in curve:
+        if acc >= fraction * iid_acc:
+            return lower
+    return None
+
+
+def retention_time(curve, iid_acc, chance):
+    """First age bin edge at which R(a) falls below the midpoint between iid accuracy and chance (None if never)."""
+    threshold = 0.5 * (iid_acc + chance)
+    for lower, acc, _ in curve:
+        if acc < threshold:
+            return lower
+    return None

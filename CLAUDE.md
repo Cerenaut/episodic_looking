@@ -15,3 +15,10 @@ Code for the "Episodic looking" paper. The paper, notes and plans live in `~/Dev
   scratch directory. Never delete or overwrite a results directory: a superseded or broken run is moved to an
   archive directory and the ledger row says so. Copy results back from pods or Walter before the machine is
   released. These directories are gitignored, so the Mac's disk is the only copy: do not clean them up.
+
+## Branch `single_stream` (from 24 Oct 2026)
+
+The single-stream stage keeps its notes, plan and ledger in a separate repo,
+`~/dev/claude/single_stream_paper` (read `Notes/experiments/plan.md` there first). Its runs are logged in that
+repo's `Notes/experiments/ledger.md`, not the previous paper's. Code: `single_stream/` (tests:
+`python -m unittest discover -s single_stream/tests -t .`); results under `runs_ss/`.
