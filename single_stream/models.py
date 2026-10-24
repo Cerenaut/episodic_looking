@@ -228,3 +228,101 @@ class ReplayLTM(LTMOnly):
     def memory_bytes(self):
         return param_bytes(self.net) + self.buf_x.numel() * self.buf_x.element_size() \
             + self.buf_y.numel() * self.buf_y.element_size()
+
+
+class ReplayOnlyLTM(StreamModel):
+    """
+    The LTM trained only from a replay buffer, never directly on the live stream. Each exposure is stored; every
+    `period` exposures the model takes `steps` gradient steps, each on `batch` samples drawn uniformly (without
+    replacement when the buffer holds enough) from the buffer. Replay ratio = steps x batch / period
+    sample-gradients per exposure.
+
+    policy "fifo": a ring buffer of `capacity` slots holding the most recent exposures (age-based forgetting).
+    policy "reservoir": reservoir sampling (a uniform sample of everything seen).
+    store_uint8: store inputs in [0, 1] as 8-bit (exact for 8-bit images such as MNIST); memory counts the bytes
+    actually stored.
+    """
+
+    def __init__(self, net, lr, capacity, batch, period, input_shape, steps=1, policy="fifo", store_uint8=True,
+                 momentum=0.0, weight_decay=0.0, seed=0, cbp=None):
+        if policy not in ("fifo", "reservoir"):
+            raise ValueError(f"unknown replay policy {policy}")
+        self.net = net
+        self.capacity = capacity
+        self.batch = batch
+        self.period = period
+        self.steps = steps
+        self.policy = policy
+        self.store_uint8 = store_uint8
+        self.opt = torch.optim.SGD(net.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+        self.cbp = cbp
+        dtype = torch.uint8 if store_uint8 else torch.float32
+        self.buf_x = torch.zeros((capacity,) + tuple(input_shape), dtype=dtype)
+        self.buf_y = torch.zeros(capacity, dtype=torch.long)
+        self.size = 0
+        self.seen = 0
+        self.head = 0
+        self.pending = 0
+        self.updates = 0
+        self.gen = torch.Generator().manual_seed(seed)
+
+    def _encode(self, x):
+        if not self.store_uint8:
+            return x
+        q = torch.round(x * 255.0)
+        return q.clamp(0, 255).to(torch.uint8)
+
+    def _decode(self, x):
+        return x.float() / 255.0 if self.store_uint8 else x
+
+    def _store(self, x, y):
+        x = self._encode(x)
+        for i in range(len(x)):
+            if self.policy == "fifo":
+                slot = self.head
+                self.head = (self.head + 1) % self.capacity
+                self.size = min(self.size + 1, self.capacity)
+            elif self.size < self.capacity:
+                slot = self.size
+                self.size += 1
+            else:
+                slot = int(torch.randint(self.seen + 1, (1,), generator=self.gen))
+            if slot < self.capacity:
+                self.buf_x[slot] = x[i]
+                self.buf_y[slot] = y[i]
+            self.seen += 1
+
+    def _replay_step(self):
+        if self.size >= self.batch:
+            idx = torch.randperm(self.size, generator=self.gen)[:self.batch]
+        else:
+            idx = torch.randint(self.size, (self.batch,), generator=self.gen)
+        self.net.train()
+        loss = F.cross_entropy(self.net(self._decode(self.buf_x[idx])), self.buf_y[idx])
+        self.opt.zero_grad(set_to_none=True)
+        loss.backward()
+        self.opt.step()
+        if self.cbp is not None:
+            self.cbp.step()
+        self.updates += 1
+
+    def observe(self, x, y):
+        with torch.no_grad():
+            self.net.eval()
+            pred = self.net(x).argmax(1)
+        self._store(x, y)
+        self.pending += len(x)
+        while self.pending >= self.period:
+            self.pending -= self.period
+            for _ in range(self.steps):
+                self._replay_step()
+        return pred
+
+    @torch.no_grad()
+    def predict(self, x):
+        self.net.eval()
+        return self.net(x)
+
+    def memory_bytes(self):
+        return param_bytes(self.net) + self.buf_x.numel() * self.buf_x.element_size() \
+            + self.buf_y.numel() * self.buf_y.element_size()

@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from single_stream import datasets, metrics
-from single_stream.models import ContinualBackprop, LTMOnly, ReplayLTM, build_net
+from single_stream.models import ContinualBackprop, LTMOnly, ReplayLTM, ReplayOnlyLTM, build_net
 from single_stream.stream import ClusteredStream, run_lengths
 
 
@@ -33,7 +33,9 @@ def parse_args(argv=None):
     p.add_argument("--cluster-size", type=int, default=1, help="c")
     p.add_argument("--batch-size", type=int, default=1, help="b")
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--model", default="ltm", choices=["ltm", "replay"])
+    p.add_argument("--model", default="ltm", choices=["ltm", "replay", "replayonly"],
+                   help="ltm: trained on the stream; replay: stream + reservoir replay mixed into each step; "
+                        "replayonly: trained only from the replay buffer")
     p.add_argument("--net", default="mlp", choices=["mlp", "resmlp"])
     p.add_argument("--widths", default="2000,2000,2000")
     p.add_argument("--blocks", type=int, default=3, help="residual blocks (resmlp)")
@@ -46,6 +48,10 @@ def parse_args(argv=None):
     p.add_argument("--cbp-maturity", type=int, default=100)
     p.add_argument("--replay-capacity", type=int, default=1000)
     p.add_argument("--replay-batch", type=int, default=10)
+    p.add_argument("--replay-period", type=int, default=16, help="replayonly: exposures between replay updates")
+    p.add_argument("--replay-steps", type=int, default=1, help="replayonly: gradient steps per replay update")
+    p.add_argument("--replay-policy", default="fifo", choices=["fifo", "reservoir"], help="replayonly")
+    p.add_argument("--replay-float", action="store_true", help="replayonly: store float32 instead of uint8")
     p.add_argument("--n-log-checkpoints", type=int, default=12)
     p.add_argument("--grid-per-epoch", type=int, default=10)
     p.add_argument("--max-exposures", type=int, default=0, help="stop early (smoke tests and timing only)")
@@ -66,6 +72,13 @@ def build_model(args, train):
     common = dict(lr=args.lr, steps=args.steps, momentum=args.momentum, weight_decay=args.weight_decay, cbp=cbp)
     if args.model == "ltm":
         return LTMOnly(net, **common)
+    if args.model == "replayonly":
+        if args.steps != 1:
+            raise ValueError("replayonly uses --replay-steps, not --steps")
+        del common["steps"]
+        return ReplayOnlyLTM(net, capacity=args.replay_capacity, batch=args.replay_batch, period=args.replay_period,
+                             steps=args.replay_steps, policy=args.replay_policy, store_uint8=not args.replay_float,
+                             input_shape=train.x.shape[1:], seed=args.seed, **common)
     return ReplayLTM(net, capacity=args.replay_capacity, replay_batch=args.replay_batch,
                      input_shape=train.x.shape[1:], seed=args.seed, **common)
 
@@ -181,6 +194,8 @@ def main(argv=None):
     with open(os.path.join(args.out, "checkpoints.jsonl")) as f:
         records = [json.loads(line) for line in f]
     summary = metrics.summarize(records, group_label)
+    if hasattr(model, "updates"):
+        summary["replay_updates"] = model.updates
     if getattr(model, "cbp", None) is not None:
         summary["cbp_replaced_units"] = model.cbp.replaced
     summary.update({"exposures": t, "memory_bytes": model.memory_bytes(), "train_time": train_time,

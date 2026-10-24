@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from single_stream import metrics
-from single_stream.models import ContinualBackprop, LTMOnly, MLP, ReplayLTM
+from single_stream.models import ContinualBackprop, LTMOnly, MLP, ReplayLTM, ReplayOnlyLTM
 from single_stream.stream import ClusteredStream, run_lengths
 
 
@@ -165,6 +165,32 @@ class TestModels(unittest.TestCase):
         cbp.step()  # decay 0: utility = current contribution, mean = current activation; replaces 8 units
         y1 = net(x).detach()
         torch.testing.assert_close(y0, y1, atol=1e-5, rtol=0)
+
+
+    def test_replay_only_fifo(self):
+        torch.manual_seed(0)
+        model = ReplayOnlyLTM(MLP(4, [8], 3), lr=0.01, capacity=5, batch=2, period=3, steps=2, input_shape=(4,))
+        xs = torch.randint(0, 256, (20, 4)).float() / 255.0
+        for i in range(20):
+            model.observe(xs[i:i + 1], torch.tensor([i % 3]))
+        self.assertEqual(model.size, 5)
+        self.assertEqual(model.updates, 2 * (20 // 3))
+        # the buffer holds exactly the last 5 exposures, stored exactly as 8-bit
+        held = sorted(model._decode(model.buf_x).tolist())
+        self.assertEqual(held, sorted(xs[15:].tolist()))
+        self.assertEqual(sorted(model.buf_y.tolist()), sorted([i % 3 for i in range(15, 20)]))
+        params = sum(p.numel() * 4 for p in model.net.parameters())
+        self.assertEqual(model.memory_bytes(), params + 5 * 4 * 1 + 5 * 8)
+
+    def test_replay_only_does_not_train_between_updates(self):
+        torch.manual_seed(0)
+        model = ReplayOnlyLTM(MLP(4, [8], 3), lr=0.1, capacity=10, batch=2, period=4, input_shape=(4,))
+        w0 = model.net.out.weight.clone()
+        for i in range(3):
+            model.observe(torch.rand(1, 4), torch.tensor([0]))
+        torch.testing.assert_close(model.net.out.weight, w0)
+        model.observe(torch.rand(1, 4), torch.tensor([0]))
+        self.assertFalse(torch.equal(model.net.out.weight, w0))
 
 
 if __name__ == "__main__":
