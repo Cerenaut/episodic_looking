@@ -100,6 +100,7 @@ def main(argv=None):
     stream = ClusteredStream(train.groups, args.cluster_size, rng)
     group_ids = stream.group_ids
     group_index = {g: i for i, g in enumerate(group_ids)}
+    group_label = metrics.group_labels(train.groups, train.y.numpy(), group_ids)
     b = args.batch_size
     epoch_len = len(train)
     total = epoch_len * args.epochs
@@ -156,12 +157,14 @@ def main(argv=None):
 
             if next_ckpt < len(checkpoints) and t >= checkpoints[next_ckpt]:
                 t0 = time.perf_counter()
-                correct = metrics.evaluate(model, eval_set)
+                preds = metrics.evaluate(model, eval_set)
                 eval_time += time.perf_counter() - t0
+                correct = preds == eval_set.y.numpy()
                 gacc = metrics.per_group_accuracy(correct, eval_set.groups, group_ids)
+                confusion = metrics.group_confusion(preds, eval_set.groups, group_ids, eval_set.num_classes)
                 age = np.where(last_seen >= 0, t - last_seen, -1)
                 rec = {"t": t, "epoch": epoch, "grid": t in grid, "acc": float(correct.mean()),
-                       "group_acc": gacc.tolist(), "n": n.tolist(), "q": q.tolist(), "age": age.tolist(),
+                       "group_acc": gacc.tolist(), "confusion": confusion.tolist(), "n": n.tolist(), "q": q.tolist(), "age": age.tolist(),
                        "online_acc": online_correct / max(online_count, 1),
                        "train_time": train_time, "eval_time": eval_time}
                 ckpt_file.write(json.dumps(rec) + "\n")
@@ -177,7 +180,7 @@ def main(argv=None):
         json.dump(stream_stats, f)
     with open(os.path.join(args.out, "checkpoints.jsonl")) as f:
         records = [json.loads(line) for line in f]
-    summary = metrics.summarize(records)
+    summary = metrics.summarize(records, group_label)
     if getattr(model, "cbp", None) is not None:
         summary["cbp_replaced_units"] = model.cbp.replaced
     summary.update({"exposures": t, "memory_bytes": model.memory_bytes(), "train_time": train_time,

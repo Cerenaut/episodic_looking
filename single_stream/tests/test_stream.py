@@ -86,6 +86,25 @@ class TestMetrics(unittest.TestCase):
     def test_log2_bins(self):
         self.assertEqual(metrics.log2_bin([0, 1, 2, 3, 4, 7, 8]).tolist(), [0, 1, 2, 2, 3, 3, 4])
 
+    def test_balanced_group_score(self):
+        # 3 groups = 3 labels, 10 samples each
+        perfect = np.diag([10, 10, 10])
+        np.testing.assert_allclose(metrics.balanced_group_score(perfect, [0, 1, 2]), 1.0)
+        # always predict label 0: recall 1/0/0, specificity 0/1/1 -> 0.5 everywhere
+        always0 = np.array([[10, 0, 0], [10, 0, 0], [10, 0, 0]])
+        np.testing.assert_allclose(metrics.balanced_group_score(always0, [0, 1, 2]), 0.5)
+        # two groups sharing a label (CIFAR coarse targets): specificity only counts the other label's groups
+        shared = np.array([[10, 0], [10, 0], [5, 5]])
+        np.testing.assert_allclose(metrics.balanced_group_score(shared, [0, 0, 1]), [0.75, 0.75, 0.75])
+
+    def test_group_confusion_and_labels(self):
+        preds = np.array([0, 1, 1, 2])
+        groups = np.array([5, 5, 7, 7])
+        np.testing.assert_array_equal(metrics.group_confusion(preds, groups, [5, 7], 3), [[1, 1, 0], [0, 1, 1]])
+        np.testing.assert_array_equal(metrics.group_labels(groups, np.array([0, 0, 1, 1]), [5, 7]), [0, 1])
+        with self.assertRaises(ValueError):
+            metrics.group_labels(groups, np.array([0, 1, 1, 1]), [5, 7])
+
     def test_thresholds(self):
         curve = [(0, 0.1, 5), (1, 0.5, 5), (2, 0.92, 5), (4, 0.99, 5)]
         self.assertEqual(metrics.effective_fewshot_exposures(curve, 1.0, 0.9), 2)

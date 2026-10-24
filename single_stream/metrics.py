@@ -26,16 +26,52 @@ def checkpoint_schedule(epoch_len, epochs, n_log, grid_per_epoch, step=1):
 
 @torch.no_grad()
 def evaluate(model, data, batch_size=2000):
-    """Per-sample correctness on `data` (bool array), with the model in prediction mode."""
-    correct = []
+    """Predicted labels on `data` (int array), with the model in prediction mode."""
+    preds = []
     for i in range(0, len(data), batch_size):
-        logits = model.predict(data.x[i:i + batch_size])
-        correct.append((logits.argmax(1) == data.y[i:i + batch_size]).numpy())
-    return np.concatenate(correct)
+        preds.append(model.predict(data.x[i:i + batch_size]).argmax(1).numpy())
+    return np.concatenate(preds)
 
 
 def per_group_accuracy(correct, groups, group_ids):
     return np.array([correct[groups == g].mean() for g in group_ids])
+
+
+def group_confusion(preds, groups, group_ids, num_classes):
+    """counts[i, l] = number of evaluation samples of group group_ids[i] predicted as label l."""
+    counts = np.zeros((len(group_ids), num_classes), dtype=np.int64)
+    for i, g in enumerate(group_ids):
+        counts[i] = np.bincount(preds[groups == g], minlength=num_classes)
+    return counts
+
+
+def group_labels(groups, labels, group_ids):
+    """The target label of each group (every group must have a single label)."""
+    out = []
+    for g in group_ids:
+        values = np.unique(labels[groups == g])
+        if len(values) != 1:
+            raise ValueError(f"group {g} has labels {values}")
+        out.append(int(values[0]))
+    return np.array(out)
+
+
+def balanced_group_score(confusion, group_label):
+    """
+    Per group: mean of recall (its samples predicted as its label) and specificity (samples of groups with a
+    different label NOT predicted as this group's label). Insensitive to a bias toward recently seen labels: a
+    model predicting one label for everything scores 0.5 on every group. Chance = 0.5.
+    """
+    confusion = np.asarray(confusion, dtype=np.float64)
+    group_label = np.asarray(group_label)
+    totals = confusion.sum(1)
+    score = np.zeros(len(group_label))
+    for i, l in enumerate(group_label):
+        recall = confusion[i, l] / totals[i]
+        other = group_label != l
+        specificity = 1.0 - confusion[other, l].sum() / totals[other].sum()
+        score[i] = 0.5 * (recall + specificity)
+    return score
 
 
 def log2_bin(values):
@@ -58,10 +94,12 @@ def binned_curve(x, acc):
     return curve
 
 
-def summarize(records):
+def summarize(records, group_label=None):
     """
     Summary of one run from its checkpoint records (dicts with t, grid, acc, group_acc, n, q, age; age < 0 means
-    the group has not been presented yet).
+    the group has not been presented yet). With `group_label` and records carrying a `confusion` matrix, the
+    exposure-efficiency and retention curves are also computed on the balanced group score (keys *_balanced),
+    which is not inflated by recency bias.
     """
     grid_acc = [r["acc"] for r in records if r["grid"]]
     n = np.concatenate([r["n"] for r in records])
@@ -69,13 +107,20 @@ def summarize(records):
     age = np.concatenate([r["age"] for r in records])
     gacc = np.concatenate([r["group_acc"] for r in records])
     seen = age >= 0
-    return {
+    out = {
         "final_acc": records[-1]["acc"],
         "anytime_acc": float(np.mean(grid_acc)) if grid_acc else None,
         "exposure_efficiency": binned_curve(n, gacc),
         "visit_efficiency": binned_curve(q, gacc),
         "retention": binned_curve(age[seen], gacc[seen]),
     }
+    if group_label is not None and all("confusion" in r for r in records):
+        bal = np.concatenate([balanced_group_score(r["confusion"], group_label) for r in records])
+        out["exposure_efficiency_balanced"] = binned_curve(n, bal)
+        out["visit_efficiency_balanced"] = binned_curve(q, bal)
+        out["retention_balanced"] = binned_curve(age[seen], bal[seen])
+        out["final_group_balanced"] = balanced_group_score(records[-1]["confusion"], group_label).tolist()
+    return out
 
 
 def effective_fewshot_exposures(curve, iid_acc, fraction=0.9):
