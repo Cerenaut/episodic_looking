@@ -18,7 +18,8 @@ import numpy as np
 import torch
 
 from single_stream import datasets, metrics
-from single_stream.models import ContinualBackprop, LTMOnly, ReplayLTM, ReplayOnlyLTM, build_net
+from single_stream.buffers import NoveltyGate, RingBuffer, SeparatedBuffer
+from single_stream.models import BufferedReplayLTM, ContinualBackprop, LTMOnly, ReplayLTM, ReplayOnlyLTM, build_net
 from single_stream.stream import ClusteredStream, run_lengths
 
 
@@ -33,9 +34,10 @@ def parse_args(argv=None):
     p.add_argument("--cluster-size", type=int, default=1, help="c")
     p.add_argument("--batch-size", type=int, default=1, help="b")
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--model", default="ltm", choices=["ltm", "replay", "replayonly"],
+    p.add_argument("--model", default="ltm", choices=["ltm", "replay", "replayonly", "buffered"],
                    help="ltm: trained on the stream; replay: stream + reservoir replay mixed into each step; "
-                        "replayonly: trained only from the replay buffer")
+                        "replayonly: trained only from the replay buffer; buffered: replayonly with a pluggable, "
+                        "novelty-gated buffer (--buffer)")
     p.add_argument("--net", default="mlp", choices=["mlp", "resmlp"])
     p.add_argument("--widths", default="2000,2000,2000")
     p.add_argument("--blocks", type=int, default=3, help="residual blocks (resmlp)")
@@ -52,6 +54,19 @@ def parse_args(argv=None):
     p.add_argument("--replay-steps", type=int, default=1, help="replayonly: gradient steps per replay update")
     p.add_argument("--replay-policy", default="fifo", choices=["fifo", "reservoir"], help="replayonly")
     p.add_argument("--replay-float", action="store_true", help="replayonly: store float32 instead of uint8")
+    p.add_argument("--buffer", default="ring", choices=["ring", "dg"],
+                   help="buffered: ring = FIFO of --replay-capacity; dg = SeparatedBuffer")
+    p.add_argument("--gate-floor", type=float, default=1.0,
+                   help="buffered: store with p = floor + (1 - floor) x novelty; 1 = store everything")
+    p.add_argument("--dg-cells", type=int, default=1000)
+    p.add_argument("--dg-k", type=int, default=1, help="cells per memory")
+    p.add_argument("--dg-fan-in", type=int, default=64, help="input pixels per cell")
+    p.add_argument("--dg-allocation", default="least_used", choices=["least_used", "response"])
+    p.add_argument("--dg-label-scale", type=float, default=1.0)
+    p.add_argument("--dg-util-decay", type=float, default=0.999)
+    p.add_argument("--dg-homeostasis", type=float, default=1.0, help="response allocation: usage penalty")
+    p.add_argument("--dg-match-threshold", type=float, default=None, help="recognition threshold; default off")
+    p.add_argument("--dg-settle", type=int, default=0, help="recall iterations when k > 1")
     p.add_argument("--n-log-checkpoints", type=int, default=12)
     p.add_argument("--grid-per-epoch", type=int, default=10)
     p.add_argument("--max-exposures", type=int, default=0, help="stop early (smoke tests and timing only)")
@@ -79,6 +94,22 @@ def build_model(args, train):
         return ReplayOnlyLTM(net, capacity=args.replay_capacity, batch=args.replay_batch, period=args.replay_period,
                              steps=args.replay_steps, policy=args.replay_policy, store_uint8=not args.replay_float,
                              input_shape=train.x.shape[1:], seed=args.seed, **common)
+    if args.model == "buffered":
+        if args.steps != 1:
+            raise ValueError("buffered uses --replay-steps, not --steps")
+        del common["steps"]
+        gate = NoveltyGate(args.gate_floor, seed=args.seed + 1)
+        if args.buffer == "ring":
+            buffer = RingBuffer(args.replay_capacity, train.x.shape[1], gate, store_uint8=not args.replay_float,
+                                seed=args.seed)
+        else:
+            buffer = SeparatedBuffer(args.dg_cells, train.x.shape[1], train.num_classes, k=args.dg_k,
+                                     fan_in=args.dg_fan_in, allocation=args.dg_allocation,
+                                     label_scale=args.dg_label_scale, util_decay=args.dg_util_decay,
+                                     homeostasis=args.dg_homeostasis, match_threshold=args.dg_match_threshold,
+                                     settle=args.dg_settle, gate=gate, seed=args.seed)
+        return BufferedReplayLTM(net, buffer=buffer, batch=args.replay_batch, period=args.replay_period,
+                                 steps=args.replay_steps, **common)
     return ReplayLTM(net, capacity=args.replay_capacity, replay_batch=args.replay_batch,
                      input_shape=train.x.shape[1:], seed=args.seed, **common)
 
@@ -196,6 +227,10 @@ def main(argv=None):
     summary = metrics.summarize(records, group_label)
     if hasattr(model, "updates"):
         summary["replay_updates"] = model.updates
+    if hasattr(model, "memory_values"):
+        summary["memory_values"] = model.memory_values()
+    if hasattr(model, "buffer"):
+        summary.update({f"buffer_{k}": getattr(model.buffer, k) for k in ("offered", "written", "recognised")})
     if getattr(model, "cbp", None) is not None:
         summary["cbp_replaced_units"] = model.cbp.replaced
     summary.update({"exposures": t, "memory_bytes": model.memory_bytes(), "train_time": train_time,

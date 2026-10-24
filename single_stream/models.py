@@ -326,3 +326,63 @@ class ReplayOnlyLTM(StreamModel):
     def memory_bytes(self):
         return param_bytes(self.net) + self.buf_x.numel() * self.buf_x.element_size() \
             + self.buf_y.numel() * self.buf_y.element_size()
+
+
+class BufferedReplayLTM(StreamModel):
+    """
+    The replay-only LTM with a pluggable buffer (single_stream/buffers.py). Each exposure is offered to the buffer
+    with a novelty score: the LTM's error on it, 1 - p(y | x), from the same pre-update forward pass that gives the
+    online prediction. Every `period` exposures the LTM takes `steps` gradient steps, each on `batch` samples drawn
+    from the buffer; it is never trained on the live sample. With RingBuffer and no gate this is ReplayOnlyLTM.
+    """
+
+    def __init__(self, net, lr, buffer, batch, period, steps=1, momentum=0.0, weight_decay=0.0, cbp=None):
+        self.net = net
+        self.buffer = buffer
+        self.batch = batch
+        self.period = period
+        self.steps = steps
+        self.opt = torch.optim.SGD(net.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+        self.cbp = cbp
+        self.pending = 0
+        self.updates = 0
+
+    @staticmethod
+    def novelty(logits, y):
+        return 1.0 - F.softmax(logits, dim=1).gather(1, y[:, None]).squeeze(1)
+
+    def _replay_step(self):
+        bx, by = self.buffer.sample(self.batch)
+        self.net.train()
+        loss = F.cross_entropy(self.net(bx), by)
+        self.opt.zero_grad(set_to_none=True)
+        loss.backward()
+        self.opt.step()
+        if self.cbp is not None:
+            self.cbp.step()
+        self.updates += 1
+
+    def observe(self, x, y):
+        with torch.no_grad():
+            self.net.eval()
+            logits = self.net(x)
+        self.buffer.write(x, y, self.novelty(logits, y))
+        self.pending += len(x)
+        while self.pending >= self.period:
+            self.pending -= self.period
+            if self.buffer.written == 0:
+                continue  # the gate has stored nothing yet
+            for _ in range(self.steps):
+                self._replay_step()
+        return logits.argmax(1)
+
+    @torch.no_grad()
+    def predict(self, x):
+        self.net.eval()
+        return self.net(x)
+
+    def memory_values(self):
+        return sum(p.numel() for p in self.net.parameters()) + self.buffer.values()
+
+    def memory_bytes(self):
+        return param_bytes(self.net) + self.buffer.nbytes()
