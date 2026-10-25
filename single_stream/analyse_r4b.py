@@ -7,7 +7,7 @@ cluster size x capacity map.
 
 Stage B run names: c<c>_k<capacity>_s<seed>__<config>; stage A runs are c 128, capacity 500, seed 0.
 
---ltm LABEL=DIR ... adds buffer-free LTM baselines (e.g. round 2's LTM-only and continual backprop runs, whose
+--ltm LABEL=DIR[,DIR...] ... adds buffer-free LTM baselines (e.g. round 2's LTM-only and continual backprop runs, whose
 names end _c<c>_lr..._s<seed>) at the cluster sizes they have, cut to the stage B budget (BUDGET exposures):
 final = accuracy at t = BUDGET, anytime = mean over grid checkpoints t <= BUDGET at stage B's spacing (one
 epoch / 5). Few-shot (n <= 256) is taken from the full run: those exposures fall in the first epoch.
@@ -51,12 +51,12 @@ def ltm_metrics(d):
 
 
 def load_ltm(specs):
-    """{label: {c: metrics}} from LABEL=DIR specs (DIR's runs named ..._c<c>_lr<lr>_s0)."""
+    """{label: {c: metrics}} from LABEL=DIR[,DIR...] specs (runs named ..._c<c>_lr<lr>_s0)."""
     out = {}
     for spec in specs:
-        label, path = spec.split("=", 1)
+        label, paths = spec.split("=", 1)
         out[label] = {}
-        for d in glob.glob(path.rstrip("/") + "*/") if not os.path.exists(os.path.join(path, "summary.json")) else [path]:
+        for d in paths.split(","):
             m = re.search(r"_c(\d+)_lr[\d.e-]+_s0/?$", d)
             if m:
                 out[label][int(m.group(1))] = ltm_metrics(d)
@@ -90,7 +90,7 @@ def main():
     p.add_argument("dir_a")
     p.add_argument("dir_b")
     p.add_argument("--fig")
-    p.add_argument("--ltm", nargs="*", default=[], help="LABEL=run dir (or path prefix) of buffer-free baselines")
+    p.add_argument("--ltm", nargs="*", default=[], help="LABEL=run dir[,run dir...] of buffer-free baselines")
     a = p.parse_args()
     runs = load(a.dir_a, a.dir_b)
     ltm = load_ltm(a.ltm)
