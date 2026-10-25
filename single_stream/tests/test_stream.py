@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from single_stream import metrics
-from single_stream.buffers import NoveltyGate, RingBuffer, SeparatedBuffer
+from single_stream.buffers import NeuralBuffer, NoveltyGate, RingBuffer, part_specs
 from single_stream.models import BufferedReplayLTM, ContinualBackprop, LTMOnly, MLP, ReplayLTM, ReplayOnlyLTM
 from single_stream.stream import ClusteredStream, run_lengths
 
@@ -200,7 +200,27 @@ class TestBuffers(unittest.TestCase):
     def offer(buf, xs, ys, novelty=None):
         for i in range(len(xs)):
             nov = torch.ones(1) if novelty is None else novelty[i:i + 1]
-            buf.write(xs[i:i + 1], ys[i:i + 1], nov)
+            buf.write((xs[i:i + 1], ys[i:i + 1]), nov)
+
+    @staticmethod
+    def image_label_parts(d):
+        return part_specs(torch.zeros(1, d), torch.zeros(1, dtype=torch.long))
+
+    def test_pack_unpack_parts(self):
+        parts = (torch.rand(3, 2, 4), torch.tensor([5, 0, 9]), torch.rand(3, 1))
+        buf = RingBuffer(10, part_specs(*parts))
+        self.assertEqual(buf.D, 8 + 1 + 1)
+        buf.write(parts, torch.ones(3))
+        out = buf.unpack(buf.sample_vectors(3))
+        self.assertEqual([o.shape for o in out], [(3, 2, 4), (3,), (3, 1)])
+        self.assertEqual(out[1].dtype, torch.long)
+        # sampling without replacement returns each stored sample once
+        got = sorted(out[1].tolist())
+        self.assertEqual(got, [0, 5, 9])
+        for k in range(3):
+            row = out[1].tolist().index(parts[1][k].item())
+            torch.testing.assert_close(out[0][row], parts[0][k])
+            torch.testing.assert_close(out[2][row], parts[2][k])
 
     def test_ring_buffer_model_reproduces_replay_only(self):
         xs = torch.randint(0, 256, (200, 4)).float() / 255.0
@@ -208,13 +228,15 @@ class TestBuffers(unittest.TestCase):
         torch.manual_seed(0)
         a = ReplayOnlyLTM(MLP(4, [8], 3), lr=0.05, capacity=20, batch=4, period=3, steps=2, input_shape=(4,), seed=7)
         torch.manual_seed(0)
-        b = BufferedReplayLTM(MLP(4, [8], 3), lr=0.05, buffer=RingBuffer(20, 4, seed=7), batch=4, period=3, steps=2)
+        b = BufferedReplayLTM(MLP(4, [8], 3), lr=0.05, buffer=RingBuffer(20, self.image_label_parts(4), seed=7),
+                              batch=4, period=3, steps=2)
         for i in range(200):
             pa = a.observe(xs[i:i + 1], ys[i:i + 1])
             pb = b.observe(xs[i:i + 1], ys[i:i + 1])
             self.assertEqual(pa.tolist(), pb.tolist())
         for wa, wb in zip(a.net.parameters(), b.net.parameters()):
             torch.testing.assert_close(wa, wb, rtol=0, atol=0)
+        self.assertEqual(b.memory_values(), a.memory_values())
         self.assertEqual(b.memory_values(), sum(p.numel() for p in b.net.parameters()) + 20 * 5)
 
     def test_gate(self):
@@ -222,79 +244,43 @@ class TestBuffers(unittest.TestCase):
         self.assertFalse(gate(torch.zeros(1000)).any())
         self.assertTrue(gate(torch.ones(1000)).all())
         self.assertAlmostEqual(NoveltyGate(floor=0.3, seed=0)(torch.zeros(10000)).float().mean().item(), 0.3, delta=0.02)
-        buf = RingBuffer(10, 4, gate=NoveltyGate(floor=0.0))
+        buf = RingBuffer(10, self.image_label_parts(4), gate=NoveltyGate(floor=0.0))
         self.offer(buf, torch.rand(50, 4), torch.zeros(50, dtype=torch.long), torch.zeros(50))
         self.assertEqual((buf.offered, buf.written, buf.size), (50, 0, 0))
 
-    def test_least_used_k1_is_fifo_with_exact_recall(self):
+    def test_neural_buffer_is_fifo_with_exact_recall(self):
         xs, ys = torch.rand(25, 20), torch.arange(25) % 4
-        buf = SeparatedBuffer(cells=8, input_size=20, num_classes=4, fan_in=5, util_decay=0.5, seed=0)
+        buf = NeuralBuffer(8, self.image_label_parts(20), fan_in=5, key_parts=(0,), util_decay=0.5, seed=0)
         self.offer(buf, xs, ys)
         x, y = buf.sample(8)  # without replacement: every memory once
         held = sorted(zip(x.tolist(), y.tolist()))
         expected = sorted(zip(xs[17:].tolist(), ys[17:].tolist()))
-        self.assertEqual(len(held), 8)
-        for (hx, hy), (ex, ey) in zip(held, expected):
-            np.testing.assert_allclose(hx, ex, atol=1e-6)
-            self.assertEqual(hy, ey)
+        self.assertEqual(held, expected)
+        self.assertEqual(buf.num_values(), 8 * 21 + 2 * 8)
 
     def test_fifo_order_survives_utilisation_underflow(self):
-        buf = SeparatedBuffer(cells=4, input_size=10, num_classes=2, fan_in=3, util_decay=1e-30, seed=0)
+        buf = NeuralBuffer(4, self.image_label_parts(10), fan_in=3, util_decay=1e-30, seed=0)
         xs = torch.rand(10, 10)
         self.offer(buf, xs, torch.zeros(10, dtype=torch.long))
         x, _ = buf.sample(4)
         self.assertEqual(sorted(x.tolist()), sorted(xs[6:].tolist()))
 
-    def test_projection_changes_only_for_recruited_cells(self):
-        buf = SeparatedBuffer(cells=10, input_size=20, num_classes=2, k=2, fan_in=5, seed=0)
-        self.offer(buf, torch.rand(3, 20), torch.zeros(3, dtype=torch.long))
-        p0 = buf.P.clone()
-        x = torch.rand(1, 20)
-        buf.write(x, torch.ones(1, dtype=torch.long), torch.ones(1))
-        changed = (buf.P != p0).any(1).nonzero().flatten()
-        self.assertEqual(len(changed), 2)
-        torch.testing.assert_close(buf.P[changed], x[0][buf.idx[changed]])
-        # an input that the gate rejects changes nothing
-        buf.gate = NoveltyGate(floor=0.0)
-        p1, c1 = buf.P.clone(), buf.C.clone()
-        buf.write(torch.rand(1, 20), torch.zeros(1, dtype=torch.long), torch.zeros(1))
-        self.assertTrue(torch.equal(buf.P, p1) and torch.equal(buf.C, c1))
-
-    def test_least_used_k_gt_1_recalls_from_one_cell(self):
-        torch.manual_seed(0)
-        xs = (torch.rand(6, 100) < 0.2).float()
-        buf = SeparatedBuffer(cells=30, input_size=100, num_classes=3, k=4, fan_in=20, seed=0)
-        self.offer(buf, xs, torch.arange(6) % 3)
-        # every cell of every memory recalls that memory exactly
-        for j in buf.occupied.nonzero().flatten():
-            z = buf.recall(j[None])[0]
-            i = int((xs - z[:100]).abs().sum(1).argmin())
-            torch.testing.assert_close(z[:100], xs[i])
-            self.assertEqual(int(z[100:].argmax()), i % 3)
-
-    def test_response_allocation_recalls_exactly_without_settling(self):
-        torch.manual_seed(0)
-        xs = (torch.rand(10, 200) < 0.15).float()
-
-        def sampled_error(settle):
-            buf = SeparatedBuffer(cells=400, input_size=200, num_classes=10, k=4, fan_in=40, allocation="response",
-                                  settle=settle, seed=0)
-            self.offer(buf, xs, torch.arange(10))
-            self.assertEqual(buf.values(), buf.C.numel() + 2 * 400)  # fixed P not counted
-            x, y = buf.sample(len(buf.occupied.nonzero()))
-            return max((xi - xs[yi]).abs().max().item() for xi, yi in zip(x, y))
-
-        self.assertLess(sampled_error(0), 1e-5)
-        # usage balancing moves write-time codes away from the pure-response code, so settling recalls wrongly
-        self.assertGreater(sampled_error(3), 0.1)
+    def test_key_excludes_label(self):
+        buf = NeuralBuffer(50, self.image_label_parts(20), fan_in=20, key_parts=(0,), seed=0)
+        self.assertTrue(torch.all(buf.idx < 20))
 
     def test_recognition_skips_duplicates(self):
-        buf = SeparatedBuffer(cells=10, input_size=30, num_classes=2, fan_in=10, match_threshold=0.99, seed=0)
+        buf = NeuralBuffer(10, self.image_label_parts(30), fan_in=10, key_parts=(0,), match_threshold=0.99, seed=0)
         x = torch.rand(1, 30)
         for _ in range(3):
-            buf.write(x, torch.zeros(1, dtype=torch.long), torch.ones(1))
+            buf.write((x, torch.zeros(1, dtype=torch.long)), torch.ones(1))
         self.assertEqual((buf.offered, buf.written, buf.recognised), (3, 1, 2))
         self.assertGreater(buf.util.max().item(), 2.0)
+        # a rejected, unrecognised sample changes nothing
+        buf.gate = NoveltyGate(floor=0.0)
+        c0 = buf.C.clone()
+        buf.write((torch.rand(1, 30), torch.zeros(1, dtype=torch.long)), torch.zeros(1))
+        self.assertTrue(torch.equal(buf.C, c0))
 
 
 if __name__ == "__main__":

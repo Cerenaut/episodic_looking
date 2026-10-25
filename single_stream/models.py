@@ -19,9 +19,14 @@ class StreamModel:
         """Logits for a batch, with no learning."""
         raise NotImplementedError
 
-    def memory_bytes(self):
-        """Bytes stored by the model: parameters plus any stored samples (optimizer state not counted)."""
+    def memory_values(self):
+        """Values held by the model (plan.md section 4): parameters plus stored samples, one per number whatever its
+        precision; optimizer state not counted."""
         raise NotImplementedError
+
+
+def param_values(net):
+    return sum(p.numel() for p in net.parameters())
 
 
 def param_bytes(net):
@@ -176,6 +181,9 @@ class LTMOnly(StreamModel):
         self.net.eval()
         return self.net(x)
 
+    def memory_values(self):
+        return param_values(self.net)
+
     def memory_bytes(self):
         return param_bytes(self.net)
 
@@ -224,6 +232,9 @@ class ReplayLTM(LTMOnly):
                 self.buf_x[slot] = x[i]
                 self.buf_y[slot] = y[i]
             self.seen += 1
+
+    def memory_values(self):
+        return param_values(self.net) + self.buf_x.numel() + self.buf_y.numel()
 
     def memory_bytes(self):
         return param_bytes(self.net) + self.buf_x.numel() * self.buf_x.element_size() \
@@ -323,6 +334,9 @@ class ReplayOnlyLTM(StreamModel):
         self.net.eval()
         return self.net(x)
 
+    def memory_values(self):
+        return param_values(self.net) + self.buf_x.numel() + self.buf_y.numel()
+
     def memory_bytes(self):
         return param_bytes(self.net) + self.buf_x.numel() * self.buf_x.element_size() \
             + self.buf_y.numel() * self.buf_y.element_size()
@@ -331,8 +345,8 @@ class ReplayOnlyLTM(StreamModel):
 class BufferedReplayLTM(StreamModel):
     """
     The replay-only LTM with a pluggable buffer (single_stream/buffers.py). Each exposure is offered to the buffer
-    with a novelty score: the LTM's error on it, 1 - p(y | x), from the same pre-update forward pass that gives the
-    online prediction. Every `period` exposures the LTM takes `steps` gradient steps, each on `batch` samples drawn
+    as the parts (x, y) with a novelty score: the LTM's error on it, 1 - p(y | x), from the same pre-update forward
+    pass that gives the online prediction. Novelty is defined here, not in the buffer: it is a function of the LTM. Every `period` exposures the LTM takes `steps` gradient steps, each on `batch` samples drawn
     from the buffer; it is never trained on the live sample. With RingBuffer and no gate this is ReplayOnlyLTM.
     """
 
@@ -366,7 +380,7 @@ class BufferedReplayLTM(StreamModel):
         with torch.no_grad():
             self.net.eval()
             logits = self.net(x)
-        self.buffer.write(x, y, self.novelty(logits, y))
+        self.buffer.write((x, y), self.novelty(logits, y))
         self.pending += len(x)
         while self.pending >= self.period:
             self.pending -= self.period
@@ -382,7 +396,4 @@ class BufferedReplayLTM(StreamModel):
         return self.net(x)
 
     def memory_values(self):
-        return sum(p.numel() for p in self.net.parameters()) + self.buffer.values()
-
-    def memory_bytes(self):
-        return param_bytes(self.net) + self.buffer.nbytes()
+        return param_values(self.net) + self.buffer.num_values()

@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from single_stream import datasets, metrics
-from single_stream.buffers import NoveltyGate, RingBuffer, SeparatedBuffer
+from single_stream.buffers import NeuralBuffer, NoveltyGate, RingBuffer, part_specs
 from single_stream.models import BufferedReplayLTM, ContinualBackprop, LTMOnly, ReplayLTM, ReplayOnlyLTM, build_net
 from single_stream.stream import ClusteredStream, run_lengths
 
@@ -54,19 +54,14 @@ def parse_args(argv=None):
     p.add_argument("--replay-steps", type=int, default=1, help="replayonly: gradient steps per replay update")
     p.add_argument("--replay-policy", default="fifo", choices=["fifo", "reservoir"], help="replayonly")
     p.add_argument("--replay-float", action="store_true", help="replayonly: store float32 instead of uint8")
-    p.add_argument("--buffer", default="ring", choices=["ring", "dg"],
-                   help="buffered: ring = FIFO of --replay-capacity; dg = SeparatedBuffer")
+    p.add_argument("--buffer", default="ring", choices=["ring", "neural"],
+                   help="buffered: ring = FIFO of --replay-capacity; neural = NeuralBuffer of --nb-cells")
     p.add_argument("--gate-floor", type=float, default=1.0,
                    help="buffered: store with p = floor + (1 - floor) x novelty; 1 = store everything")
-    p.add_argument("--dg-cells", type=int, default=1000)
-    p.add_argument("--dg-k", type=int, default=1, help="cells per memory")
-    p.add_argument("--dg-fan-in", type=int, default=64, help="input pixels per cell")
-    p.add_argument("--dg-allocation", default="least_used", choices=["least_used", "response"])
-    p.add_argument("--dg-label-scale", type=float, default=1.0)
-    p.add_argument("--dg-util-decay", type=float, default=0.999)
-    p.add_argument("--dg-homeostasis", type=float, default=1.0, help="response allocation: usage penalty")
-    p.add_argument("--dg-match-threshold", type=float, default=None, help="recognition threshold; default off")
-    p.add_argument("--dg-settle", type=int, default=0, help="recall iterations when k > 1")
+    p.add_argument("--nb-cells", type=int, default=1000)
+    p.add_argument("--nb-fan-in", type=int, default=64, help="key (input) values seen by each cell")
+    p.add_argument("--nb-util-decay", type=float, default=0.999)
+    p.add_argument("--nb-match-threshold", type=float, default=None, help="recognition threshold; default off")
     p.add_argument("--n-log-checkpoints", type=int, default=12)
     p.add_argument("--grid-per-epoch", type=int, default=10)
     p.add_argument("--max-exposures", type=int, default=0, help="stop early (smoke tests and timing only)")
@@ -99,15 +94,13 @@ def build_model(args, train):
             raise ValueError("buffered uses --replay-steps, not --steps")
         del common["steps"]
         gate = NoveltyGate(args.gate_floor, seed=args.seed + 1)
+        parts = part_specs(train.x[:1], train.y[:1])  # (image, label)
         if args.buffer == "ring":
-            buffer = RingBuffer(args.replay_capacity, train.x.shape[1], gate, store_uint8=not args.replay_float,
-                                seed=args.seed)
+            buffer = RingBuffer(args.replay_capacity, parts, gate, seed=args.seed)
         else:
-            buffer = SeparatedBuffer(args.dg_cells, train.x.shape[1], train.num_classes, k=args.dg_k,
-                                     fan_in=args.dg_fan_in, allocation=args.dg_allocation,
-                                     label_scale=args.dg_label_scale, util_decay=args.dg_util_decay,
-                                     homeostasis=args.dg_homeostasis, match_threshold=args.dg_match_threshold,
-                                     settle=args.dg_settle, gate=gate, seed=args.seed)
+            buffer = NeuralBuffer(args.nb_cells, parts, fan_in=args.nb_fan_in, key_parts=(0,),
+                                  util_decay=args.nb_util_decay, match_threshold=args.nb_match_threshold, gate=gate,
+                                  seed=args.seed)
         return BufferedReplayLTM(net, buffer=buffer, batch=args.replay_batch, period=args.replay_period,
                                  steps=args.replay_steps, **common)
     return ReplayLTM(net, capacity=args.replay_capacity, replay_batch=args.replay_batch,
@@ -157,7 +150,7 @@ def main(argv=None):
         checkpoints.append(total)
     log(f"train {len(train)}  eval {len(eval_set)}  groups {len(group_ids)}  c={args.cluster_size} b={b}  "
         f"epochs {args.epochs}  exposures {total}  checkpoints {len(checkpoints)}  "
-        f"memory {model.memory_bytes() / 1e6:.1f} MB")
+        f"memory {model.memory_values() / 1e6:.2f}M values")
 
     n = np.zeros(len(group_ids), dtype=np.int64)
     q = np.zeros(len(group_ids), dtype=np.int64)
@@ -227,13 +220,13 @@ def main(argv=None):
     summary = metrics.summarize(records, group_label)
     if hasattr(model, "updates"):
         summary["replay_updates"] = model.updates
-    if hasattr(model, "memory_values"):
-        summary["memory_values"] = model.memory_values()
     if hasattr(model, "buffer"):
         summary.update({f"buffer_{k}": getattr(model.buffer, k) for k in ("offered", "written", "recognised")})
     if getattr(model, "cbp", None) is not None:
         summary["cbp_replaced_units"] = model.cbp.replaced
-    summary.update({"exposures": t, "memory_bytes": model.memory_bytes(), "train_time": train_time,
+    if hasattr(model, "memory_bytes"):
+        summary["memory_bytes"] = model.memory_bytes()
+    summary.update({"exposures": t, "memory_values": model.memory_values(), "train_time": train_time,
                     "eval_time": eval_time, "ms_per_step": 1000 * train_time / max(t // b, 1)})
     with open(os.path.join(args.out, "summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
