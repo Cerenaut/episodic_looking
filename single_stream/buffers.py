@@ -43,7 +43,8 @@ def part_specs(*parts):
 class Buffer:
     """
     parts: per-sample (shape, dtype) of each part (see `part_specs`). Subclasses implement `_offer` (one packed
-    sample (D,) and the gate's decision), `sample_vectors` (n packed samples, (n, D)) and `num_values`.
+    sample (D,), the gate's decision and its novelty), `sample_vectors` (n packed samples (n, D) and their cell
+    indices (n,)) and `num_values`; `rescore` is optional.
     """
 
     def __init__(self, parts, gate=None):
@@ -75,13 +76,17 @@ class Buffer:
         keep = self.gate(novelty)
         for i in range(len(z)):
             self.offered += 1
-            self._offer(z[i], bool(keep[i]))
+            self._offer(z[i], bool(keep[i]), float(novelty[i]))
 
     def sample(self, n):
-        """n stored samples drawn for replay, as parts, each (n, *shape)."""
-        return self.unpack(self.sample_vectors(n))
+        """n stored samples drawn for replay: (parts, each (n, *shape); cell indices (n,), for `rescore`)."""
+        z, idx = self.sample_vectors(n)
+        return self.unpack(z), idx
 
-    def _offer(self, z, keep):
+    def rescore(self, idx, novelty):
+        """New novelty (n,) for the samples in cells idx (n,), e.g. measured when they are replayed."""
+
+    def _offer(self, z, keep, novelty):
         raise NotImplementedError
 
     def sample_vectors(self, n):
@@ -105,7 +110,7 @@ class RingBuffer(Buffer):
         self.head = 0
         self.gen = torch.Generator().manual_seed(seed)
 
-    def _offer(self, z, keep):
+    def _offer(self, z, keep, novelty):
         if not keep:
             return
         self.buf[self.head] = z
@@ -118,7 +123,7 @@ class RingBuffer(Buffer):
             idx = torch.randperm(self.size, generator=self.gen)[:n]
         else:
             idx = torch.randint(self.size, (n,), generator=self.gen)
-        return self.buf[idx]
+        return self.buf[idx], idx
 
     def num_values(self):
         return self.buf.numel()
@@ -175,7 +180,7 @@ class NeuralBuffer(Buffer):
         r = (zs * cs).sum(-1) / (zs.norm(dim=-1) * cs.norm(dim=-1) + 1e-8)
         return r.masked_fill(~self.occupied, float("-inf"))
 
-    def _offer(self, z, keep):
+    def _offer(self, z, keep, novelty):
         self.util.mul_(self.util_decay)
         if self.match_threshold is not None and self.occupied.any():
             r = self.responses(z)
@@ -201,7 +206,73 @@ class NeuralBuffer(Buffer):
             pick = occ[torch.randperm(len(occ), generator=self.gen)[:n]]
         else:
             pick = occ[torch.randint(len(occ), (n,), generator=self.gen)]
-        return self.C[pick]
+        return self.C[pick], pick
 
     def num_values(self):
         return self.C.numel() + self.util.numel() + self.stamp.numel()
+
+
+def rank_weights(scores, alpha, most_first):
+    """Weights 1 / rank^alpha over scores (n,), rank 1 = highest score if most_first else lowest. alpha 0 = uniform."""
+    if alpha == 0:
+        return torch.ones(len(scores), dtype=torch.float64)
+    order = torch.argsort(scores, descending=most_first, stable=True)
+    ranks = torch.empty(len(scores), dtype=torch.float64)
+    ranks[order] = torch.arange(1, len(scores) + 1, dtype=torch.float64)
+    return ranks.pow(-alpha)
+
+
+class PriorityBuffer(Buffer):
+    """
+    Novelty-prioritised buffer (plan.md section 5, agreed 25 Oct): one whole sample per cell, never merged.
+
+    Each cell holds its sample's novelty score, set at admission and replaced by `rescore` (the LTM's pre-update
+    error when the sample is replayed). When full, an admitted sample evicts a cell drawn with probability
+    proportional to 1 / rank^alpha_evict, rank 1 = least novel (0 = uniform random eviction). Replay draws cells
+    with probability proportional to 1 / rank^alpha_replay, rank 1 = most novel (0 = uniform), without
+    replacement when there are enough. Ranks make one alpha mean the same thing whatever the range of novelties,
+    and every cell keeps a nonzero chance of eviction. Age (offered-sample count at admission) is kept for metrics
+    only, not used by the algorithm and not counted as values.
+    """
+
+    def __init__(self, capacity, parts, alpha_evict=0.0, alpha_replay=0.0, gate=None, seed=0):
+        super().__init__(parts, gate)
+        self.capacity = capacity
+        self.alpha_evict = alpha_evict
+        self.alpha_replay = alpha_replay
+        self.buf = torch.zeros(capacity, self.D)
+        self.score = torch.zeros(capacity, dtype=torch.float64)
+        self.admitted_at = torch.zeros(capacity, dtype=torch.long)  # metrics only
+        self.size = 0
+        self.evicted = 0
+        self.gen = torch.Generator().manual_seed(seed)
+
+    def _offer(self, z, keep, novelty):
+        if not keep:
+            return
+        if self.size < self.capacity:
+            cell = self.size
+            self.size += 1
+        else:
+            w = rank_weights(self.score, self.alpha_evict, most_first=False)
+            cell = int(torch.multinomial(w, 1, generator=self.gen))
+            self.evicted += 1
+        self.buf[cell] = z
+        self.score[cell] = novelty
+        self.admitted_at[cell] = self.offered
+        self.written += 1
+
+    def sample_vectors(self, n):
+        w = rank_weights(self.score[:self.size], self.alpha_replay, most_first=True)
+        idx = torch.multinomial(w, n, replacement=self.size < n, generator=self.gen)
+        return self.buf[idx], idx
+
+    def rescore(self, idx, novelty):
+        self.score[idx] = novelty.double()
+
+    def ages(self):
+        """Offered samples since admission, per stored sample (metrics)."""
+        return self.offered - self.admitted_at[:self.size]
+
+    def num_values(self):
+        return self.buf.numel() + self.score.numel()

@@ -366,9 +366,11 @@ class BufferedReplayLTM(StreamModel):
         return 1.0 - F.softmax(logits, dim=1).gather(1, y[:, None]).squeeze(1)
 
     def _replay_step(self):
-        bx, by = self.buffer.sample(self.batch)
+        (bx, by), idx = self.buffer.sample(self.batch)
         self.net.train()
-        loss = F.cross_entropy(self.net(bx), by)
+        logits = self.net(bx)
+        self.buffer.rescore(idx, self.novelty(logits.detach(), by))  # pre-update error, free from this pass
+        loss = F.cross_entropy(logits, by)
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         self.opt.step()

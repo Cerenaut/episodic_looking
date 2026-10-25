@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from single_stream import metrics
-from single_stream.buffers import NeuralBuffer, NoveltyGate, RingBuffer, part_specs
+from single_stream.buffers import NeuralBuffer, NoveltyGate, PriorityBuffer, RingBuffer, part_specs, rank_weights
 from single_stream.models import BufferedReplayLTM, ContinualBackprop, LTMOnly, MLP, ReplayLTM, ReplayOnlyLTM
 from single_stream.stream import ClusteredStream, run_lengths
 
@@ -211,7 +211,7 @@ class TestBuffers(unittest.TestCase):
         buf = RingBuffer(10, part_specs(*parts))
         self.assertEqual(buf.D, 8 + 1 + 1)
         buf.write(parts, torch.ones(3))
-        out = buf.unpack(buf.sample_vectors(3))
+        out = buf.unpack(buf.sample_vectors(3)[0])
         self.assertEqual([o.shape for o in out], [(3, 2, 4), (3,), (3, 1)])
         self.assertEqual(out[1].dtype, torch.long)
         # sampling without replacement returns each stored sample once
@@ -248,11 +248,57 @@ class TestBuffers(unittest.TestCase):
         self.offer(buf, torch.rand(50, 4), torch.zeros(50, dtype=torch.long), torch.zeros(50))
         self.assertEqual((buf.offered, buf.written, buf.size), (50, 0, 0))
 
+    def test_rank_weights(self):
+        scores = torch.tensor([0.3, 0.1, 0.9])
+        np.testing.assert_allclose(rank_weights(scores, 1.0, most_first=False).tolist(), [1 / 2, 1, 1 / 3])
+        np.testing.assert_allclose(rank_weights(scores, 1.0, most_first=True).tolist(), [1 / 2, 1 / 3, 1])
+        self.assertEqual(rank_weights(scores, 0.0, most_first=True).tolist(), [1, 1, 1])
+
+    def test_priority_eviction(self):
+        parts = self.image_label_parts(3)
+        # strong alpha: always evicts the least novel
+        buf = PriorityBuffer(5, parts, alpha_evict=60.0, seed=0)
+        self.offer(buf, torch.rand(5, 3), torch.arange(5), torch.tensor([0.5, 0.1, 0.4, 0.3, 0.2]))
+        self.offer(buf, torch.rand(1, 3), torch.tensor([9]), torch.tensor([0.05]))
+        np.testing.assert_allclose(sorted(buf.score.tolist()), [0.05, 0.2, 0.3, 0.4, 0.5], atol=1e-6)
+        self.assertEqual(buf.evicted, 1)
+        # alpha 0: eviction uniform over cells
+        counts = Counter()
+        for seed in range(2000):
+            buf = PriorityBuffer(4, parts, alpha_evict=0.0, seed=seed)
+            self.offer(buf, torch.rand(5, 3), torch.arange(5), torch.tensor([0.9, 0.1, 0.5, 0.3, 0.7]))
+            counts[next(i for i in range(4) if buf.buf[i, 3].item() == 4)] += 1
+        for v in counts.values():
+            self.assertAlmostEqual(v / 2000, 0.25, delta=0.04)
+
+    def test_priority_replay_and_rescore(self):
+        buf = PriorityBuffer(10, self.image_label_parts(3), alpha_replay=60.0, seed=0)
+        self.offer(buf, torch.rand(10, 3), torch.arange(10), torch.linspace(0, 0.9, 10))
+        (_, y), idx = buf.sample(2)
+        self.assertEqual(sorted(y.tolist()), [8, 9])  # the two most novel
+        buf.rescore(idx, torch.zeros(2))
+        (_, y), _ = buf.sample(2)
+        self.assertEqual(sorted(y.tolist()), [6, 7])
+        self.assertEqual(buf.num_values(), 10 * 4 + 10)
+        self.assertEqual(sorted(buf.ages().tolist()), list(range(10)))
+
+    def test_model_rescores_replayed_samples(self):
+        torch.manual_seed(0)
+        buf = PriorityBuffer(8, self.image_label_parts(4), seed=0)
+        model = BufferedReplayLTM(MLP(4, [8], 3), lr=0.05, buffer=buf, batch=8, period=8)
+        xs = torch.rand(8, 4)
+        for i in range(7):
+            model.observe(xs[i:i + 1], torch.tensor([i % 3]))
+        before = buf.score.clone()
+        model.observe(xs[7:8], torch.tensor([1]))  # triggers one replay step over all 8 cells
+        self.assertEqual(model.updates, 1)
+        self.assertFalse(torch.equal(buf.score[:7], before[:7]))
+
     def test_neural_buffer_is_fifo_with_exact_recall(self):
         xs, ys = torch.rand(25, 20), torch.arange(25) % 4
         buf = NeuralBuffer(8, self.image_label_parts(20), fan_in=5, key_parts=(0,), util_decay=0.5, seed=0)
         self.offer(buf, xs, ys)
-        x, y = buf.sample(8)  # without replacement: every memory once
+        (x, y), _ = buf.sample(8)  # without replacement: every memory once
         held = sorted(zip(x.tolist(), y.tolist()))
         expected = sorted(zip(xs[17:].tolist(), ys[17:].tolist()))
         self.assertEqual(held, expected)
@@ -262,7 +308,7 @@ class TestBuffers(unittest.TestCase):
         buf = NeuralBuffer(4, self.image_label_parts(10), fan_in=3, util_decay=1e-30, seed=0)
         xs = torch.rand(10, 10)
         self.offer(buf, xs, torch.zeros(10, dtype=torch.long))
-        x, _ = buf.sample(4)
+        (x, _), _ = buf.sample(4)
         self.assertEqual(sorted(x.tolist()), sorted(xs[6:].tolist()))
 
     def test_key_excludes_label(self):

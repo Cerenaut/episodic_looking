@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from single_stream import datasets, metrics
-from single_stream.buffers import NeuralBuffer, NoveltyGate, RingBuffer, part_specs
+from single_stream.buffers import NeuralBuffer, NoveltyGate, PriorityBuffer, RingBuffer, part_specs
 from single_stream.models import BufferedReplayLTM, ContinualBackprop, LTMOnly, ReplayLTM, ReplayOnlyLTM, build_net
 from single_stream.stream import ClusteredStream, run_lengths
 
@@ -54,8 +54,11 @@ def parse_args(argv=None):
     p.add_argument("--replay-steps", type=int, default=1, help="replayonly: gradient steps per replay update")
     p.add_argument("--replay-policy", default="fifo", choices=["fifo", "reservoir"], help="replayonly")
     p.add_argument("--replay-float", action="store_true", help="replayonly: store float32 instead of uint8")
-    p.add_argument("--buffer", default="ring", choices=["ring", "neural"],
-                   help="buffered: ring = FIFO of --replay-capacity; neural = NeuralBuffer of --nb-cells")
+    p.add_argument("--buffer", default="ring", choices=["ring", "priority", "neural"],
+                   help="buffered: ring = FIFO of --replay-capacity; priority = PriorityBuffer of --replay-capacity; "
+                        "neural = NeuralBuffer of --nb-cells")
+    p.add_argument("--alpha-evict", type=float, default=0.0, help="priority: eviction 1/rank^a, rank 1 least novel")
+    p.add_argument("--alpha-replay", type=float, default=0.0, help="priority: replay 1/rank^a, rank 1 most novel")
     p.add_argument("--gate-floor", type=float, default=1.0,
                    help="buffered: store with p = floor + (1 - floor) x novelty; 1 = store everything")
     p.add_argument("--nb-cells", type=int, default=1000)
@@ -97,6 +100,9 @@ def build_model(args, train):
         parts = part_specs(train.x[:1], train.y[:1])  # (image, label)
         if args.buffer == "ring":
             buffer = RingBuffer(args.replay_capacity, parts, gate, seed=args.seed)
+        elif args.buffer == "priority":
+            buffer = PriorityBuffer(args.replay_capacity, parts, alpha_evict=args.alpha_evict,
+                                    alpha_replay=args.alpha_replay, gate=gate, seed=args.seed)
         else:
             buffer = NeuralBuffer(args.nb_cells, parts, fan_in=args.nb_fan_in, key_parts=(0,),
                                   util_decay=args.nb_util_decay, match_threshold=args.nb_match_threshold, gate=gate,
@@ -105,6 +111,18 @@ def build_model(args, train):
                                  steps=args.replay_steps, **common)
     return ReplayLTM(net, capacity=args.replay_capacity, replay_batch=args.replay_batch,
                      input_shape=train.x.shape[1:], seed=args.seed, **common)
+
+
+def buffer_diagnostics(buffer, num_classes):
+    """Diagnostics only (the model never sees them): stored labels per class, written count, and for the priority
+    buffer the mean age and score of stored samples."""
+    z = buffer.buf[:buffer.size] if hasattr(buffer, "buf") else buffer.C[buffer.occupied]
+    labels = buffer.unpack(z)[1] if len(z) else torch.zeros(0, dtype=torch.long)
+    out = {"buffer_labels": torch.bincount(labels, minlength=num_classes).tolist(), "buffer_written": buffer.written}
+    if hasattr(buffer, "ages") and len(z):
+        out.update({"buffer_mean_age": float(buffer.ages().float().mean()),
+                    "buffer_mean_score": float(buffer.score[:buffer.size].mean())})
+    return out
 
 
 class Tee:
@@ -204,6 +222,8 @@ def main(argv=None):
                        "group_acc": gacc.tolist(), "confusion": confusion.tolist(), "n": n.tolist(), "q": q.tolist(), "age": age.tolist(),
                        "online_acc": online_correct / max(online_count, 1),
                        "train_time": train_time, "eval_time": eval_time}
+                if hasattr(model, "buffer"):
+                    rec.update(buffer_diagnostics(model.buffer, eval_set.num_classes))
                 ckpt_file.write(json.dumps(rec) + "\n")
                 ckpt_file.flush()
                 log(f"t {t:>8d}  ep {epoch}  acc {rec['acc']:.4f}  online {rec['online_acc']:.4f}  "
@@ -221,7 +241,8 @@ def main(argv=None):
     if hasattr(model, "updates"):
         summary["replay_updates"] = model.updates
     if hasattr(model, "buffer"):
-        summary.update({f"buffer_{k}": getattr(model.buffer, k) for k in ("offered", "written", "recognised")})
+        summary.update({f"buffer_{k}": getattr(model.buffer, k, None)
+                        for k in ("offered", "written", "recognised", "evicted")})
     if getattr(model, "cbp", None) is not None:
         summary["cbp_replaced_units"] = model.cbp.replaced
     if hasattr(model, "memory_bytes"):
