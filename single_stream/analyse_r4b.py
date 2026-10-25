@@ -6,9 +6,15 @@ cluster size x capacity map.
       --fig out.png
 
 Stage B run names: c<c>_k<capacity>_s<seed>__<config>; stage A runs are c 128, capacity 500, seed 0.
+
+--ltm LABEL=DIR ... adds buffer-free LTM baselines (e.g. round 2's LTM-only and continual backprop runs, whose
+names end _c<c>_lr..._s<seed>) at the cluster sizes they have, cut to the stage B budget (BUDGET exposures):
+final = accuracy at t = BUDGET, anytime = mean over grid checkpoints t <= BUDGET at stage B's spacing (one
+epoch / 5). Few-shot (n <= 256) is taken from the full run: those exposures fall in the first epoch.
 """
 import argparse
 import glob
+import json
 import os
 import re
 
@@ -17,7 +23,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from single_stream.analyse_grid import SURFACE, INK, INK2, run_metrics, style
+from single_stream.analyse_grid import EPOCH, SURFACE, INK, INK2, pooled, run_metrics, style
 
 CONFIGS = ["fifo", "fifo_g0.2", "pri_ae1_ar0_g0.2", "pri_ae3_ar0_g0.2", "pri_ae3_ar0_g1", "pri_ae3_ar1_g1"]
 LABELS = {"fifo": "FIFO", "fifo_g0.2": "FIFO + gate 0.2", "pri_ae1_ar0_g0.2": "priority ae1 + gate 0.2",
@@ -27,6 +33,34 @@ LABELS = {"fifo": "FIFO", "fifo_g0.2": "FIFO + gate 0.2", "pri_ae1_ar0_g0.2": "p
 COLOURS = {"fifo": "#8a8984", "fifo_g0.2": INK, "pri_ae1_ar0_g0.2": "#2a78d6", "pri_ae3_ar0_g0.2": "#eb6834",
            "pri_ae3_ar0_g1": "#1baf7a", "pri_ae3_ar1_g1": "#8f5bd6"}
 KEYS = ["final", "anytime", "worst_digit", "fewshot", "retain", "digits"]
+BUDGET = 2 * EPOCH
+LTM_STYLE = [("#b8336a", "s"), ("#c98a0b", "D")]  # (colour, marker) per --ltm baseline, in order
+
+
+def ltm_metrics(d):
+    """Metrics of a buffer-free run cut to BUDGET exposures."""
+    with open(os.path.join(d, "checkpoints.jsonl")) as f:
+        recs = [json.loads(line) for line in f]
+    with open(os.path.join(d, "summary.json")) as f:
+        s = json.load(f)
+    grid = [r for r in recs if r["grid"] and r["t"] <= BUDGET and r["t"] % (EPOCH // 5) == 0]
+    end = [r for r in recs if r["t"] == BUDGET][-1]
+    return {"final": end["acc"], "anytime": float(np.mean([r["acc"] for r in grid])),
+            "worst_digit": min(end["group_acc"]),
+            "fewshot": pooled(s["exposure_efficiency_balanced"], lambda lo: lo <= 256)}
+
+
+def load_ltm(specs):
+    """{label: {c: metrics}} from LABEL=DIR specs (DIR's runs named ..._c<c>_lr<lr>_s0)."""
+    out = {}
+    for spec in specs:
+        label, path = spec.split("=", 1)
+        out[label] = {}
+        for d in glob.glob(path.rstrip("/") + "*/") if not os.path.exists(os.path.join(path, "summary.json")) else [path]:
+            m = re.search(r"_c(\d+)_lr[\d.e-]+_s0/?$", d)
+            if m:
+                out[label][int(m.group(1))] = ltm_metrics(d)
+    return out
 
 
 def load(dir_a, dir_b):
@@ -56,8 +90,10 @@ def main():
     p.add_argument("dir_a")
     p.add_argument("dir_b")
     p.add_argument("--fig")
+    p.add_argument("--ltm", nargs="*", default=[], help="LABEL=run dir (or path prefix) of buffer-free baselines")
     a = p.parse_args()
     runs = load(a.dir_a, a.dir_b)
+    ltm = load_ltm(a.ltm)
 
     print("Seeds 0-2, c 128, capacity 500: mean (min-max)\n")
     seeded = sorted({k[3] for k in runs if k[:2] == (128, 500) and k[2] > 0})
@@ -79,13 +115,15 @@ def main():
         print(f"{key} by cluster size / capacity, seed 0\n")
         table(["config"] + [f"c{c} k{k}" for c, k in cells],
               [[cfg] + [f"{runs[(c, k, 0, cfg)][key]:.3f}" if (c, k, 0, cfg) in runs else "-" for c, k in cells]
-               for cfg in CONFIGS])
+               for cfg in CONFIGS] +
+              [[label] + [f"{v[c][key]:.3f}" if c in v and key in v[c] else "-" for c, k in cells]
+               for label, v in ltm.items()])
 
     if a.fig:
-        figure(runs, a.fig)
+        figure(runs, ltm, a.fig)
 
 
-def figure(runs, path):
+def figure(runs, ltm, path):
     sizes = sorted({k[0] for k in runs})
     caps = sorted({k[1] for k in runs})
     metrics_ = [("anytime", "anytime accuracy"), ("final", "final accuracy"), ("fewshot", "few-shot score (n <= 256)")]
@@ -100,6 +138,11 @@ def figure(runs, path):
                 pts = [(c, runs[(c, cap, 0, cfg)][key]) for c in sizes if (c, cap, 0, cfg) in runs]
                 ax.plot(*zip(*pts), marker="o", color=COLOURS[cfg], lw=2, ms=6, label=LABELS[cfg],
                         ls="--" if cfg.startswith("fifo") else "-")
+            for (name, v), (colour, marker) in zip(ltm.items(), LTM_STYLE):
+                pts = [(c, v[c][key]) for c in sizes if c in v]
+                if pts:
+                    ax.plot(*zip(*pts), marker=marker, color=colour, lw=2, ms=8, ls=":", label=name,
+                            markeredgecolor=SURFACE, markeredgewidth=1.5)
             ax.set_xscale("log", base=2)
             ax.set_xticks(sizes, [str(c) for c in sizes])
             ax.minorticks_off()
@@ -109,7 +152,7 @@ def figure(runs, path):
             if row == 0:
                 ax.set_title(f"capacity {cap}", color=INK)
     h, l = axes[0][0].get_legend_handles_labels()
-    fig.legend(h, l, loc="lower center", ncol=3, frameon=False, fontsize=9)
+    fig.legend(h, l, loc="lower center", ncol=4, frameon=False, fontsize=9)
     fig.suptitle("Round 4 stage B: replay-only LTM, unpermuted MNIST, 2 epochs, seed 0 (validation)", color=INK)
     fig.tight_layout(rect=(0, 0.06, 1, 0.96))
     fig.savefig(path, dpi=130, facecolor=SURFACE)
