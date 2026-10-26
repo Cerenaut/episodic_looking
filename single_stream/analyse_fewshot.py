@@ -5,6 +5,11 @@ and seeds, plus final / anytime averaged over seeds.
   python -m single_stream.analyse_fewshot runs_ss/task1_r4_fewshot_c_20261026 --fig curves.png \
       --fig-by-c by_c.png [--seeds 0,1,2]
 
+--fig-digits out.png --cell C,CAPACITY: per-digit breakdown at one cluster size / capacity, one row per model,
+columns recall / specificity / balanced score of the triggering digit and overall accuracy, against n; thin
+line per digit (mean over seeds), bold = mean over digits. Assumes group id = label (task 1, unpermuted or
+permuted MNIST).
+
 --fig: few-shot curve E(n) per cluster size (rows) and capacity (columns). --fig-by-c: every metric against
 cluster size, one row per metric (anytime, final, few-shot at each threshold n), one column per capacity.
 
@@ -61,6 +66,8 @@ def main():
     p.add_argument("grid_dir")
     p.add_argument("--fig")
     p.add_argument("--fig-by-c")
+    p.add_argument("--fig-digits")
+    p.add_argument("--cell", default="128,500", help="--fig-digits: cluster size,capacity")
     p.add_argument("--seeds", default="0,1,2")
     a = p.parse_args()
     seeds = [int(s) for s in a.seeds.split(",")]
@@ -106,6 +113,63 @@ def main():
         figure(runs, sizes, caps, get, a.fig, seeds)
     if a.fig_by_c:
         figure_by_c(runs, sizes, caps, get, a.fig_by_c, seeds)
+    if a.fig_digits:
+        c, cap = (int(v) for v in a.cell.split(","))
+        figure_digits(a.grid_dir, runs, c, cap, get, a.fig_digits, seeds)
+
+
+def digit_scores(path):
+    """{(digit, threshold): (recall, specificity, balanced, overall acc)} from a run's fewshot.jsonl."""
+    out = {}
+    with open(path) as f:
+        for line in f:
+            r = json.loads(line)
+            conf = np.array(r["confusion"], dtype=np.float64)
+            g = r["group"]
+            other = np.arange(len(conf)) != g
+            spec = 1 - conf[other, g].sum() / conf[other].sum()
+            out[(g, r["threshold"])] = (r["recall"], spec, r["balanced"], r["acc"])
+    return out
+
+
+def figure_digits(grid_dir, runs, c, cap, get, path, seeds):
+    cfgs = [cfg for cfg in CONFIGS if get(c, cap, cfg)]
+    cols = ["recall (new digit)", "specificity (others not called it)", "balanced score", "overall accuracy"]
+    fig, axes = plt.subplots(len(cfgs), len(cols), figsize=(4.2 * len(cols), 2.6 * len(cfgs)), sharex=True,
+                             sharey=True, squeeze=False)
+    fig.patch.set_facecolor(SURFACE)
+    for row, cfg in enumerate(cfgs):
+        name = f"c{c}_k{cap}" if not cfg.startswith("ltm") else f"c{c}"
+        per_seed = [digit_scores(os.path.join(grid_dir, f"{name}_s{s}__{cfg}", "fewshot.jsonl"))
+                    for s in get(c, cap, cfg)]
+        digits = sorted({d for sc in per_seed for d, _ in sc})
+        ths = sorted({v for sc in per_seed for _, v in sc})
+        # vals[digit, threshold, metric], mean over seeds
+        vals = np.array([[np.mean([sc[(d, v)] for sc in per_seed if (d, v) in sc], axis=0) for v in ths]
+                         for d in digits])
+        for col, label in enumerate(cols):
+            ax = axes[row][col]
+            style(ax)
+            for i, d in enumerate(digits):
+                ax.plot(ths, vals[i, :, col], color=COLOURS[cfg], lw=0.8, alpha=0.45)
+                ax.annotate(str(d), (ths[-1], vals[i, -1, col]), fontsize=6, color=INK2, xytext=(3, 0),
+                            textcoords="offset points", va="center")
+            ax.plot(ths, vals[:, :, col].mean(0), color=INK, lw=2.2, marker="o", ms=4)
+            ax.set_xscale("log", base=2)
+            ax.set_xticks([1, 4, 16, 64, 256], ["1", "4", "16", "64", "256"])
+            ax.minorticks_off()
+            ax.set_ylim(-0.03, 1.03)
+            if row == 0:
+                ax.set_title(label, color=INK)
+            if row == len(cfgs) - 1:
+                ax.set_xlabel("exposures of the digit so far (n)", color=INK2)
+            if col == 0:
+                ax.set_ylabel(LABELS[cfg].replace(" (", "\n("), color=INK2, fontsize=9)
+    fig.suptitle(f"Few-shot per digit, c = {c}, capacity {cap}: scored when each digit reaches its n-th exposure "
+                 f"(thin = one digit, labelled at right, mean over seeds {','.join(map(str, seeds))}; "
+                 "bold = mean over digits)", color=INK, fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(path, dpi=110, facecolor=SURFACE)
 
 
 def metric_values(by_seed, key):
