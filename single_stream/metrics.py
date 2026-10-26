@@ -1,6 +1,6 @@
 """
 Checkpoint schedule, held-out evaluation and the summary metrics of single_stream_paper plan.md section 4:
-final and anytime accuracy, few-shot exposure efficiency E(n) / E(q), retention curve R(a), effective few-shot
+final and anytime accuracy, few-shot exposure efficiency E(n) / E(q) (and the triggered few-shot curve), retention curve R(a), effective few-shot
 exposures N_x and retention time tau.
 """
 import numpy as np
@@ -120,6 +120,20 @@ def summarize(records, group_label=None):
         out["visit_efficiency_balanced"] = binned_curve(q, bal)
         out["retention_balanced"] = binned_curve(age[seen], bal[seen])
         out["final_group_balanced"] = balanced_group_score(records[-1]["confusion"], group_label).tolist()
+    return out
+
+
+def summarize_fewshot(records):
+    """
+    Few-shot curve from the triggered evaluations (run_stream fewshot.jsonl: one record per group per threshold,
+    taken when the group's exposure count first reached it). Returns a list, per threshold, of
+    (threshold, mean balanced score over groups, mean recall over groups, number of groups).
+    """
+    out = []
+    for v in sorted({r["threshold"] for r in records}):
+        rows = [r for r in records if r["threshold"] == v]
+        out.append((v, float(np.mean([r["balanced"] for r in rows])), float(np.mean([r["recall"] for r in rows])),
+                    len(rows)))
     return out
 
 

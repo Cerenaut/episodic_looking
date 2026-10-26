@@ -5,8 +5,12 @@ Example (selection run on the validation split):
   python -m single_stream.run_stream --dataset mnist --cluster-size 16 --epochs 3 --lr 0.003 \
       --val-holdout 600 --out runs_ss/pilot/c16_s0
 
-Outputs in --out: args.json, checkpoints.jsonl (one record per checkpoint), stream_stats.json (run lengths per
-epoch), summary.json, log.txt.
+Outputs in --out: args.json, checkpoints.jsonl (one record per checkpoint), fewshot.jsonl (one record per
+few-shot trigger, below), stream_stats.json (run lengths per epoch), summary.json, log.txt.
+
+Few-shot triggers: besides the fixed checkpoints, the model is evaluated whenever a group's own exposure count
+first reaches one of --fewshot-thresholds (default 1, 2, 4, ..., 512), so every group is scored at every
+threshold however the stream is clustered. The trigger is the harness's bookkeeping; the model sees nothing.
 """
 import argparse
 import json
@@ -66,6 +70,8 @@ def parse_args(argv=None):
     p.add_argument("--nb-util-decay", type=float, default=0.999)
     p.add_argument("--nb-match-threshold", type=float, default=None, help="recognition threshold; default off")
     p.add_argument("--n-log-checkpoints", type=int, default=12)
+    p.add_argument("--fewshot-thresholds", default="1,2,4,8,16,32,64,128,256,512",
+                   help="evaluate when a group's exposure count first reaches each of these ('' = off)")
     p.add_argument("--grid-per-epoch", type=int, default=10)
     p.add_argument("--max-exposures", type=int, default=0, help="stop early (smoke tests and timing only)")
     p.add_argument("--seed", type=int, default=0)
@@ -170,6 +176,8 @@ def main(argv=None):
         f"epochs {args.epochs}  exposures {total}  checkpoints {len(checkpoints)}  "
         f"memory {model.memory_values() / 1e6:.2f}M values")
 
+    thresholds = np.array([int(v) for v in args.fewshot_thresholds.split(",") if v.strip()], dtype=np.int64)
+    fewshot_file = open(os.path.join(args.out, "fewshot.jsonl"), "w")
     n = np.zeros(len(group_ids), dtype=np.int64)
     q = np.zeros(len(group_ids), dtype=np.int64)
     last_seen = np.full(len(group_ids), -1, dtype=np.int64)
@@ -203,12 +211,30 @@ def main(argv=None):
             train_time += time.perf_counter() - t0
             online_correct += int((pred == train.y[idx]).sum())
             online_count += len(idx)
+            n_before = n.copy()
             for j, k in enumerate(idx):
                 gi = group_index[train.groups[k]]
                 n[gi] += 1
                 q[gi] += int(cluster_start[i + j])
                 last_seen[gi] = t + j + 1
             t += len(idx)
+
+            crossed = [(gi, int(v)) for gi in np.flatnonzero(n > n_before)
+                       for v in thresholds if n_before[gi] < v <= n[gi]]
+            if crossed:
+                t0 = time.perf_counter()
+                preds = metrics.evaluate(model, eval_set)
+                eval_time += time.perf_counter() - t0
+                confusion = metrics.group_confusion(preds, eval_set.groups, group_ids, eval_set.num_classes)
+                balanced = metrics.balanced_group_score(confusion, group_label)
+                acc = float((preds == eval_set.y.numpy()).mean())
+                for gi, v in crossed:
+                    row = confusion[gi]
+                    fewshot_file.write(json.dumps({
+                        "t": t, "group": int(group_ids[gi]), "threshold": v, "n": int(n[gi]), "q": int(q[gi]),
+                        "balanced": float(balanced[gi]), "recall": float(row[group_label[gi]] / row.sum()),
+                        "acc": acc, "confusion": confusion.tolist()}) + "\n")
+                fewshot_file.flush()
 
             if next_ckpt < len(checkpoints) and t >= checkpoints[next_ckpt]:
                 t0 = time.perf_counter()
@@ -233,11 +259,14 @@ def main(argv=None):
                     next_ckpt += 1
 
     ckpt_file.close()
+    fewshot_file.close()
     with open(os.path.join(args.out, "stream_stats.json"), "w") as f:
         json.dump(stream_stats, f)
     with open(os.path.join(args.out, "checkpoints.jsonl")) as f:
         records = [json.loads(line) for line in f]
     summary = metrics.summarize(records, group_label)
+    with open(os.path.join(args.out, "fewshot.jsonl")) as f:
+        summary["fewshot_triggered"] = metrics.summarize_fewshot([json.loads(line) for line in f])
     if hasattr(model, "updates"):
         summary["replay_updates"] = model.updates
     if hasattr(model, "buffer"):
