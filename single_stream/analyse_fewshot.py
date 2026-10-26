@@ -7,7 +7,8 @@ and seeds, plus final / anytime averaged over seeds.
 
 --fig-digits out.png --cell C,CAPACITY: per-digit breakdown at one cluster size / capacity, one row per model,
 columns recall / specificity / balanced score of the triggering digit and overall accuracy, against n; thin
-line per digit (mean over seeds), bold = mean over digits. Assumes group id = label (task 1, unpermuted or
+line per digit (mean over seeds), bold = mean over digits; dashed (overall accuracy) = digits seen so far / 10,
+mean over digits, the ceiling without guessing unseen digits. Assumes group id = label (task 1, unpermuted or
 permuted MNIST).
 
 --fig: few-shot curve E(n) per cluster size (rows) and capacity (columns). --fig-by-c: every metric against
@@ -119,16 +120,22 @@ def main():
 
 
 def digit_scores(path):
-    """{(digit, threshold): (recall, specificity, balanced, overall acc)} from a run's fewshot.jsonl."""
-    out = {}
+    """
+    {(digit, threshold): (recall, specificity, balanced, overall acc, ceiling)} from a run's fewshot.jsonl.
+    ceiling = digits seen so far / number of digits: the best overall accuracy possible without guessing unseen
+    digits (a digit's first exposure is its threshold-1 record).
+    """
     with open(path) as f:
-        for line in f:
-            r = json.loads(line)
-            conf = np.array(r["confusion"], dtype=np.float64)
-            g = r["group"]
-            other = np.arange(len(conf)) != g
-            spec = 1 - conf[other, g].sum() / conf[other].sum()
-            out[(g, r["threshold"])] = (r["recall"], spec, r["balanced"], r["acc"])
+        recs = [json.loads(line) for line in f]
+    first = {r["group"]: r["t"] for r in recs if r["threshold"] == 1}
+    out = {}
+    for r in recs:
+        conf = np.array(r["confusion"], dtype=np.float64)
+        g = r["group"]
+        other = np.arange(len(conf)) != g
+        spec = 1 - conf[other, g].sum() / conf[other].sum()
+        ceiling = sum(1 for t in first.values() if t <= r["t"]) / len(conf)
+        out[(g, r["threshold"])] = (r["recall"], spec, r["balanced"], r["acc"], ceiling)
     return out
 
 
@@ -155,6 +162,9 @@ def figure_digits(grid_dir, runs, c, cap, get, path, seeds):
                 ax.annotate(str(d), (ths[-1], vals[i, -1, col]), fontsize=6, color=INK2, xytext=(3, 0),
                             textcoords="offset points", va="center")
             ax.plot(ths, vals[:, :, col].mean(0), color=INK, lw=2.2, marker="o", ms=4)
+            if col == 3:
+                ax.plot(ths, vals[:, :, 4].mean(0), color=INK2, lw=1.6, ls="--", label="digits seen / 10")
+                ax.legend(loc="upper left", frameon=False, fontsize=8)
             ax.set_xscale("log", base=2)
             ax.set_xticks([1, 4, 16, 64, 256], ["1", "4", "16", "64", "256"])
             ax.minorticks_off()
