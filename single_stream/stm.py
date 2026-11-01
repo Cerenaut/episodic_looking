@@ -90,14 +90,15 @@ class RLSTM:
         value_window = torch.zeros(B, H)
 
         logits = [out["logits"]]
-        inputs, windows, samples, log_p_old, values = [], [], [], [], []
+        inputs, windows, contexts, samples, log_p_old, values = [], [], [], [], [], []
         keys_a, active_a, keys_c, active_c, biases = [], [], [], [], []
         with torch.set_grad_enabled(learn):
             for t in range(T):
                 inp = self._input(history)
-                v, kc, ac = self.model.do_critic(inp)
+                ctx = torch.full((B, 1), (T - t) / T) if cfg.step_input else None
+                v, kc, ac = self.model.do_critic(inp, ctx)
                 value_window = torch.cat([value_window[:, 1:], v.detach()[:, None]], dim=1)
-                policy, ka, aa = self.model.do_actor(inp, value_window)
+                policy, ka, aa = self.model.do_actor(inp, value_window, ctx)
                 a = policy.sample if sample else policy.mean.detach()
                 a = a.detach()
                 bias = bias + a if self.incremental else a   # bias applied (cumulative if incremental)
@@ -110,6 +111,7 @@ class RLSTM:
                 logits.append(out["logits"])
                 inputs.append(inp)
                 windows.append(value_window)
+                contexts.append(ctx)
                 samples.append(a)
                 log_p_old.append(policy.distribution.log_prob(a).sum(-1).detach())
                 values.append(v)
@@ -117,28 +119,29 @@ class RLSTM:
                 keys_a.append(ka); active_a.append(aa); keys_c.append(kc); active_c.append(ac)
 
         result = {"logits": torch.stack(logits), "values": torch.stack(values).detach(), "bias": torch.stack(biases),
-                  "actions": torch.stack(samples)}
+                  "actions": torch.stack(samples), "active_actor": active_a, "active_critic": active_c}
         if y is None:
             return result
         scores = [self.model.step_score(lg, y) for lg in logits]
-        rewards = self.model.episode_rewards(scores)
+        rewards = self.model.episode_rewards(scores, result["logits"].argmax(2))
         returns = self.model.returns(rewards, result["values"])
         result.update({"scores": torch.stack(scores), "rewards": rewards, "returns": returns})
         if learn:
-            self._update(inputs, windows, samples, log_p_old, values, returns)
+            self._update(inputs, windows, contexts, samples, log_p_old, values, returns)
             if active_a[0] is not None:
                 self.recruited += self.model.recruit(keys_a, active_a, keys_c, active_c)
             self.episodes += 1
         return result
 
-    def _update(self, inputs, windows, samples, log_p_old, values, returns):
+    def _update(self, inputs, windows, contexts, samples, log_p_old, values, returns):
         cfg = self.model.config
         v = torch.stack(values)                       # [T, B], with grads
         advantage = (returns - v.detach())            # [T, B]
         log_p_old = torch.stack(log_p_old)
         inp, win, smp = torch.cat(inputs), torch.cat(windows), torch.cat(samples)
+        ctx = torch.cat(contexts) if contexts[0] is not None else None
         for k in range(cfg.actor_updates):
-            log_p = self.model.actor_log_p(inp, win, smp)
+            log_p = self.model.actor_log_p(inp, win, smp, ctx)
             loss = self.model.actor_loss(log_p, log_p_old.flatten(), advantage.flatten())
             if k == 0:
                 loss = loss + self.model.critic_loss(v.flatten(), returns.flatten())

@@ -74,7 +74,7 @@ class TestEpisode(unittest.TestCase):
         net, stm = make_stm(steps=4, history=2)
         seen = []
         orig = stm.model.do_critic
-        stm.model.do_critic = lambda inp: (seen.append(inp.clone()), orig(inp))[1]
+        stm.model.do_critic = lambda inp, ctx=None: (seen.append(inp.clone()), orig(inp, ctx))[1]
         x = torch.rand(1, 49 * 8)
         res = stm.episode(x)
         O = stm.model.observation_size
@@ -196,6 +196,42 @@ class TestBiasBasis(unittest.TestCase):
         res = stm.episode(x, torch.tensor([1, 2]), learn=True)
         self.assertEqual(tuple(res["bias"].shape), (2, 2, 9))
         torch.testing.assert_close(res["logits"][-1], net.eval().run(x, res["bias"][-1] @ b)["logits"])
+
+
+class TestEpisodeInputs(unittest.TestCase):
+
+    def test_clique_constant_over_episode(self):
+        """The clique is chosen from the unbiased first observation only, so it is the same at every step, for the
+        actor and the critic, whatever biases the actor applies."""
+        _, stm = make_stm(steps=5, history=2)
+        x = torch.rand(3, 49 * 8)
+        res = stm.episode(x, torch.tensor([1, 2, 3]), learn=True)
+        for key in ("active_actor", "active_critic"):
+            first = res[key][0].sort(1).values
+            for a in res[key][1:]:
+                torch.testing.assert_close(a.sort(1).values, first, atol=0, rtol=0)
+
+    def test_first_observation_in_model_input(self):
+        net, stm = make_stm(steps=2, history=2)
+        m = stm.model
+        O = m.observation_size
+        inp = torch.rand(2, 2 * O + O)
+        _, model_input = m.prepare_input(inp)
+        self.assertEqual(model_input.shape[1], 3 * O)
+        torch.testing.assert_close(model_input[:, -O:], inp[:, -O:])
+
+    def test_step_input(self):
+        net, stm = make_stm(steps=3, history=2, step_input=True)
+        res = stm.episode(torch.rand(2, 49 * 8), torch.tensor([0, 1]), learn=True)
+        self.assertEqual(tuple(res["logits"].shape), (4, 2, 10))
+
+    def test_class_bonus(self):
+        classes = torch.tensor([[3, 1], [3, 2], [5, 2], [3, 1], [7, 4]])  # [T + 1, B], step 0 = unbiased
+        novel = MnistModel.novel_classes(classes)
+        torch.testing.assert_close(novel, torch.tensor([[0., 1.], [1., 0.], [0., 0.], [1., 1.]]))
+        _, stm = make_stm(reward_type="accuracy-improvement", class_bonus=0.05)
+        scores = [torch.zeros(2)] * 5
+        torch.testing.assert_close(stm.model.episode_rewards(scores, classes), 0.05 * novel)
 
 
 class TestIncremental(unittest.TestCase):

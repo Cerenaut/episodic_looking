@@ -102,6 +102,9 @@ def parse_args(argv=None):
     p.add_argument("--stm-no-live", action="store_true", help="STM learns from replay episodes only")
     p.add_argument("--stm-sparse-init", default="none", choices=["none", "critic", "actor", "both"],
                    help="sparsity-aware init (layers after the masked one scaled by sqrt(H/k), hidden biases 0)")
+    p.add_argument("--stm-no-first-input", action="store_true", help="unbiased first observation not an STM input")
+    p.add_argument("--stm-step-input", action="store_true", help="fraction of the episode remaining as an STM input")
+    p.add_argument("--stm-class-bonus", type=float, default=0.0, help="STM reward per class newly reached")
     p.add_argument("--stm-incremental", action="store_true", help="STM actions are changes to a cumulative bias")
     p.add_argument("--stm-recruit-rate", type=float, default=0.0, help="idle-cell recruitment; 0 = off")
     p.add_argument("--stm-recruit-idle", type=int, default=10000)
@@ -183,7 +186,8 @@ def build_stm(args, net, num_classes):
         actor_value_input=not args.stm_no_value_input, input_conditioning=args.stm_conditioning,
         mask_key=args.stm_mask_key, recruit_rate=args.stm_recruit_rate, recruit_idle_steps=args.stm_recruit_idle,
         recruit_prob=args.stm_recruit_prob, stm_critic_sparse_init=args.stm_sparse_init in ("critic", "both"),
-        stm_actor_sparse_init=args.stm_sparse_init in ("actor", "both"), seed=args.seed)
+        stm_actor_sparse_init=args.stm_sparse_init in ("actor", "both"), first_input=not args.stm_no_first_input,
+        step_input=args.stm_step_input, class_bonus=args.stm_class_bonus, seed=args.seed)
     model = MnistModel(config, encoded_size=net.d_model, bias_size=net.bias_size)
     return RLSTM(net, model, steps=args.stm_steps, lr=args.stm_lr, momentum=args.stm_momentum,
                  incremental=args.stm_incremental)

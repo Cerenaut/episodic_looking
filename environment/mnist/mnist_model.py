@@ -63,6 +63,12 @@ class MnistModelConfig:
     policy_std: float | None = 0.5
     eval_bias: str = "mean"  # "mean" or "sample" at evaluation
     actor_value_input: bool = True  # the critic's values of the history steps are part of the actor's input
+    # The episode's first (unbiased) observation, logits included, is part of the actor's and critic's input at every
+    # step: a fixed reference (Dave, 1 Nov). With mask key "first" it is also the clique key, so the clique is
+    # constant over the episode.
+    first_input: bool = True
+    step_input: bool = False  # the fraction of the episode remaining, (T - t) / T, is part of both models' input
+    class_bonus: float = 0.0  # reward for each LTM class (argmax) reached for the first time in the episode
 
     # Input conditioning and mask key (copied from CifarModelConfig; see there)
     input_conditioning: str = "none"
@@ -179,16 +185,19 @@ class MnistModel:
         if self.is_first_observation_input():
             self.critic_input_size += self.observation_size
         self.value_input_size = self.config.history_size if self.config.actor_value_input else 0
+        self.context_size = 1 if self.config.step_input else 0
         key_size = self.create_input_conditioning()
 
         num_terms = 2 if self.config.policy_std is None else 1  # mean (+ log std)
         self.policy_config = PolicyConfig(action_type=PolicyUtil.ACTION_TYPE_CONTINUOUS,
                                           policy_std=self.config.policy_std,
                                           policy_ratio_limit=self.config.policy_ratio_limit)
-        history_input = self.observation_size * self.config.history_size
-        self.model_actor = self.create_model("Actor", history_input + self.value_input_size,
+        model_input = self.observation_size * self.config.history_size + self.context_size
+        if self.config.first_input:
+            model_input += self.observation_size
+        self.model_actor = self.create_model("Actor", model_input + self.value_input_size,
                                              self.bias_size * num_terms, key_size, seed=self.config.seed)
-        self.model_critic = self.create_model("Critic", history_input, 1, key_size, seed=self.config.seed + 1)
+        self.model_critic = self.create_model("Critic", model_input, 1, key_size, seed=self.config.seed + 1)
         if self.config.stm_critic_sparse_init:
             self.apply_sparse_init(self.model_critic)
         if self.config.stm_actor_sparse_init:
@@ -204,7 +213,8 @@ class MnistModel:
                 layer.bias.zero_()
 
     def is_first_observation_input(self) -> bool:
-        return self.config.mask_key == MnistModel.MASK_KEY_FIRST
+        """True if the raw input vector carries the episode's first observation after the history."""
+        return self.config.mask_key == MnistModel.MASK_KEY_FIRST or self.config.first_input
 
     def create_input_conditioning(self) -> int:
         """Conditioning of the STM input (see CifarModelConfig). Returns the size of the sparse mask's key."""
@@ -256,6 +266,11 @@ class MnistModel:
             model_input = history_conditioned.reshape(B, T * O)
         else:
             model_input = input[:, :T * O]
+        if self.config.first_input:
+            first = input[:, T * O:T * O + O]
+            if self.config.input_conditioning_target == MnistModel.CONDITIONING_TARGET_BOTH:
+                first = self.input_conditioner_first(first)
+            model_input = torch.cat([model_input, first], dim=1)
         if self.config.mask_key == MnistModel.MASK_KEY_HISTORY:
             key = (history_conditioned * self.mask_key_weight).reshape(B, T * O)
         elif self.config.mask_key == MnistModel.MASK_KEY_CURRENT:
@@ -283,9 +298,15 @@ class MnistModel:
         output, _ = model.do_model(key_input=key, model_input=model_input, active_mask=active_mask)
         return output, key, active_indices
 
-    def do_actor(self, input: torch.Tensor, values: torch.Tensor | None):
-        logits, key, active = self.do_model(self.model_actor, input,
-                                            extra=values if self.config.actor_value_input else None)
+    def _extra(self, *parts):
+        parts = [p for p in parts if p is not None]
+        return torch.cat(parts, dim=1) if parts else None
+
+    def do_actor(self, input: torch.Tensor, values: torch.Tensor | None, context: torch.Tensor | None = None):
+        """context: [B, context_size] per-step inputs (the step input), or None."""
+        logits, key, active = self.do_model(
+            self.model_actor, input,
+            extra=self._extra(values if self.config.actor_value_input else None, context))
         distribution, sample = PolicyUtil.sample_policy(logits=logits, config=self.policy_config)
         mean = PolicyUtil.get_policy_mean_continuous(
             logits=PolicyUtil.clamp_logits(logits, max_logit_magnitude=self.policy_config.max_logit_magnitude),
@@ -294,13 +315,14 @@ class MnistModel:
                                    sample_one_hot=None, mean=mean)
         return output, key, active
 
-    def actor_log_p(self, input: torch.Tensor, values: torch.Tensor | None, sample: torch.Tensor):
+    def actor_log_p(self, input: torch.Tensor, values: torch.Tensor | None, sample: torch.Tensor,
+                    context: torch.Tensor | None = None):
         """Joint log-probability of `sample` under the current actor (with grads)."""
-        output, _, _ = self.do_actor(input, values)
+        output, _, _ = self.do_actor(input, values, context)
         return output.distribution.log_prob(sample).sum(dim=-1)
 
-    def do_critic(self, input: torch.Tensor):
-        output, key, active = self.do_model(self.model_critic, input)
+    def do_critic(self, input: torch.Tensor, context: torch.Tensor | None = None):
+        output, key, active = self.do_model(self.model_critic, input, extra=context)
         return output.squeeze(1), key, active
 
     @torch.no_grad()
@@ -343,20 +365,34 @@ class MnistModel:
             return self.get_class_entropy_reward(logits)
         return self.get_class_accuracy_reward(logits, targets)
 
-    def episode_rewards(self, scores: list[torch.Tensor]) -> torch.Tensor:
+    def episode_rewards(self, scores: list[torch.Tensor], classes: torch.Tensor | None = None) -> torch.Tensor:
         """
         scores: T + 1 per-step scores [B] of the LTM output after each bias (index 0 = unbiased, before any action).
+        classes: [T + 1, B] the LTM's predicted class at each step, for the class bonus.
         Returns rewards [T, B] for the T actions.
         """
         s = torch.stack(scores)  # [T + 1, B]
         rt = self.config.reward_type
         if rt in (MnistModel.REWARD_TYPE_ACCURACY_IMPROVEMENT, MnistModel.REWARD_TYPE_ENTROPY_IMPROVEMENT):
-            return s[1:] - s[:-1]
-        if rt == MnistModel.REWARD_TYPE_TERMINAL_ACCURACY:
+            r = s[1:] - s[:-1]
+        elif rt == MnistModel.REWARD_TYPE_TERMINAL_ACCURACY:
             r = torch.zeros_like(s[1:])
             r[-1] = s[-1]
-            return r
-        return s[1:]
+        else:
+            r = s[1:]
+        if self.config.class_bonus > 0:
+            r = r + self.config.class_bonus * self.novel_classes(classes)
+        return r
+
+    @staticmethod
+    def novel_classes(classes: torch.Tensor) -> torch.Tensor:
+        """classes [T + 1, B] -> [T, B]: 1 where the class after action t was not reached at any earlier step of the
+        episode (step 0, the unbiased answer, counts as reached)."""
+        T1 = classes.shape[0]
+        out = torch.zeros(T1 - 1, classes.shape[1])
+        for t in range(1, T1):
+            out[t - 1] = (classes[:t] != classes[t][None]).all(0).float()
+        return out
 
     # Losses -----------------------------------------------------------------------------------------------------
 
