@@ -63,10 +63,6 @@ class MnistModelConfig:
     policy_std: float | None = 0.5
     eval_bias: str = "mean"  # "mean" or "sample" at evaluation
     actor_value_input: bool = True  # the critic's values of the history steps are part of the actor's input
-    # The episode's first (unbiased) observation, logits included, is part of the actor's and critic's input at every
-    # step: a fixed reference (Dave, 1 Nov). With mask key "first" it is also the clique key, so the clique is
-    # constant over the episode.
-    first_input: bool = True
     step_input: bool = False  # the fraction of the episode remaining, (T - t) / T, is part of both models' input
     class_bonus: float = 0.0  # reward for each LTM class (argmax) reached for the first time in the episode
 
@@ -193,8 +189,6 @@ class MnistModel:
                                           policy_std=self.config.policy_std,
                                           policy_ratio_limit=self.config.policy_ratio_limit)
         model_input = self.observation_size * self.config.history_size + self.context_size
-        if self.config.first_input:
-            model_input += self.observation_size
         self.model_actor = self.create_model("Actor", model_input + self.value_input_size,
                                              self.bias_size * num_terms, key_size, seed=self.config.seed)
         self.model_critic = self.create_model("Critic", model_input, 1, key_size, seed=self.config.seed + 1)
@@ -213,8 +207,9 @@ class MnistModel:
                 layer.bias.zero_()
 
     def is_first_observation_input(self) -> bool:
-        """True if the raw input vector carries the episode's first observation after the history."""
-        return self.config.mask_key == MnistModel.MASK_KEY_FIRST or self.config.first_input
+        """True if the raw input vector carries the episode's first observation after the history: with mask key
+        "first" the clique is chosen from the unbiased observation, so it is constant over the episode."""
+        return self.config.mask_key == MnistModel.MASK_KEY_FIRST
 
     def create_input_conditioning(self) -> int:
         """Conditioning of the STM input (see CifarModelConfig). Returns the size of the sparse mask's key."""
@@ -266,11 +261,6 @@ class MnistModel:
             model_input = history_conditioned.reshape(B, T * O)
         else:
             model_input = input[:, :T * O]
-        if self.config.first_input:
-            first = input[:, T * O:T * O + O]
-            if self.config.input_conditioning_target == MnistModel.CONDITIONING_TARGET_BOTH:
-                first = self.input_conditioner_first(first)
-            model_input = torch.cat([model_input, first], dim=1)
         if self.config.mask_key == MnistModel.MASK_KEY_HISTORY:
             key = (history_conditioned * self.mask_key_weight).reshape(B, T * O)
         elif self.config.mask_key == MnistModel.MASK_KEY_CURRENT:

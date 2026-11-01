@@ -211,15 +211,6 @@ class TestEpisodeInputs(unittest.TestCase):
             for a in res[key][1:]:
                 torch.testing.assert_close(a.sort(1).values, first, atol=0, rtol=0)
 
-    def test_first_observation_in_model_input(self):
-        net, stm = make_stm(steps=2, history=2)
-        m = stm.model
-        O = m.observation_size
-        inp = torch.rand(2, 2 * O + O)
-        _, model_input = m.prepare_input(inp)
-        self.assertEqual(model_input.shape[1], 3 * O)
-        torch.testing.assert_close(model_input[:, -O:], inp[:, -O:])
-
     def test_step_input(self):
         net, stm = make_stm(steps=3, history=2, step_input=True)
         res = stm.episode(torch.rand(2, 49 * 8), torch.tensor([0, 1]), learn=True)

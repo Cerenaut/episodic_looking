@@ -178,8 +178,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         policy_std=args.policy_std, actor_value_input=not args.no_value_input, input_conditioning=args.conditioning,
         mask_key=args.mask_key, recruit_rate=args.recruit_rate, recruit_idle_steps=args.recruit_idle,
         stm_critic_sparse_init=args.sparse_init in ("critic", "both"),
-        stm_actor_sparse_init=args.sparse_init in ("actor", "both"), first_input=not args.no_first_input,
-        step_input=args.step_input, class_bonus=args.class_bonus, seed=args.seed)
+        stm_actor_sparse_init=args.sparse_init in ("actor", "both"), step_input=args.step_input, class_bonus=args.class_bonus, seed=args.seed)
     basis = None
     if args.bias_grid:
         if args.bias_mode != "where":
@@ -257,7 +256,6 @@ def main():
     p.add_argument("--d-model", type=int, default=64)
     p.add_argument("--bias-scale", type=float, default=1.3863)
     p.add_argument("--bias-mode", default="where", choices=["where", "what"])
-    p.add_argument("--no-first-input", action="store_true", help="rl: unbiased first observation not a model input")
     p.add_argument("--step-input", action="store_true", help="rl: fraction of the episode remaining as an input")
     p.add_argument("--class-bonus", type=float, default=0.0, help="rl: reward per class newly reached in the episode")
     p.add_argument("--incremental", action="store_true", help="rl: actions are changes to a cumulative bias")
