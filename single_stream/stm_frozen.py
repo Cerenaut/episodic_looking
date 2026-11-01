@@ -143,12 +143,15 @@ def cmd_ltm(args, xt, yt, xv, yv, log):
 
     def evaluate(n):
         net.eval()
+        shots = torch.nonzero(yt == args.new_digit).flatten()
         with torch.no_grad():
             s = summary(net(xe).argmax(1), ye, args.new_digit)
+            s["new_train_recall"] = float((net(xt[shots]).argmax(1) == args.new_digit).float().mean())
         s["samples"] = n
         s["new_samples"] = int((yt[order[:n]] == args.new_digit).sum())
         history.append(s)
-        log(f"{args.name} samples {n:>6d}  acc {s['acc']:.4f}  new {s['new_recall']:.3f}  others {s['others_acc']:.4f}")
+        log(f"{args.name} samples {n:>6d}  acc {s['acc']:.4f}  mem {s['new_train_recall']:.3f}  new {s['new_recall']:.3f}  "
+            f"others {s['others_acc']:.4f}")
 
     evaluate(0)
     B = args.ltm_batch
@@ -179,6 +182,9 @@ def cmd_rl(args, xt, yt, xv, yv, log):
     stm = RLSTM(net, MnistModel(config, encoded_size=net.d_model, bias_size=net.bias_size), steps=args.steps,
                 lr=args.stm_lr, momentum=args.stm_momentum)
     xe, ye = xv[:args.eval_images], yv[:args.eval_images]
+    shots = torch.nonzero(yt == args.new_digit).flatten()  # the few-shot training images (memorisation)
+    others_idx = torch.nonzero(yt != args.new_digit).flatten()
+    gf = torch.Generator().manual_seed(args.seed + 11)
     history = []
     t0 = time.time()
     order = stream_order(args, yt)
@@ -193,7 +199,10 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         s0 = summary(pred[0], ye, args.new_digit)
         v = res["values"][-1]
         final = res["scores"][-1]
-        rec = {"episodes": ep, "samples": ep, "learning_episodes": ep * args.repeats, "new_samples": int((yt[order[:ep]] == args.new_digit).sum()), "step_acc": step_acc, "new_recall_unbiased": s0["new_recall"],
+        with torch.no_grad():
+            mem = stm.episode(xt[shots], yt[shots])["logits"][-1].argmax(1)
+        rec_mem = float((mem == args.new_digit).float().mean())
+        rec = {"new_train_recall": rec_mem, "episodes": ep, "samples": ep, "learning_episodes": ep * (args.repeats + args.interleave * (args.repeats - 1)), "new_samples": int((yt[order[:ep]] == args.new_digit).sum()), "step_acc": step_acc, "new_recall_unbiased": s0["new_recall"],
                "new_recall": s["new_recall"], "others_acc": s["others_acc"], "acc": s["acc"],
                "step_score": res["scores"].mean(1).tolist(), "value_last": float(v.mean()),
                "value_final_corr": float(torch.corrcoef(torch.stack([v, final]))[0, 1]) if v.std() > 0 else 0.0,
@@ -204,7 +213,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
             for name, m in (("actor", stm.model.model_actor), ("critic", stm.model.model_critic)):
                 rec.update({f"{name}_{k}": val for k, val in m.utilisation().items()})
         history.append(rec)
-        log(f"{args.name} ep {ep:>6d}  step acc {' '.join(f'{a:.4f}' for a in step_acc)}  new {s0['new_recall']:.3f}"
+        log(f"{args.name} ep {ep:>6d}  step acc {' '.join(f'{a:.4f}' for a in step_acc)}  mem {rec_mem:.3f}  new {s0['new_recall']:.3f}"
             f"->{s['new_recall']:.3f}  others {s['others_acc']:.4f}  V {rec['value_last']:.3f} "
             f"corr {rec['value_final_corr']:.2f}  |b| {rec['bias_abs']:.2f}  {rec['time']:.0f}s")
 
@@ -213,12 +222,18 @@ def cmd_rl(args, xt, yt, xv, yv, log):
     for ep in range(1, args.episodes + 1):
         j = order[ep - 1]
         for k in range(args.repeats):  # r independent learning episodes per sample ("thinking time")
+            if k > 0:
+                # between repeats: `interleave` learning episodes on iid images of the other digits (stand-in
+                # for replay of other material), so repeats are not back to back
+                for f in others_idx[torch.randint(len(others_idx), (args.interleave,), generator=gf)]:
+                    stm.episode(xt[f:f + 1], yt[f:f + 1], learn=True)
             res = stm.episode(xt[j:j + 1], yt[j:j + 1], learn=True)
             if k == 0:
                 train_scores.append(float(res["scores"][-1, 0]))
         if ep in checkpoints:
             evaluate(ep)
-    return {"history": history, "ms_per_episode": 1000 * (time.time() - t0) / (args.episodes * args.repeats)}
+    n_episodes = args.episodes * (args.repeats + args.interleave * (args.repeats - 1))
+    return {"history": history, "learning_episodes": n_episodes, "ms_per_episode": 1000 * (time.time() - t0) / n_episodes}
 
 
 def main():
@@ -239,6 +254,8 @@ def main():
     p.add_argument("--ltm-batch", type=int, default=16)
     p.add_argument("--episodes", type=int, default=20000, help="samples presented (rl: x repeats episodes)")
     p.add_argument("--repeats", type=int, default=1, help="rl: independent learning episodes per sample")
+    p.add_argument("--interleave", type=int, default=0,
+                   help="rl: learning episodes on iid other-digit images between consecutive repeats")
     p.add_argument("--first-checkpoint", type=int, default=100)
     p.add_argument("--checkpoints", type=int, default=8)
     p.add_argument("--new-fraction", type=float, default=0.0,
