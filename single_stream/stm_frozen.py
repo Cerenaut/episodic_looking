@@ -112,6 +112,59 @@ def cmd_bound(args, xt, yt, xv, yv, log):
     return out
 
 
+def stream_order(args, yt):
+    """The training samples presented, one per episode (rl) or per sample (ltm): iid over the snapshot's training
+    images, with --new-fraction of them drawn from the few-shot images (a stand-in for a prioritised buffer).
+    Identical for rl and ltm with the same seed, so their curves share the x-axis."""
+    g = torch.Generator().manual_seed(args.seed + 7)
+    order = torch.randint(len(yt), (args.episodes,), generator=g)
+    if args.new_fraction > 0:
+        new_idx = torch.nonzero(yt == args.new_digit).flatten()
+        pick_new = torch.rand(args.episodes, generator=g) < args.new_fraction
+        order[pick_new] = new_idx[torch.randint(len(new_idx), (int(pick_new.sum()),), generator=g)]
+    return order
+
+
+def eval_checkpoints(args):
+    return set(np.unique(np.geomspace(100, args.episodes, 8).astype(int)).tolist())
+
+
+def cmd_ltm(args, xt, yt, xv, yv, log):
+    """The LTM's own learning from the same sample stream as `rl`: the snapshot trained on (AdamW, its lr), one
+    minibatch of the last `ltm_batch` samples every `ltm_batch` samples (one sample-gradient per sample, as the
+    replay LTM's batch 16 every 16). Evaluated at the same checkpoints on the same images."""
+    net = make_net(args, "where")
+    net.load_state_dict(torch.load(os.path.join(args.out, "snapshot.pt"), weights_only=True))
+    opt = torch.optim.AdamW(net.parameters(), lr=args.lr)
+    order = stream_order(args, yt)
+    xe, ye = xv[:args.eval_images], yv[:args.eval_images]
+    checkpoints = eval_checkpoints(args)
+    history = []
+
+    def evaluate(n):
+        net.eval()
+        with torch.no_grad():
+            s = summary(net(xe).argmax(1), ye, args.new_digit)
+        s["samples"] = n
+        s["new_samples"] = int((yt[order[:n]] == args.new_digit).sum())
+        history.append(s)
+        log(f"{args.name} samples {n:>6d}  acc {s['acc']:.4f}  new {s['new_recall']:.3f}  others {s['others_acc']:.4f}")
+
+    evaluate(0)
+    B = args.ltm_batch
+    for n in range(1, args.episodes + 1):
+        if n % B == 0:
+            idx = order[n - B:n]
+            net.train()
+            loss = F.cross_entropy(net(xt[idx]), yt[idx])
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        if n in checkpoints:
+            evaluate(n)
+    return {"history": history}
+
+
 def cmd_rl(args, xt, yt, xv, yv, log):
     net = load_snapshot(args, args.bias_mode)
     torch.manual_seed(args.seed)
@@ -125,16 +178,10 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         stm_actor_sparse_init=args.sparse_init in ("actor", "both"), seed=args.seed)
     stm = RLSTM(net, MnistModel(config, encoded_size=net.d_model, bias_size=net.bias_size), steps=args.steps,
                 lr=args.stm_lr, momentum=args.stm_momentum)
-    g = torch.Generator().manual_seed(args.seed + 7)
     xe, ye = xv[:args.eval_images], yv[:args.eval_images]
     history = []
     t0 = time.time()
-    order = torch.randint(len(yt), (args.episodes,), generator=g)
-    if args.new_fraction > 0:
-        # oversample the few-shot images (stand-in for a novelty-prioritised replay buffer)
-        new_idx = torch.nonzero(yt == args.new_digit).flatten()
-        pick_new = torch.rand(args.episodes, generator=g) < args.new_fraction
-        order[pick_new] = new_idx[torch.randint(len(new_idx), (int(pick_new.sum()),), generator=g)]
+    order = stream_order(args, yt)
     train_scores = []
 
     def evaluate(ep):
@@ -146,7 +193,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         s0 = summary(pred[0], ye, args.new_digit)
         v = res["values"][-1]
         final = res["scores"][-1]
-        rec = {"episodes": ep, "step_acc": step_acc, "new_recall_unbiased": s0["new_recall"],
+        rec = {"episodes": ep, "new_samples": int((yt[order[:ep]] == args.new_digit).sum()), "step_acc": step_acc, "new_recall_unbiased": s0["new_recall"],
                "new_recall": s["new_recall"], "others_acc": s["others_acc"], "acc": s["acc"],
                "step_score": res["scores"].mean(1).tolist(), "value_last": float(v.mean()),
                "value_final_corr": float(torch.corrcoef(torch.stack([v, final]))[0, 1]) if v.std() > 0 else 0.0,
@@ -161,7 +208,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
             f"->{s['new_recall']:.3f}  others {s['others_acc']:.4f}  V {rec['value_last']:.3f} "
             f"corr {rec['value_final_corr']:.2f}  |b| {rec['bias_abs']:.2f}  {rec['time']:.0f}s")
 
-    checkpoints = set(np.unique(np.geomspace(100, args.episodes, 8).astype(int)).tolist())
+    checkpoints = eval_checkpoints(args)
     evaluate(0)
     for ep in range(1, args.episodes + 1):
         j = order[ep - 1]
@@ -174,7 +221,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("command", choices=["snapshot", "bound", "rl"])
+    p.add_argument("command", choices=["snapshot", "bound", "rl", "ltm"])
     p.add_argument("--out", required=True)
     p.add_argument("--name", default="rl")
     p.add_argument("--data-root", default=os.path.expanduser("~/dev/claude/mnist"))
@@ -187,6 +234,7 @@ def main():
     p.add_argument("--bias-scale", type=float, default=1.3863)
     p.add_argument("--bias-mode", default="where", choices=["where", "what"])
     p.add_argument("--bound-steps", type=int, default=200)
+    p.add_argument("--ltm-batch", type=int, default=16)
     p.add_argument("--episodes", type=int, default=20000)
     p.add_argument("--new-fraction", type=float, default=0.0,
                    help="rl: fraction of training episodes drawn from the new digit's few-shot images")
@@ -215,7 +263,7 @@ def main():
     args = p.parse_args()
     torch.set_num_threads(args.threads)
     os.makedirs(args.out, exist_ok=True)
-    result_path = os.path.join(args.out, f"{args.command if args.command != 'rl' else args.name}.json")
+    result_path = os.path.join(args.out, f"{args.command if args.command in ('snapshot', 'bound') else args.name}.json")
     if os.path.exists(result_path):
         raise SystemExit(f"{result_path} exists; refusing to overwrite")
     logf = open(os.path.join(args.out, "log.txt"), "a")
@@ -227,7 +275,7 @@ def main():
 
     log(f"== {args.command} {json.dumps(vars(args))}")
     data = load_data(args)
-    result = {"cmd_snapshot": cmd_snapshot, "cmd_bound": cmd_bound, "cmd_rl": cmd_rl}[f"cmd_{args.command}"](
+    result = {"cmd_snapshot": cmd_snapshot, "cmd_bound": cmd_bound, "cmd_rl": cmd_rl, "cmd_ltm": cmd_ltm}[f"cmd_{args.command}"](
         args, *data, log)
     with open(result_path, "w") as f:
         json.dump({"args": vars(args), "result": result}, f, indent=1)
