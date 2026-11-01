@@ -32,12 +32,74 @@ def load(run, name):
     return xs, [h["new_recall"] for h in hist], [h["others_acc"] for h in hist], hist
 
 
+def load_log(run, name):
+    """Checkpoints of a run from log.txt (works while the run is still going): (samples, mem, new, others)."""
+    rows = []
+    for line in open(os.path.join(run, "log.txt")):
+        if not line.startswith(f"{name} ep "):
+            continue
+        f = line.split()
+        rows.append((int(f[2]), float(line.split(" mem ")[1].split()[0]),
+                     float(line.split("->")[1].split()[0]), float(line.split(" others ")[1].split()[0])))
+    return rows
+
+
+def load_ltm(run, name):
+    hist = json.load(open(os.path.join(run, f"{name}.json")))["result"]["history"]
+    return [(h["samples"], h["new_train_recall"], h["new_recall"], h["others_acc"]) for h in hist]
+
+
+def plot_repeats(args):
+    """Wave 4: repeats per sample, memorisation and held-out recall vs samples, one figure per bias mode."""
+    for mode in ("where", "what"):
+        series = [("ltm200_lr0.001", "LTM (AdamW 1e-3)", "ltm")]
+        series += [(f"w4_{mode}_a0.1_r{r}", f"STM {mode}, r={r}", "stm") for r in (1, 8, 16, 64, 128)]
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4.4), facecolor=SURFACE)
+        partial = []
+        for i, (name, label, kind) in enumerate(series):
+            rows = load_ltm(args.run, name) if kind == "ltm" else load_log(args.run, name)
+            if not rows:
+                continue
+            if kind == "stm" and not os.path.exists(os.path.join(args.run, f"{name}.json")):
+                label += f" (running, {rows[-1][0]} samples)"
+                partial.append(name)
+            xs = [max(r[0], 5) for r in rows]
+            for ax, k in zip(axes, (1, 2, 3)):
+                ax.plot(xs, [r[k] for r in rows], color=SERIES[i], lw=2, ls="-" if kind == "ltm" else "--",
+                        marker="o" if kind == "ltm" else "s", ms=5, mec=SURFACE, mew=1.5, label=label, zorder=3)
+        titles = ("Memorised: recall on the 16 training nines", "Generalised: recall on held-out nines",
+                  "Accuracy on digits 0-8")
+        for ax, title in zip(axes, titles):
+            ax.set_facecolor(SURFACE)
+            ax.set_xscale("log")
+            ax.set_xlabel("samples presented (25% nines)")
+            ax.set_title(title, color=INK, loc="left", fontsize=10.5)
+            ax.grid(True, color=GRID, lw=0.8, zorder=0)
+        axes[0].set_ylim(0, 1.02)
+        axes[1].set_ylim(0, 1.02)
+        axes[2].set_ylim(0.85, 1.0)
+        axes[2].legend(loc="lower left", frameon=False, fontsize=8.5, labelcolor=INK)
+        fig.suptitle(f"Frozen gap snapshot: RL STM ({mode} bias, actor 0.1, actor sparse init) with r repeats per sample, "
+                     f"1 other-digit episode between repeats, vs LTM", color=INK, x=0.01, ha="left", fontsize=11.5)
+        fig.tight_layout()
+        path = os.path.join(args.out, f"repeats_{mode}.png")
+        fig.savefig(path, dpi=150, facecolor=SURFACE)
+        plt.close(fig)
+        print(path, "partial:", partial)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--figure", default="speed", choices=["speed", "repeats"])
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
+    plt.rcParams.update({"font.size": 10, "axes.edgecolor": INK2, "axes.labelcolor": INK, "xtick.color": INK2,
+                         "ytick.color": INK2, "axes.spines.top": False, "axes.spines.right": False})
+    if args.figure == "repeats":
+        plot_repeats(args)
+        return
     plt.rcParams.update({"font.size": 10, "axes.edgecolor": INK2, "axes.labelcolor": INK, "xtick.color": INK2,
                          "ytick.color": INK2, "axes.spines.top": False, "axes.spines.right": False})
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.6), facecolor=SURFACE)
