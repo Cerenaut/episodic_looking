@@ -77,6 +77,7 @@ class MnistModelConfig:
     stm_layer_norm_affine: bool = True
     stm_output_bias: bool = True
     stm_critic_sparse_init: bool = False
+    stm_actor_sparse_init: bool = False  # same scaling for the actor (its output layer also sees only k inputs)
 
     # Idle-cell recruitment for the clique selection (SparseDistributedEncoder); 0 = off
     recruit_rate: float = 0.0
@@ -190,6 +191,8 @@ class MnistModel:
         self.model_critic = self.create_model("Critic", history_input, 1, key_size, seed=self.config.seed + 1)
         if self.config.stm_critic_sparse_init:
             self.apply_sparse_init(self.model_critic)
+        if self.config.stm_actor_sparse_init:
+            self.apply_sparse_init(self.model_actor)
 
     def apply_sparse_init(self, model: SparseDistributedModel):
         mlp = model.get_model(0)
