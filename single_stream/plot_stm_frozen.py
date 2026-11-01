@@ -175,11 +175,102 @@ def plot_wave5(args):
     print(path)
 
 
+def load_ltm_any(run, name, max_samples=None):
+    """LTM history as (samples, memorised or None, held-out recall, others) up to max_samples."""
+    hist = json.load(open(os.path.join(run, f"{name}.json")))["result"]["history"]
+    return [(h["samples"], h.get("new_train_recall"), h["new_recall"], h["others_acc"]) for h in hist
+            if max_samples is None or h["samples"] <= max_samples]
+
+
+def plot_curves(args, groups, refs, fname, title):
+    """One row per group: memorised, held-out recall, others vs samples. refs: (name, label, colour, ls, kind, max
+    samples) drawn in every row (kind "ltm" or "stm"); groups: (row title, [(name, label)]) in palette order."""
+    fig, axes = plt.subplots(len(groups), 3, figsize=(16, 4.3 * len(groups)), facecolor=SURFACE, squeeze=False)
+    for ax_row, (row_title, runs) in zip(axes, groups):
+        row_max = max(load_stm(args.run, n)[1][-1][0] for n, _ in runs)
+        # a ref with max_samples is a long-stream reference: only in rows that run longer than 200 samples, and
+        # only from its first checkpoint after 0 (its checkpoints are sparse early on)
+        series = [(n, l, c, ls, k, m) for n, l, c, ls, k, m in refs if m is None or row_max > 200]
+        series += [(n, l, SERIES[i], "--", "stm", None) for i, (n, l) in enumerate(runs)]
+        for name, label, color, ls, kind, max_samples in series:
+            rows = load_ltm_any(args.run, name, max_samples) if kind == "ltm" else load_stm(args.run, name)[1]
+            if max_samples is not None:
+                rows = rows[1:]
+            xs = [max(r[0], 2) for r in rows]
+            for ax, k in zip(ax_row, (1, 2, 3)):
+                pts = [(x, r[k]) for x, r in zip(xs, rows) if r[k] is not None]
+                if pts:
+                    ax.plot(*zip(*pts), color=color, lw=2, ls=ls, marker="o" if kind == "ltm" else "s", ms=4.5,
+                            mec=SURFACE, mew=1.2, label=label, zorder=3)
+        titles = ("Memorised: recall on the 16 training nines", "Generalised: recall on held-out nines",
+                  "Accuracy on digits 0-8")
+        for ax, t in zip(ax_row, titles):
+            ax.set_facecolor(SURFACE)
+            ax.set_title(t, color=INK, loc="left", fontsize=10.5)
+            ax.grid(True, color=GRID, lw=0.8, zorder=0)
+            ax.set_xscale("log")
+            ax.set_xlabel("samples presented")
+        ax_row[0].set_ylim(0, 1.02)
+        ax_row[1].set_ylim(0, 1.02)
+        ax_row[2].set_ylim(0.85, 1.0)
+        ax_row[0].set_ylabel(row_title, color=INK, fontsize=11)
+        ax_row[2].legend(loc="lower left", frameon=False, fontsize=8.5, labelcolor=INK)
+    fig.suptitle(title, color=INK, x=0.01, ha="left", fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.25 / (4.3 * len(groups))))
+    path = os.path.join(args.out, fname)
+    fig.savefig(path, dpi=150, facecolor=SURFACE)
+    plt.close(fig)
+    print(path)
+
+
+def final_table(args, names, path, at=None):
+    """Markdown table: memorised / held-out / others / |bias| / step acc at sample `at` (default: last)."""
+    with open(path, "w") as f:
+        f.write("| run | samples | memorised | held-out 9 | digits 0-8 | mean abs bias | all digits step 0 -> T |\n"
+                "|---|---|---|---|---|---|---|\n")
+        for name, label in names:
+            hist = json.load(open(os.path.join(args.run, f"{name}.json")))["result"]["history"]
+            h = hist[-1] if at is None else max((x for x in hist if x["samples"] <= at), key=lambda x: x["samples"])
+            f.write(f"| {label} | {h['samples']} | {h['new_train_recall']:.3f} | {h['new_recall']:.3f} | "
+                    f"{h['others_acc']:.4f} | {h['bias_abs']:.2f} | {h['step_acc'][0]:.3f} -> {h['step_acc'][-1]:.3f} |\n")
+    print(open(path).read())
+
+
+LTM_REFS = [("ltm200_lr0.001", "LTM (AdamW 1e-3)", INK, "-", "ltm", None),
+            ("ltm_lr0.001", "LTM (AdamW 1e-3), longer stream", INK2, "-", "ltm", 1000)]
+
+
+def plot_wave6(args):
+    """Wave 6: per-step accuracy reward, T 4 H 4: lr x repeats, length, seeds, replay mixing."""
+    base = ("w6_r64_lr0.01", "lr 0.01, r 64 (= wave 5 best)", "#8f8d87", ":", "stm", None)
+    groups = [
+        ("lr, 1000 samples", [("w6_long1000_lr0.01", "lr 0.01"), ("w6_long1000_lr0.03", "lr 0.03"),
+                              ("w6_long1000_lr0.1", "lr 0.1")]),
+        ("repeats, lr 0.01", [("w6_r16_lr0.01", "r 16"), ("w6_r128_lr0.01", "r 128"),
+                              ("w6_actor0.3_lr0.01", "r 64, actor 0.3")]),
+        ("lr 0.03: seeds, repeats", [("w6_r64_lr0.03", "r 64 seed 0"), ("w6_r64_lr0.03_s1", "r 64 seed 1"),
+                                     ("w6_r64_lr0.03_s2", "r 64 seed 2"), ("w6_r16_lr0.03", "r 16"),
+                                     ("w6_r128_lr0.03", "r 128")]),
+        ("mixing, lr 0.03, r 64", [("w6_mix_i0_lr0.03", "interleave 0"), ("w6_mix_i4_lr0.03", "interleave 4 others"),
+                                   ("w6_mix_i1stream_lr0.03", "interleave 1 replay mix"),
+                                   ("w6_mix_i4stream_lr0.03", "interleave 4 replay mix"),
+                                   ("w6_mix_nf0.1_lr0.03", "10% nines"), ("w6_mix_nf0.5_lr0.03", "50% nines")]),
+    ]
+    plot_curves(args, groups, [LTM_REFS[0], LTM_REFS[1], base], "wave6_per_step_accuracy.png",
+                "Frozen gap snapshot, wave 6: RL STM, per-step accuracy reward, T 4, H 4 (where, actor 0.1, "
+                "interleave 1 from other digits, 25% nines unless noted) vs LTM")
+    names = [base[:2]] + [(n, f"{rt}: {l}") for rt, runs in groups for n, l in runs]
+    names += [("w6_r16_lr0.1", "r 16 lr 0.1"), ("w6_r64_lr0.1", "r 64 lr 0.1"), ("w6_r128_lr0.1", "r 128 lr 0.1"),
+              ("w6_actor0.3_lr0.03", "lr 0.03, actor 0.3")]
+    final_table(args, names, os.path.join(args.out, "wave6_at200.md"), at=200)
+    final_table(args, [r for r in groups[0][1]], os.path.join(args.out, "wave6_long.md"))
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--figure", default="speed", choices=["speed", "repeats", "wave5"])
+    p.add_argument("--figure", default="speed", choices=["speed", "repeats", "wave5", "wave6"])
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
     plt.rcParams.update({"font.size": 10, "axes.edgecolor": INK2, "axes.labelcolor": INK, "xtick.color": INK2,
@@ -189,6 +280,9 @@ def main():
         return
     if args.figure == "wave5":
         plot_wave5(args)
+        return
+    if args.figure == "wave6":
+        plot_wave6(args)
         return
     plt.rcParams.update({"font.size": 10, "axes.edgecolor": INK2, "axes.labelcolor": INK, "xtick.color": INK2,
                          "ytick.color": INK2, "axes.spines.top": False, "axes.spines.right": False})
