@@ -49,6 +49,23 @@ class RLSTM:
         self.opt = torch.optim.SGD(model.get_trainable_parameters(), lr=lr, momentum=momentum)
         self.episodes = 0
         self.recruited = 0
+        self.last_update = None   # diagnostics of the last update (losses, advantages, gradient norms)
+        self.param_groups = self._param_groups()
+
+    def _param_groups(self):
+        """Named parameter groups for diagnostics: actor_shared (input layer norm and output bias, applied to every
+        input whatever its clique), actor_hidden (hidden layer weights and biases), actor_out (output weights), critic."""
+        groups = {"actor_shared": [], "actor_hidden": [], "actor_out": [], "critic": []}
+        out_layer = f"dense-layer-{self.model.config.model_layers - 1}"
+        for name, p in self.model.model_actor.named_parameters():
+            if "layer-norm" in name or name.endswith(f"{out_layer}.bias"):
+                groups["actor_shared"].append(p)
+            elif out_layer in name:
+                groups["actor_out"].append(p)
+            else:
+                groups["actor_hidden"].append(p)
+        groups["critic"] = list(self.model.model_critic.parameters())
+        return groups
 
     def observation(self, out, bias):
         return torch.cat([out["features"], bias, out["logits"]], dim=1).detach()
@@ -140,14 +157,27 @@ class RLSTM:
         log_p_old = torch.stack(log_p_old)
         inp, win, smp = torch.cat(inputs), torch.cat(windows), torch.cat(samples)
         ctx = torch.cat(contexts) if contexts[0] is not None else None
+        stats = {"advantage": float(advantage.mean()), "advantage_abs": float(advantage.abs().mean()),
+                 "return_0": float(returns[0].mean()), "value_0": float(v[0].detach().mean())}
         for k in range(cfg.actor_updates):
             log_p = self.model.actor_log_p(inp, win, smp, ctx)
             loss = self.model.actor_loss(log_p, log_p_old.flatten(), advantage.flatten())
             if k == 0:
-                loss = loss + self.model.critic_loss(v.flatten(), returns.flatten())
+                critic_loss = self.model.critic_loss(v.flatten(), returns.flatten())
+                stats.update({"actor_loss": float(loss), "critic_loss": float(critic_loss)})
+                loss = loss + critic_loss
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
+            if k == 0:
+                for name, params in self.param_groups.items():
+                    stats[f"grad_{name}"] = float(torch.sqrt(sum((p.grad ** 2).sum() for p in params
+                                                                 if p.grad is not None)))
             self.opt.step()
+        self.last_update = stats
+
+    def param_vector(self, group):
+        """A detached flat copy of a parameter group (diagnostics: weight change between two points)."""
+        return torch.cat([p.detach().flatten() for p in self.param_groups[group]]).clone()
 
     def num_values(self):
         return self.model.num_values()

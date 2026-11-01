@@ -112,6 +112,16 @@ class TestEpisode(unittest.TestCase):
         self.assertGreater(changed, 0)
         self.assertEqual(stm.episodes, 1)
 
+    def test_update_diagnostics(self):
+        _, stm = make_stm()
+        grouped = {id(p) for ps in stm.param_groups.values() for p in ps}
+        self.assertEqual(grouped, {id(p) for p in stm.model.get_trainable_parameters()})
+        self.assertIsNone(stm.last_update)
+        stm.episode(torch.rand(1, 49 * 8), torch.tensor([3]), learn=True)
+        for group in stm.param_groups:
+            self.assertGreater(stm.last_update[f"grad_{group}"], 0)
+        self.assertIn("advantage", stm.last_update)
+
 
 def objects(n, k, protos, g):
     """Synthetic token images: 49 noise tokens of size 8, k of them carrying class prototypes at random positions.

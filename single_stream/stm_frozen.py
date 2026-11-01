@@ -168,6 +168,10 @@ def cmd_ltm(args, xt, yt, xv, yv, log):
     return {"history": history}
 
 
+def fmt(x):
+    return "-" if x is None else f"{x:.3f}"
+
+
 def cmd_rl(args, xt, yt, xv, yv, log):
     net = load_snapshot(args, args.bias_mode)
     torch.manual_seed(args.seed)
@@ -208,34 +212,89 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         with torch.no_grad():
             mem = stm.episode(xt[shots], yt[shots])["logits"][-1].argmax(1)
         rec_mem = float((mem == args.new_digit).float().mean())
+        seen = torch.isin(shots, order[:ep])
+        mem_hit = (mem == args.new_digit).float()
         rec = {"new_train_recall": rec_mem, "episodes": ep, "samples": ep, "learning_episodes": ep * (args.repeats + args.interleave * (args.repeats - 1)), "new_samples": int((yt[order[:ep]] == args.new_digit).sum()), "step_acc": step_acc, "new_recall_unbiased": s0["new_recall"],
                "new_recall": s["new_recall"], "others_acc": s["others_acc"], "acc": s["acc"],
                "step_score": res["scores"].mean(1).tolist(), "value_last": float(v.mean()),
                "value_final_corr": float(torch.corrcoef(torch.stack([v, final]))[0, 1]) if v.std() > 0 else 0.0,
                "bias_abs": float(res["bias"].abs().mean()),
                "train_final_score": float(np.mean(train_scores[-1000:])) if train_scores else None,
-               "recruited": stm.recruited, "time": time.time() - t0}
+               "recruited": stm.recruited, "time": time.time() - t0,
+               "shots_seen": int(seen.sum()),
+               "mem_seen": float(mem_hit[seen].mean()) if seen.any() else None,
+               "mem_unseen": float(mem_hit[~seen].mean()) if (~seen).any() else None,
+               "actor_shared_norm": float(stm.param_vector("actor_shared").norm())}
         if config.encoder_sparsity > 0:
             for name, m in (("actor", stm.model.model_actor), ("critic", stm.model.model_critic)):
                 rec.update({f"{name}_{k}": val for k, val in m.utilisation().items()})
         history.append(rec)
         log(f"{args.name} ep {ep:>6d}  step acc {' '.join(f'{a:.4f}' for a in step_acc)}  mem {rec_mem:.3f}  new {s0['new_recall']:.3f}"
             f"->{s['new_recall']:.3f}  others {s['others_acc']:.4f}  V {rec['value_last']:.3f} "
-            f"corr {rec['value_final_corr']:.2f}  |b| {rec['bias_abs']:.2f}  {rec['time']:.0f}s")
+            f"corr {rec['value_final_corr']:.2f}  |b| {rec['bias_abs']:.2f}  seen {rec['shots_seen']} "
+            f"mem seen/unseen {fmt(rec['mem_seen'])}/{fmt(rec['mem_unseen'])}  {rec['time']:.0f}s")
+
+    def probe(j):
+        """The STM's current answer on training image j (policy mean, no learning): unbiased and final score p(y),
+        final correctness, mean |bias|, the actor clique."""
+        with torch.no_grad():
+            r = stm.episode(xt[j:j + 1], yt[j:j + 1])
+        return {"score_0": float(r["scores"][0, 0]), "score_T": float(r["scores"][-1, 0]),
+                "correct_T": int(r["logits"][-1, 0].argmax() == yt[j]), "bias_abs": float(r["bias"][-1].abs().mean())}, \
+            r["active_actor"][0][0]
+
+    def summarise(stats):
+        """Mean of the per-update diagnostics over a block of episodes; return_std is the spread of the episode
+        return over the block (the reward signal exploration produces), baseline_error the mean return - value."""
+        out = {k: float(np.mean([u[k] for u in stats])) for k in stats[0]}
+        g = np.array([u["return_0"] for u in stats])
+        out["return_std"] = float(g.std())
+        out["baseline_error"] = float(np.mean([u["return_0"] - u["value_0"] for u in stats]))
+        return out
+
+    # Per-sample diagnostics (the early-learning delay, Dave 1 Nov): one JSON line per sample presented
+    diag = open(os.path.join(args.out, f"{args.name}_diag.jsonl"), "w") if args.diag else None
+    actor_count = dict(stm.model.model_actor.named_buffers())["active_count"]
+    presented = torch.zeros(len(yt), dtype=torch.long)
 
     checkpoints = eval_checkpoints(args)
     evaluate(0)
     for ep in range(1, args.episodes + 1):
         j = order[ep - 1]
+        if diag:
+            pre, cells = probe(j)
+            prior = actor_count[cells]
+            w0 = {g: stm.param_vector(g) for g in stm.param_groups}
+            target, other = [], []
         for k in range(args.repeats):  # r independent learning episodes per sample ("thinking time")
             if k > 0:
                 # between repeats: `interleave` learning episodes on iid images of the other digits (stand-in
                 # for replay of other material), so repeats are not back to back
-                for f in others_idx[torch.randint(len(others_idx), (args.interleave,), generator=gf)]:
+                if args.interleave_source == "others":
+                    fill = others_idx[torch.randint(len(others_idx), (args.interleave,), generator=gf)]
+                else:  # the replay mixture: iid training images, new_fraction of them few-shot images
+                    fill = torch.randint(len(yt), (args.interleave,), generator=gf)
+                    pick = torch.rand(args.interleave, generator=gf) < args.new_fraction
+                    fill[pick] = shots[torch.randint(len(shots), (int(pick.sum()),), generator=gf)]
+                for f in fill:
                     stm.episode(xt[f:f + 1], yt[f:f + 1], learn=True)
+                    if diag:
+                        other.append(stm.last_update)
             res = stm.episode(xt[j:j + 1], yt[j:j + 1], learn=True)
+            if diag:
+                target.append(stm.last_update)
             if k == 0:
                 train_scores.append(float(res["scores"][-1, 0]))
+        if diag:
+            post, _ = probe(j)
+            line = {"sample": ep, "index": int(j), "label": int(yt[j]), "new": int(yt[j] == args.new_digit),
+                    "times_presented": int(presented[j]), "pre": pre, "post": post,
+                    "clique_fresh": float((prior == 0).float().mean()), "clique_prior_mean": float(prior.float().mean()),
+                    "target": summarise(target), "interleaved": summarise(other) if other else None,
+                    "weight_change": {g: float((stm.param_vector(g) - w0[g]).norm()) for g in w0}}
+            diag.write(json.dumps(line) + "\n")
+            diag.flush()
+        presented[j] += 1
         if ep in checkpoints:
             evaluate(ep)
     n_episodes = args.episodes * (args.repeats + args.interleave * (args.repeats - 1))
@@ -266,6 +325,9 @@ def main():
     p.add_argument("--repeats", type=int, default=1, help="rl: independent learning episodes per sample")
     p.add_argument("--interleave", type=int, default=0,
                    help="rl: learning episodes on iid other-digit images between consecutive repeats")
+    p.add_argument("--interleave-source", default="others", choices=["others", "stream"],
+                   help="rl: interleaved episodes on other digits only, or on the replay mixture (new_fraction "
+                        "few-shot images, which can include the current sample's class)")
     p.add_argument("--first-checkpoint", type=int, default=100)
     p.add_argument("--checkpoints", type=int, default=8)
     p.add_argument("--new-fraction", type=float, default=0.0,
@@ -291,6 +353,7 @@ def main():
     p.add_argument("--recruit-rate", type=float, default=0.0)
     p.add_argument("--recruit-idle", type=int, default=10000)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--diag", action="store_true", help="rl: per-sample diagnostics to <name>_diag.jsonl")
     p.add_argument("--threads", type=int, default=2)
     args = p.parse_args()
     torch.set_num_threads(args.threads)
