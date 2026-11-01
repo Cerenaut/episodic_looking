@@ -36,7 +36,8 @@ from single_stream.stm import RLSTM, grid_basis
 def load_data(args):
     train, val = datasets.load("mnist", args.data_root, val_holdout=600, split_seed=0)
     pre = load_checkpoint(args.preproc)
-    rng = np.random.default_rng(args.seed)
+    data_seed = getattr(args, "data_seed", None)
+    rng = np.random.default_rng(args.seed if data_seed is None else data_seed)  # the few-shot images
     y = train.y.numpy()
     new = np.flatnonzero(y == args.new_digit)
     keep = np.concatenate([np.flatnonzero(y != args.new_digit), rng.choice(new, args.new_shots, replace=False)])
@@ -172,6 +173,11 @@ def fmt(x):
     return "-" if x is None else f"{x:.3f}"
 
 
+def episodes_per_sample(args):
+    """Learning episodes per sample: the repeats, plus the interleaved episodes between bursts."""
+    return args.repeats + args.interleave * ((args.repeats - 1) // args.burst)
+
+
 def cmd_rl(args, xt, yt, xv, yv, log):
     net = load_snapshot(args, args.bias_mode)
     torch.manual_seed(args.seed)
@@ -214,7 +220,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         rec_mem = float((mem == args.new_digit).float().mean())
         seen = torch.isin(shots, order[:ep])
         mem_hit = (mem == args.new_digit).float()
-        rec = {"new_train_recall": rec_mem, "episodes": ep, "samples": ep, "learning_episodes": ep * (args.repeats + args.interleave * (args.repeats - 1)), "new_samples": int((yt[order[:ep]] == args.new_digit).sum()), "step_acc": step_acc, "new_recall_unbiased": s0["new_recall"],
+        rec = {"new_train_recall": rec_mem, "episodes": ep, "samples": ep, "learning_episodes": ep * episodes_per_sample(args), "new_samples": int((yt[order[:ep]] == args.new_digit).sum()), "step_acc": step_acc, "new_recall_unbiased": s0["new_recall"],
                "new_recall": s["new_recall"], "others_acc": s["others_acc"], "acc": s["acc"],
                "step_score": res["scores"].mean(1).tolist(), "value_last": float(v.mean()),
                "value_final_corr": float(torch.corrcoef(torch.stack([v, final]))[0, 1]) if v.std() > 0 else 0.0,
@@ -268,9 +274,9 @@ def cmd_rl(args, xt, yt, xv, yv, log):
             w0 = {g: stm.param_vector(g) for g in stm.param_groups}
             target, other = [], []
         for k in range(args.repeats):  # r independent learning episodes per sample ("thinking time")
-            if k > 0:
-                # between repeats: `interleave` learning episodes on iid images of the other digits (stand-in
-                # for replay of other material), so repeats are not back to back
+            if k > 0 and k % args.burst == 0:
+                # between bursts of `burst` repeats: `interleave` learning episodes on iid images of the other
+                # digits (stand-in for replay of other material), so repeats are not all back to back
                 if args.interleave_source == "others":
                     fill = others_idx[torch.randint(len(others_idx), (args.interleave,), generator=gf)]
                 else:  # the replay mixture: iid training images, new_fraction of them few-shot images
@@ -298,7 +304,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         presented[j] += 1
         if ep in checkpoints:
             evaluate(ep)
-    n_episodes = args.episodes * (args.repeats + args.interleave * (args.repeats - 1))
+    n_episodes = args.episodes * episodes_per_sample(args)
     return {"history": history, "learning_episodes": n_episodes, "ms_per_episode": 1000 * (time.time() - t0) / n_episodes}
 
 
@@ -326,6 +332,8 @@ def main():
     p.add_argument("--repeats", type=int, default=1, help="rl: independent learning episodes per sample")
     p.add_argument("--interleave", type=int, default=0,
                    help="rl: learning episodes on iid other-digit images between consecutive repeats")
+    p.add_argument("--burst", type=int, default=1,
+                   help="rl: repeats back to back between interleaves (1: interleave between every two repeats)")
     p.add_argument("--interleave-source", default="others", choices=["others", "stream"],
                    help="rl: interleaved episodes on other digits only, or on the replay mixture (new_fraction "
                         "few-shot images, which can include the current sample's class)")
@@ -356,6 +364,9 @@ def main():
     p.add_argument("--recruit-rate", type=float, default=0.0)
     p.add_argument("--recruit-idle", type=int, default=10000)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--data-seed", type=int, default=None,
+                   help="which few-shot images (default: --seed); the snapshot was trained on data seed 0's, so STM "
+                        "replicates on the same snapshot need --data-seed 0")
     p.add_argument("--diag", action="store_true", help="rl: per-sample diagnostics to <name>_diag.jsonl")
     p.add_argument("--threads", type=int, default=2)
     args = p.parse_args()
