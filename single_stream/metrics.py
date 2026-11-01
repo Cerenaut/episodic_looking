@@ -33,6 +33,21 @@ def evaluate(model, data, batch_size=2000):
     return np.concatenate(preds)
 
 
+@torch.no_grad()
+def evaluate_variants(model, data, batch_size=2000):
+    """Predicted labels of the model ("main") and of any variants it reports (predict_variants, e.g. the STM's
+    unbiased LTM output), from one pass where the model supports it."""
+    if not hasattr(model, "predict_variants"):
+        return {"main": evaluate(model, data, batch_size)}
+    out = {}
+    for i in range(0, len(data), batch_size):
+        for name, logits in model.predict_variants(data.x[i:i + batch_size]).items():
+            out.setdefault(name, []).append(logits.argmax(1).numpy())
+    out = {k: np.concatenate(v) for k, v in out.items()}
+    out["main"] = out["stm"]
+    return out
+
+
 def per_group_accuracy(correct, groups, group_ids):
     return np.array([correct[groups == g].mean() for g in group_ids])
 

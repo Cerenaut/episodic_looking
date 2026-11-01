@@ -23,7 +23,8 @@ import torch
 
 from single_stream import datasets, metrics
 from single_stream.buffers import NeuralBuffer, NoveltyGate, PriorityBuffer, RingBuffer, part_specs
-from single_stream.models import BufferedReplayLTM, ContinualBackprop, LTMOnly, ReplayLTM, ReplayOnlyLTM, build_net
+from single_stream.models import (BufferedReplayLTM, CLSModel, ContinualBackprop, LTMOnly, ReplayLTM, ReplayOnlyLTM,
+                                  build_net)
 from single_stream.stream import ClusteredStream, run_lengths
 
 
@@ -38,11 +39,20 @@ def parse_args(argv=None):
     p.add_argument("--cluster-size", type=int, default=1, help="c")
     p.add_argument("--batch-size", type=int, default=1, help="b")
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--model", default="ltm", choices=["ltm", "replay", "replayonly", "buffered"],
+    p.add_argument("--model", default="ltm", choices=["ltm", "replay", "replayonly", "buffered", "cls"],
                    help="ltm: trained on the stream; replay: stream + reservoir replay mixed into each step; "
                         "replayonly: trained only from the replay buffer; buffered: replayonly with a pluggable, "
-                        "novelty-gated buffer (--buffer)")
-    p.add_argument("--net", default="mlp", choices=["mlp", "resmlp"])
+                        "novelty-gated buffer (--buffer); cls: buffered LTM (--net transformer) + RL STM (--stm-*)")
+    p.add_argument("--net", default="mlp", choices=["mlp", "resmlp", "transformer"])
+    p.add_argument("--preproc", default="",
+                   help="frozen preprocessor checkpoint (single_stream.preprocessor): inputs become its tokens")
+    p.add_argument("--d-model", type=int, default=64, help="transformer")
+    p.add_argument("--heads", type=int, default=4, help="transformer")
+    p.add_argument("--mlp-ratio", type=int, default=2, help="transformer")
+    p.add_argument("--bias-mode", default="where", choices=["where", "what"], help="transformer bias hook")
+    p.add_argument("--bias-scale", type=float, default=1.3863, help="transformer bias bound s (default ln 4)")
+    p.add_argument("--bias-block", type=int, default=0, help="transformer block the bias acts on")
+    p.add_argument("--optimizer", default="sgd", choices=["sgd", "adamw"], help="LTM optimizer")
     p.add_argument("--widths", default="2000,2000,2000")
     p.add_argument("--blocks", type=int, default=3, help="residual blocks (resmlp)")
     p.add_argument("--lr", type=float, default=0.003)
@@ -69,6 +79,32 @@ def parse_args(argv=None):
     p.add_argument("--nb-fan-in", type=int, default=64, help="key (input) values seen by each cell")
     p.add_argument("--nb-util-decay", type=float, default=0.999)
     p.add_argument("--nb-match-threshold", type=float, default=None, help="recognition threshold; default off")
+    p.add_argument("--stm-steps", type=int, default=4, help="T: bias steps per STM episode")
+    p.add_argument("--stm-history", type=int, default=4, help="STM observation history window")
+    p.add_argument("--stm-hidden", type=int, default=1000)
+    p.add_argument("--stm-sparsity", type=int, default=32, help="k of the sparse clique; 0 = dense")
+    p.add_argument("--stm-layers", type=int, default=3)
+    p.add_argument("--stm-lr", type=float, default=0.01)
+    p.add_argument("--stm-momentum", type=float, default=0.5)
+    p.add_argument("--stm-reward", default="terminal-accuracy",
+                   choices=["terminal-accuracy", "accuracy", "accuracy-improvement", "entropy", "entropy-improvement"])
+    p.add_argument("--stm-returns", default="mc", choices=["mc", "td"])
+    p.add_argument("--stm-discount", type=float, default=1.0)
+    p.add_argument("--stm-policy-std", type=float, default=0.5)
+    p.add_argument("--stm-actor-scale", type=float, default=0.01)
+    p.add_argument("--stm-actor-updates", type=int, default=1)
+    p.add_argument("--stm-mask-key", default="first", choices=["first", "current", "history"])
+    p.add_argument("--stm-conditioning", default="none", choices=["none", "centre", "centre-scale", "layernorm"])
+    p.add_argument("--stm-no-value-input", action="store_true", help="actor does not see the critic's values")
+    p.add_argument("--stm-eval-bias", default="mean", choices=["mean", "sample"])
+    p.add_argument("--stm-repeats", type=int, default=1, help="r: independent episodes per live sample")
+    p.add_argument("--stm-replay-ratio", type=float, default=0.0, help="STM replay episodes per exposure")
+    p.add_argument("--stm-no-live", action="store_true", help="STM learns from replay episodes only")
+    p.add_argument("--stm-recruit-rate", type=float, default=0.0, help="idle-cell recruitment; 0 = off")
+    p.add_argument("--stm-recruit-idle", type=int, default=10000)
+    p.add_argument("--stm-recruit-prob", type=float, default=1.0)
+    p.add_argument("--stm-diag-images", type=int, default=1000,
+                   help="evaluation images for the STM diagnostics at each checkpoint (labels used by the harness only)")
     p.add_argument("--n-log-checkpoints", type=int, default=12)
     p.add_argument("--fewshot-thresholds", default="1,2,4,8,16,32,64,128,256,512",
                    help="evaluate when a group's exposure count first reaches each of these ('' = off)")
@@ -80,9 +116,16 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
-def build_model(args, train):
+def build_model(args, train, token_shape=None):
     widths = [int(w) for w in args.widths.split(",")]
-    net = build_net(args.net, train.x.shape[1], train.num_classes, widths, args.blocks)
+    transformer = None
+    if args.net == "transformer":
+        if token_shape is None:
+            raise ValueError("--net transformer needs --preproc (tokens)")
+        transformer = dict(num_tokens=token_shape[0], token_size=token_shape[1], d_model=args.d_model,
+                           heads=args.heads, mlp_ratio=args.mlp_ratio, bias_block=args.bias_block,
+                           bias_mode=args.bias_mode, bias_scale=args.bias_scale)
+    net = build_net(args.net, train.x.shape[1], train.num_classes, widths, args.blocks, transformer)
     cbp = None
     if args.cbp_rate > 0:
         if args.net != "mlp":
@@ -90,7 +133,7 @@ def build_model(args, train):
         cbp = ContinualBackprop(net, args.cbp_rate, args.cbp_decay, args.cbp_maturity)
     common = dict(lr=args.lr, steps=args.steps, momentum=args.momentum, weight_decay=args.weight_decay, cbp=cbp)
     if args.model == "ltm":
-        return LTMOnly(net, **common)
+        return LTMOnly(net, optimizer=args.optimizer, **common)
     if args.model == "replayonly":
         if args.steps != 1:
             raise ValueError("replayonly uses --replay-steps, not --steps")
@@ -98,7 +141,7 @@ def build_model(args, train):
         return ReplayOnlyLTM(net, capacity=args.replay_capacity, batch=args.replay_batch, period=args.replay_period,
                              steps=args.replay_steps, policy=args.replay_policy, store_uint8=not args.replay_float,
                              input_shape=train.x.shape[1:], seed=args.seed, **common)
-    if args.model == "buffered":
+    if args.model in ("buffered", "cls"):
         if args.steps != 1:
             raise ValueError("buffered uses --replay-steps, not --steps")
         del common["steps"]
@@ -113,10 +156,58 @@ def build_model(args, train):
             buffer = NeuralBuffer(args.nb_cells, parts, fan_in=args.nb_fan_in, key_parts=(0,),
                                   util_decay=args.nb_util_decay, match_threshold=args.nb_match_threshold, gate=gate,
                                   seed=args.seed)
-        return BufferedReplayLTM(net, buffer=buffer, batch=args.replay_batch, period=args.replay_period,
-                                 steps=args.replay_steps, **common)
+        ltm = BufferedReplayLTM(net, buffer=buffer, batch=args.replay_batch, period=args.replay_period,
+                                steps=args.replay_steps, optimizer=args.optimizer, **common)
+        if args.model == "buffered":
+            return ltm
+        return CLSModel(ltm, build_stm(args, net, train.num_classes), repeats=args.stm_repeats,
+                        replay_ratio=args.stm_replay_ratio, learn_live=not args.stm_no_live)
     return ReplayLTM(net, capacity=args.replay_capacity, replay_batch=args.replay_batch,
                      input_shape=train.x.shape[1:], seed=args.seed, **common)
+
+
+def build_stm(args, net, num_classes):
+    from environment.mnist.mnist_model import MnistModel, MnistModelConfig
+    from single_stream.stm import RLSTM
+
+    if args.net != "transformer":
+        raise ValueError("--model cls needs --net transformer (the biasable LTM)")
+    config = MnistModelConfig(
+        encoder_sparsity=args.stm_sparsity, history_size=args.stm_history, model_hidden_size=args.stm_hidden,
+        model_layers=args.stm_layers, discount_factor=args.stm_discount, returns=args.stm_returns,
+        reward_type=args.stm_reward, loss_actor_scale=args.stm_actor_scale, actor_updates=args.stm_actor_updates,
+        num_classes=num_classes, policy_std=args.stm_policy_std, eval_bias=args.stm_eval_bias,
+        actor_value_input=not args.stm_no_value_input, input_conditioning=args.stm_conditioning,
+        mask_key=args.stm_mask_key, recruit_rate=args.stm_recruit_rate, recruit_idle_steps=args.stm_recruit_idle,
+        recruit_prob=args.stm_recruit_prob, seed=args.seed)
+    model = MnistModel(config, encoded_size=net.d_model, bias_size=net.bias_size)
+    return RLSTM(net, model, steps=args.stm_steps, lr=args.stm_lr, momentum=args.stm_momentum)
+
+
+@torch.no_grad()
+def stm_diagnostics(model, data, n):
+    """
+    Harness-side diagnostics of the STM on the first n evaluation images (labels used here only, never by the
+    model): per-step accuracy and p(y) of the LTM output (step 0 = unbiased: the within-episode curve), the mean
+    critic value per step, its correlation with the episode's final score, the mean |bias| and cell utilisation.
+    """
+    x, y = data.x[:n], data.y[:n]
+    res = model.stm.episode(x, y)
+    acc = (res["logits"].argmax(2) == y[None]).float().mean(1)
+    final = res["scores"][-1]
+    v = res["values"]
+    corr = [float(torch.corrcoef(torch.stack([v[t], final]))[0, 1]) if v[t].std() > 0 else 0.0
+            for t in range(len(v))]
+    out = {"stm_step_acc": acc.tolist(), "stm_step_score": res["scores"].mean(1).tolist(),
+           "stm_step_value": v.mean(1).tolist(), "stm_value_final_corr": corr,
+           "stm_bias_abs": res["bias"].abs().mean((1, 2)).tolist(),
+           "stm_episodes": model.stm.episodes, "stm_replay_episodes": model.replay_episodes,
+           "stm_recruited": model.stm.recruited}
+    m = model.stm.model
+    if m.config.encoder_sparsity > 0:
+        for name, net in (("actor", m.model_actor), ("critic", m.model_critic)):
+            out.update({f"stm_{name}_{k}": val for k, val in net.utilisation().items()})
+    return out
 
 
 def buffer_diagnostics(buffer, num_classes):
@@ -157,7 +248,14 @@ def main(argv=None):
 
     train, eval_set = datasets.load(args.dataset, args.data_root, args.val_holdout, args.split_seed,
                                     permutation_seed=args.permutation_seed)
-    model = build_model(args, train)
+    token_shape, preproc_values = None, 0
+    if args.preproc:
+        from single_stream.preprocessor import featurize, load_checkpoint
+        pre = load_checkpoint(args.preproc)
+        train.x, eval_set.x = featurize(pre, train.x), featurize(pre, eval_set.x)
+        token_shape = (49, pre.channels)
+        preproc_values = sum(p.numel() for p in pre.parameters())
+    model = build_model(args, train, token_shape)
     stream = ClusteredStream(train.groups, args.cluster_size, rng)
     group_ids = stream.group_ids
     group_index = {g: i for i, g in enumerate(group_ids)}
@@ -223,22 +321,31 @@ def main(argv=None):
                        for v in thresholds if n_before[gi] < v <= n[gi]]
             if crossed:
                 t0 = time.perf_counter()
-                preds = metrics.evaluate(model, eval_set)
+                variants = metrics.evaluate_variants(model, eval_set)
                 eval_time += time.perf_counter() - t0
-                confusion = metrics.group_confusion(preds, eval_set.groups, group_ids, eval_set.num_classes)
-                balanced = metrics.balanced_group_score(confusion, group_label)
-                acc = float((preds == eval_set.y.numpy()).mean())
+                scored = {}
+                for name, vp in variants.items():
+                    vc = metrics.group_confusion(vp, eval_set.groups, group_ids, eval_set.num_classes)
+                    scored[name] = (vc, metrics.balanced_group_score(vc, group_label),
+                                    float((vp == eval_set.y.numpy()).mean()))
+                confusion, balanced, acc = scored["main"]
                 for gi, v in crossed:
                     row = confusion[gi]
-                    fewshot_file.write(json.dumps({
-                        "t": t, "group": int(group_ids[gi]), "threshold": v, "n": int(n[gi]), "q": int(q[gi]),
-                        "balanced": float(balanced[gi]), "recall": float(row[group_label[gi]] / row.sum()),
-                        "acc": acc, "confusion": confusion.tolist()}) + "\n")
+                    rec = {"t": t, "group": int(group_ids[gi]), "threshold": v, "n": int(n[gi]), "q": int(q[gi]),
+                           "balanced": float(balanced[gi]), "recall": float(row[group_label[gi]] / row.sum()),
+                           "acc": acc, "confusion": confusion.tolist()}
+                    for name, (vc, vb, va) in scored.items():
+                        if name != "main":
+                            rec[f"{name}_balanced"] = float(vb[gi])
+                            rec[f"{name}_recall"] = float(vc[gi, group_label[gi]] / vc[gi].sum())
+                            rec[f"{name}_acc"] = va
+                    fewshot_file.write(json.dumps(rec) + "\n")
                 fewshot_file.flush()
 
             if next_ckpt < len(checkpoints) and t >= checkpoints[next_ckpt]:
                 t0 = time.perf_counter()
-                preds = metrics.evaluate(model, eval_set)
+                variants = metrics.evaluate_variants(model, eval_set)
+                preds = variants["main"]
                 eval_time += time.perf_counter() - t0
                 correct = preds == eval_set.y.numpy()
                 gacc = metrics.per_group_accuracy(correct, eval_set.groups, group_ids)
@@ -248,8 +355,13 @@ def main(argv=None):
                        "group_acc": gacc.tolist(), "confusion": confusion.tolist(), "n": n.tolist(), "q": q.tolist(), "age": age.tolist(),
                        "online_acc": online_correct / max(online_count, 1),
                        "train_time": train_time, "eval_time": eval_time}
+                for name, vp in variants.items():
+                    if name != "main":
+                        rec[f"{name}_acc"] = float((vp == eval_set.y.numpy()).mean())
                 if hasattr(model, "buffer"):
                     rec.update(buffer_diagnostics(model.buffer, eval_set.num_classes))
+                if isinstance(model, CLSModel):
+                    rec.update(stm_diagnostics(model, eval_set, args.stm_diag_images))
                 ckpt_file.write(json.dumps(rec) + "\n")
                 ckpt_file.flush()
                 log(f"t {t:>8d}  ep {epoch}  acc {rec['acc']:.4f}  online {rec['online_acc']:.4f}  "
@@ -276,7 +388,11 @@ def main(argv=None):
         summary["cbp_replaced_units"] = model.cbp.replaced
     if hasattr(model, "memory_bytes"):
         summary["memory_bytes"] = model.memory_bytes()
-    summary.update({"exposures": t, "memory_values": model.memory_values(), "train_time": train_time,
+    if isinstance(model, CLSModel):
+        summary.update({"stm_episodes": model.stm.episodes, "stm_replay_episodes": model.replay_episodes,
+                        "stm_values": model.stm.num_values()})
+    summary.update({"exposures": t, "memory_values": model.memory_values(), "preprocessor_values": preproc_values,
+                    "train_time": train_time,
                     "eval_time": eval_time, "ms_per_step": 1000 * train_time / max(t // b, 1)})
     with open(os.path.join(args.out, "summary.json"), "w") as f:
         json.dump(summary, f, indent=1)

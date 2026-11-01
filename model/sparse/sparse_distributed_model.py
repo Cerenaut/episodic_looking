@@ -29,6 +29,7 @@ class SparseDistributedModel(SparseDistributedEncoder):
         ensemble_size: int,
         sparsity: int,
         model_configs: list[SparseActivationDenseModelConfig],
+        **encoder_options,  # e.g. recruitment (SparseDistributedEncoder)
     ):
         logger.info(f"Key size:{input_key_size} Input size:{input_value_size} Memory size:{memory_size} Ensemble size:{ensemble_size} Sparsity:{sparsity}")
         super().__init__(
@@ -36,6 +37,7 @@ class SparseDistributedModel(SparseDistributedEncoder):
             memory_size = memory_size,
             ensemble_size = ensemble_size,
             sparsity = sparsity,
+            **encoder_options,
         )
         self.input_value_size = input_value_size        
         self.model_configs = model_configs
@@ -67,10 +69,9 @@ class SparseDistributedModel(SparseDistributedEncoder):
         model_index:int = 0,
         active_mask:torch.Tensor|None = None,
     ):
-        active_indices = self.encode(key_input)  # returns [B, sparsity]
-
         model = self.get_model(model_index)
         if active_mask is None:
+            active_indices = self.encode(key_input)  # returns [B, sparsity]
             active_mask = model.create_active_mask(
                 model_input,  # only used for value dtype and mask
                 active_indices=active_indices,

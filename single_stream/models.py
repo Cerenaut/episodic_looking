@@ -139,21 +139,34 @@ class ResidualMLP(nn.Module):
         return self.out(F.relu(self.norm(x)))
 
 
-def build_net(name, input_size, num_classes, widths=(2000, 2000, 2000), blocks=3):
+def build_net(name, input_size, num_classes, widths=(2000, 2000, 2000), blocks=3, transformer=None):
+    """transformer: BiasableTransformer options (num_tokens, token_size, d_model, heads, mlp_ratio, bias_mode, ...),
+    for name "transformer"; `blocks` is its number of blocks."""
     if name == "mlp":
         return MLP(input_size, widths, num_classes)
     if name == "resmlp":
         return ResidualMLP(input_size, widths[0], blocks, num_classes)
+    if name == "transformer":
+        from model.transformer import BiasableTransformer
+        return BiasableTransformer(num_classes=num_classes, blocks=blocks, **(transformer or {}))
     raise ValueError(f"unknown net {name}")
+
+
+def make_optimizer(name, params, lr, momentum=0.0, weight_decay=0.0):
+    if name == "sgd":
+        return torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
+    if name == "adamw":
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    raise ValueError(f"unknown optimizer {name}")
 
 
 class LTMOnly(StreamModel):
     """The LTM trained directly on the stream with SGD, `steps` gradient steps per exposure."""
 
-    def __init__(self, net, lr, steps=1, momentum=0.0, weight_decay=0.0, cbp=None):
+    def __init__(self, net, lr, steps=1, momentum=0.0, weight_decay=0.0, cbp=None, optimizer="sgd"):
         self.net = net
         self.steps = steps
-        self.opt = torch.optim.SGD(net.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+        self.opt = make_optimizer(optimizer, net.parameters(), lr, momentum, weight_decay)
         self.cbp = cbp  # optional ContinualBackprop, applied after every optimizer step
 
     def _step(self, loss):
@@ -350,13 +363,14 @@ class BufferedReplayLTM(StreamModel):
     from the buffer; it is never trained on the live sample. With RingBuffer and no gate this is ReplayOnlyLTM.
     """
 
-    def __init__(self, net, lr, buffer, batch, period, steps=1, momentum=0.0, weight_decay=0.0, cbp=None):
+    def __init__(self, net, lr, buffer, batch, period, steps=1, momentum=0.0, weight_decay=0.0, cbp=None,
+                 optimizer="sgd"):
         self.net = net
         self.buffer = buffer
         self.batch = batch
         self.period = period
         self.steps = steps
-        self.opt = torch.optim.SGD(net.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+        self.opt = make_optimizer(optimizer, net.parameters(), lr, momentum, weight_decay)
         self.cbp = cbp
         self.pending = 0
         self.updates = 0
@@ -399,3 +413,67 @@ class BufferedReplayLTM(StreamModel):
 
     def memory_values(self):
         return param_values(self.net) + self.buffer.num_values()
+
+
+class CLSModel(StreamModel):
+    """
+    LTM + replay + RL STM. The LTM is a BufferedReplayLTM (trained only from its replay buffer) whose net takes a
+    bias (BiasableTransformer); the STM (single_stream/stm.py) biases it. Per exposure, in order:
+
+    1. `repeats` STM episodes on the live sample, each independent, learning if `learn_live` (more "thinking time";
+       the online prediction is the first episode's output);
+    2. STM episodes on samples drawn one at a time from the LTM's replay buffer, `replay_ratio` per exposure on
+       average (fractional ratios accumulate), learning, interleaved serially with the live stream (minibatch 1;
+       the draws do not rescore the buffer);
+    3. the LTM's own step (buffer write, replay updates).
+
+    Evaluation (`predict`): one STM episode per image, no learning, the policy mean as bias (eval_bias), output =
+    the LTM logits after the last bias. `predict_variants` also returns the unbiased LTM logits from the same pass
+    (step 0), so the STM's contribution is measured on identical LTM weights.
+    """
+
+    def __init__(self, ltm, stm, repeats=1, replay_ratio=0.0, learn_live=True):
+        self.ltm = ltm
+        self.stm = stm
+        self.repeats = repeats
+        self.replay_ratio = replay_ratio
+        self.learn_live = learn_live
+        self.replay_pending = 0.0
+        self.replay_episodes = 0
+
+    @property
+    def buffer(self):
+        return self.ltm.buffer
+
+    @property
+    def updates(self):
+        return self.ltm.updates
+
+    def observe(self, x, y):
+        pred = None
+        for _ in range(self.repeats):
+            res = self.stm.episode(x, y, learn=self.learn_live)
+            if pred is None:
+                pred = res["logits"][-1].argmax(1)
+        self.replay_pending += self.replay_ratio
+        while self.replay_pending >= 1:
+            self.replay_pending -= 1
+            if self.ltm.buffer.written == 0:
+                continue
+            (bx, by), _ = self.ltm.buffer.sample(1)
+            self.stm.episode(bx, by, learn=True)
+            self.replay_episodes += 1
+        self.ltm.observe(x, y)
+        return pred
+
+    @torch.no_grad()
+    def predict(self, x):
+        return self.stm.episode(x)["logits"][-1]
+
+    @torch.no_grad()
+    def predict_variants(self, x):
+        logits = self.stm.episode(x)["logits"]
+        return {"stm": logits[-1], "ltm": logits[0]}
+
+    def memory_values(self):
+        return self.ltm.memory_values() + self.stm.num_values()
