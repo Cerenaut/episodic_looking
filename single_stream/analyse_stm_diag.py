@@ -29,9 +29,16 @@ def load(run, name):
     return [json.loads(line) for line in open(os.path.join(run, f"{name}_diag.jsonl"))]
 
 
-def presentations(diag, max_sample=None):
+def reward_scale(run, name):
+    return json.load(open(os.path.join(run, f"{name}.json")))["args"].get("reward_scale", 1.0)
+
+
+def presentations(diag, max_sample=None, scale=1.0):
     """Few-shot presentations: list of dicts with sample, index, k (earlier presentations), pre, post, prev_post,
-    return_std, baseline_error, grad_*."""
+    return_std, baseline_error, grad_*. Scores are logged as p(y)^scale (the reward's score); converted back to p(y)
+    here so runs with different reward scales compare (return_std stays in each run's reward units)."""
+    def p(score):
+        return score ** (1.0 / scale)
     last, out = {}, []
     for d in diag:
         if max_sample is not None and d["sample"] > max_sample:
@@ -40,10 +47,10 @@ def presentations(diag, max_sample=None):
             continue
         t = d["target"]
         out.append({"sample": d["sample"], "index": d["index"], "k": d["times_presented"],
-                    "p0": d["pre"]["score_0"], "pre": d["pre"]["score_T"], "post": d["post"]["score_T"],
+                    "p0": p(d["pre"]["score_0"]), "pre": p(d["pre"]["score_T"]), "post": p(d["post"]["score_T"]),
                     "prev_post": last.get(d["index"]), "return_std": t["return_std"],
                     "baseline_error": t["baseline_error"], "grad_actor_out": t["grad_actor_out"]})
-        last[d["index"]] = d["post"]["score_T"]
+        last[d["index"]] = p(d["post"]["score_T"])
     return out
 
 
@@ -72,7 +79,7 @@ def style(ax, title):
 def plot(run, names, labels, out, max_sample):
     plt.rcParams.update({"font.size": 10, "axes.edgecolor": INK2, "axes.labelcolor": INK, "xtick.color": INK2,
                          "ytick.color": INK2, "axes.spines.top": False, "axes.spines.right": False})
-    data = {n: presentations(load(run, n), max_sample) for n in names}
+    data = {n: presentations(load(run, n), max_sample, reward_scale(run, n)) for n in names}
 
     # Figure 1: trajectories of each few-shot image (first run), flat reward, within-block gain
     pres = data[names[0]]

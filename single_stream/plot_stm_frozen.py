@@ -266,11 +266,28 @@ def plot_wave6(args):
     final_table(args, [r for r in groups[0][1]], os.path.join(args.out, "wave6_long.md"))
 
 
+def plot_wave6b(args):
+    """Wave 6b: reward scale p(y)^s, policy std, and mask keys that let the biased input choose the clique."""
+    base = ("w6_r64_lr0.03", "base: lr 0.03, s 1, std 0.5, key first", "#8f8d87", ":", "stm", None)
+    groups = [
+        ("reward scale, exploration", [("w6b_s0.1", "s 0.1"), ("w6b_s0.3", "s 0.3"), ("w6b_std1.0", "std 1.0"),
+                                       ("w6b_s0.1_std1.0", "s 0.1, std 1.0"), ("w6b_s0.1_lr0.01", "s 0.1, lr 0.01")]),
+        ("clique key", [("w6b_key_current", "key current"), ("w6b_key_current_s0.1", "key current, s 0.1"),
+                        ("w6b_key_history_s0.1", "key history, s 0.1")]),
+    ]
+    plot_curves(args, groups, [LTM_REFS[0], base], "wave6b_reward_key.png",
+                "Frozen gap snapshot, wave 6b: RL STM, per-step accuracy reward p(y)^s, T 4, H 4 (where, r 64, "
+                "interleave 1 from other digits, lr 0.03 unless noted) vs LTM")
+    names = [base[:2], ("w6_r64_lr0.03_s1", "base seed 1"), ("w6_r64_lr0.03_s2", "base seed 2"),
+             ("w6_r64_lr0.01", "lr 0.01, s 1")] + [r for _, runs in groups for r in runs]
+    final_table(args, names, os.path.join(args.out, "wave6b_at200.md"))
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--figure", default="speed", choices=["speed", "repeats", "wave5", "wave6"])
+    p.add_argument("--figure", default="speed", choices=["speed", "repeats", "wave5", "wave6", "wave6b"])
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
     plt.rcParams.update({"font.size": 10, "axes.edgecolor": INK2, "axes.labelcolor": INK, "xtick.color": INK2,
@@ -283,6 +300,9 @@ def main():
         return
     if args.figure == "wave6":
         plot_wave6(args)
+        return
+    if args.figure == "wave6b":
+        plot_wave6b(args)
         return
     plt.rcParams.update({"font.size": 10, "axes.edgecolor": INK2, "axes.labelcolor": INK, "xtick.color": INK2,
                          "ytick.color": INK2, "axes.spines.top": False, "axes.spines.right": False})
