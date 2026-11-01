@@ -179,7 +179,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         encoder_sparsity=args.sparsity, history_size=args.history, model_hidden_size=args.hidden,
         model_layers=args.layers, discount_factor=args.discount, returns=args.returns, reward_type=args.reward,
         loss_actor_scale=args.actor_scale, actor_updates=args.actor_updates, num_classes=10,
-        policy_std=args.policy_std, actor_value_input=not args.no_value_input, input_conditioning=args.conditioning,
+        policy_std=args.policy_std, reward_scale=args.reward_scale, actor_value_input=not args.no_value_input, input_conditioning=args.conditioning,
         mask_key=args.mask_key, recruit_rate=args.recruit_rate, recruit_idle_steps=args.recruit_idle,
         stm_critic_sparse_init=args.sparse_init in ("critic", "both"),
         stm_actor_sparse_init=args.sparse_init in ("actor", "both"), step_input=args.step_input, class_bonus=args.class_bonus, seed=args.seed)
@@ -240,7 +240,8 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         with torch.no_grad():
             r = stm.episode(xt[j:j + 1], yt[j:j + 1])
         return {"score_0": float(r["scores"][0, 0]), "score_T": float(r["scores"][-1, 0]),
-                "correct_T": int(r["logits"][-1, 0].argmax() == yt[j]), "bias_abs": float(r["bias"][-1].abs().mean())}, \
+                "correct_T": int(r["logits"][-1, 0].argmax() == yt[j]), "bias_abs": float(r["bias"][-1].abs().mean()),
+                "clique_kept": float(torch.isin(r["active_actor"][-1][0], r["active_actor"][0][0]).float().mean())}, \
             r["active_actor"][0][0]
 
     def summarise(stats):
@@ -344,11 +345,13 @@ def main():
     p.add_argument("--returns", default="mc")
     p.add_argument("--discount", type=float, default=1.0)
     p.add_argument("--policy-std", type=float, default=0.5)
+    p.add_argument("--reward-scale", type=float, default=1.0,
+                   help="rl: accuracy score p(y)^s; s < 1 flattens it less where p(y) is small (s -> 0: ~log p(y))")
     p.add_argument("--actor-scale", type=float, default=0.01)
     p.add_argument("--actor-updates", type=int, default=1)
     p.add_argument("--no-value-input", action="store_true")
     p.add_argument("--conditioning", default="none")
-    p.add_argument("--mask-key", default="first")
+    p.add_argument("--mask-key", default="first", choices=["first", "current", "history"])
     p.add_argument("--sparse-init", default="none", choices=["none", "critic", "actor", "both"])
     p.add_argument("--recruit-rate", type=float, default=0.0)
     p.add_argument("--recruit-idle", type=int, default=10000)
