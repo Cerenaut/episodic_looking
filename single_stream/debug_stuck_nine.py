@@ -3,7 +3,7 @@ Why does a few-shot image never learn under the RL STM? (Dave 2 Nov 2026: traini
 p(9) < 0.16 in every run.) For chosen training images of the frozen snapshot:
 
   unbiased      the LTM's class probabilities with no bias
-  reachable     the label-supervised optimal where bias (Adam on the pre-tanh bias through the frozen LTM, as the
+  reachable     the label-supervised optimal bias of --bias-mode (Adam on the pre-tanh bias through the frozen LTM, as the
                 `bound` command): the most p(y) any bias can give, how far the bias is from 0, how saturated it is
   exploration   p(y) under random biases a ~ N(m, std^2) around m = 0 (the untrained policy) and around fractions of
                 the optimal bias: how often exploration finds a better reward, and how large the improvement is
@@ -80,6 +80,7 @@ def main():
     ap.add_argument("--new-shots", type=int, default=16)
     ap.add_argument("--d-model", type=int, default=64)
     ap.add_argument("--bias-scale", type=float, default=1.3863)
+    ap.add_argument("--bias-mode", default="where", choices=["where", "what"])
     ap.add_argument("--policy-std", type=float, default=0.5)
     ap.add_argument("--samples", type=int, default=2000)
     ap.add_argument("--steps", type=int, default=300)
@@ -88,7 +89,7 @@ def main():
     torch.set_num_threads(4)
     os.makedirs(args.dest, exist_ok=True)
     xt, yt, _, _ = load_data(args)
-    net = load_snapshot(args, "where")
+    net = load_snapshot(args, args.bias_mode)
     shots = torch.nonzero(yt == args.new_digit).flatten().tolist()
     images = args.images if args.images != [-1] else shots
     g = torch.Generator().manual_seed(0)
