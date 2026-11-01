@@ -30,7 +30,7 @@ from environment.mnist.mnist_model import MnistModel, MnistModelConfig
 from model.transformer import BiasableTransformer
 from single_stream import datasets
 from single_stream.preprocessor import featurize, load_checkpoint
-from single_stream.stm import RLSTM
+from single_stream.stm import RLSTM, grid_basis
 
 
 def load_data(args):
@@ -179,8 +179,14 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         mask_key=args.mask_key, recruit_rate=args.recruit_rate, recruit_idle_steps=args.recruit_idle,
         stm_critic_sparse_init=args.sparse_init in ("critic", "both"),
         stm_actor_sparse_init=args.sparse_init in ("actor", "both"), seed=args.seed)
-    stm = RLSTM(net, MnistModel(config, encoded_size=net.d_model, bias_size=net.bias_size), steps=args.steps,
-                lr=args.stm_lr, momentum=args.stm_momentum)
+    basis = None
+    if args.bias_grid:
+        if args.bias_mode != "where":
+            raise ValueError("--bias-grid applies to the where bias (7x7 tokens)")
+        basis = grid_basis(args.bias_grid)
+    action_size = net.bias_size if basis is None else basis.shape[0]
+    stm = RLSTM(net, MnistModel(config, encoded_size=net.d_model, bias_size=action_size), steps=args.steps,
+                lr=args.stm_lr, momentum=args.stm_momentum, bias_basis=basis, incremental=args.incremental)
     xe, ye = xv[:args.eval_images], yv[:args.eval_images]
     shots = torch.nonzero(yt == args.new_digit).flatten()  # the few-shot training images (memorisation)
     others_idx = torch.nonzero(yt != args.new_digit).flatten()
@@ -250,6 +256,8 @@ def main():
     p.add_argument("--d-model", type=int, default=64)
     p.add_argument("--bias-scale", type=float, default=1.3863)
     p.add_argument("--bias-mode", default="where", choices=["where", "what"])
+    p.add_argument("--incremental", action="store_true", help="rl: actions are changes to a cumulative bias")
+    p.add_argument("--bias-grid", type=int, default=0, help="rl: where-bias action on a coarse g x g grid (0 = 7x7)")
     p.add_argument("--bound-steps", type=int, default=200)
     p.add_argument("--ltm-batch", type=int, default=16)
     p.add_argument("--episodes", type=int, default=20000, help="samples presented (rl: x repeats episodes)")

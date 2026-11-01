@@ -172,6 +172,48 @@ class TestLearning(unittest.TestCase):
         self.assertGreater(after, unbiased + 0.05, (unbiased, after))
 
 
+class TestBiasBasis(unittest.TestCase):
+
+    def test_grid_basis_upsamples(self):
+        from single_stream.stm import grid_basis
+        b = grid_basis(2)
+        self.assertEqual(tuple(b.shape), (4, 49))
+        torch.testing.assert_close(b.sum(0), torch.ones(49))           # every token in exactly one cell
+        m = (torch.tensor([[1., 2., 3., 4.]]) @ b).reshape(7, 7)
+        self.assertEqual(m[0, 0].item(), 1.0)
+        self.assertEqual(m[6, 6].item(), 4.0)
+        torch.testing.assert_close(grid_basis(7), torch.eye(49))
+
+    def test_episode_with_basis(self):
+        from single_stream.stm import grid_basis
+        torch.manual_seed(0)
+        net = BiasableTransformer(num_tokens=49, token_size=8, num_classes=10, d_model=16, heads=2)
+        b = grid_basis(3)
+        model = MnistModel(MnistModelConfig(encoder_sparsity=16, history_size=2, model_hidden_size=100,
+                                            num_classes=10), encoded_size=16, bias_size=9)
+        stm = RLSTM(net, model, steps=2, bias_basis=b)
+        x = torch.rand(2, 49 * 8)
+        res = stm.episode(x, torch.tensor([1, 2]), learn=True)
+        self.assertEqual(tuple(res["bias"].shape), (2, 2, 9))
+        torch.testing.assert_close(res["logits"][-1], net.eval().run(x, res["bias"][-1] @ b)["logits"])
+
+
+class TestIncremental(unittest.TestCase):
+
+    def test_bias_is_cumulative_and_observed(self):
+        net, stm = make_stm(steps=3, history=3)
+        stm.incremental = True
+        x = torch.rand(2, 49 * 8)
+        res = stm.episode(x, torch.tensor([1, 2]), learn=True)
+        torch.testing.assert_close(res["bias"], torch.cumsum(res["actions"], 0))
+        torch.testing.assert_close(res["logits"][-1], net.eval().run(x, res["bias"][-1])["logits"])
+
+    def test_absolute_by_default(self):
+        _, stm = make_stm(steps=2, history=2)
+        res = stm.episode(torch.rand(2, 49 * 8))
+        torch.testing.assert_close(res["bias"], res["actions"])
+
+
 class TestRecruitment(unittest.TestCase):
 
     def test_idle_cells_are_recruited_and_active_cells_are_not(self):

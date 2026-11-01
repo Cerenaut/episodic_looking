@@ -22,11 +22,29 @@ from environment.mnist.mnist_model import MnistModel
 from util.observation_history import ObservationHistory, ObservationHistoryConfig
 
 
-class RLSTM:
+def grid_basis(grid, side=7):
+    """Fixed basis mapping a grid x grid action to the side x side token bias: each token takes the value of the
+    coarse cell it falls in (nearest-cell upsampling). (grid^2, side^2)."""
+    cell = (torch.arange(side) * grid) // side
+    idx = (cell[:, None] * grid + cell[None, :]).flatten()
+    return torch.nn.functional.one_hot(idx, grid * grid).T.float()
 
-    def __init__(self, ltm_net, model: MnistModel, steps=4, lr=0.01, momentum=0.5):
+
+class RLSTM:
+    """
+    bias_basis: optional fixed (m, bias_size) matrix; the actor then emits m values and the LTM receives
+    action @ bias_basis (e.g. a coarse spatial grid for the "where" bias). The STM observes the m-dim action.
+    incremental: each action is a change to the bias, which accumulates over the episode (from 0); the LTM receives
+    the cumulative bias, and the observation's bias part is the cumulative bias, so the actor can see and cancel
+    earlier moves. Otherwise each action is the bias itself.
+    """
+
+    def __init__(self, ltm_net, model: MnistModel, steps=4, lr=0.01, momentum=0.5, bias_basis=None,
+                 incremental=False):
         self.ltm = ltm_net          # BiasableTransformer (shared with the LTM model; read-only here)
         self.model = model
+        self.bias_basis = bias_basis
+        self.incremental = incremental
         self.steps = steps
         self.opt = torch.optim.SGD(model.get_trainable_parameters(), lr=lr, momentum=momentum)
         self.episodes = 0
@@ -44,6 +62,8 @@ class RLSTM:
     @torch.no_grad()
     def _ltm(self, x, bias):
         self.ltm.eval()
+        if bias is not None and self.bias_basis is not None:
+            bias = bias @ self.bias_basis
         return self.ltm.run(x, bias)
 
     def episode(self, x, y=None, learn=False, sample=None):
@@ -80,8 +100,9 @@ class RLSTM:
                 policy, ka, aa = self.model.do_actor(inp, value_window)
                 a = policy.sample if sample else policy.mean.detach()
                 a = a.detach()
-                out = self._ltm(x, a)
-                obs = self.observation(out, a)
+                bias = bias + a if self.incremental else a   # bias applied (cumulative if incremental)
+                out = self._ltm(x, bias)
+                obs = self.observation(out, bias)
                 if learn:
                     self.model.update_input_statistics(obs, history.is_empty())
                 history.update(obs)
@@ -92,10 +113,11 @@ class RLSTM:
                 samples.append(a)
                 log_p_old.append(policy.distribution.log_prob(a).sum(-1).detach())
                 values.append(v)
-                biases.append(a)
+                biases.append(bias)
                 keys_a.append(ka); active_a.append(aa); keys_c.append(kc); active_c.append(ac)
 
-        result = {"logits": torch.stack(logits), "values": torch.stack(values).detach(), "bias": torch.stack(biases)}
+        result = {"logits": torch.stack(logits), "values": torch.stack(values).detach(), "bias": torch.stack(biases),
+                  "actions": torch.stack(samples)}
         if y is None:
             return result
         scores = [self.model.step_score(lg, y) for lg in logits]

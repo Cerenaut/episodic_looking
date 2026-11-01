@@ -102,6 +102,7 @@ def parse_args(argv=None):
     p.add_argument("--stm-no-live", action="store_true", help="STM learns from replay episodes only")
     p.add_argument("--stm-sparse-init", default="none", choices=["none", "critic", "actor", "both"],
                    help="sparsity-aware init (layers after the masked one scaled by sqrt(H/k), hidden biases 0)")
+    p.add_argument("--stm-incremental", action="store_true", help="STM actions are changes to a cumulative bias")
     p.add_argument("--stm-recruit-rate", type=float, default=0.0, help="idle-cell recruitment; 0 = off")
     p.add_argument("--stm-recruit-idle", type=int, default=10000)
     p.add_argument("--stm-recruit-prob", type=float, default=1.0)
@@ -184,7 +185,8 @@ def build_stm(args, net, num_classes):
         recruit_prob=args.stm_recruit_prob, stm_critic_sparse_init=args.stm_sparse_init in ("critic", "both"),
         stm_actor_sparse_init=args.stm_sparse_init in ("actor", "both"), seed=args.seed)
     model = MnistModel(config, encoded_size=net.d_model, bias_size=net.bias_size)
-    return RLSTM(net, model, steps=args.stm_steps, lr=args.stm_lr, momentum=args.stm_momentum)
+    return RLSTM(net, model, steps=args.stm_steps, lr=args.stm_lr, momentum=args.stm_momentum,
+                 incremental=args.stm_incremental)
 
 
 @torch.no_grad()
