@@ -88,17 +88,107 @@ def plot_repeats(args):
         print(path, "partial:", partial)
 
 
+WAVE5 = [  # (row title, [(file, label)]); all where, r64, interleave 1, actor 0.1, actor sparse init
+    ("T = 4 steps, history 4", [
+        ("w5_1_impr_T4H4", "improvement reward"),
+        ("w5_2_acc_T4H4", "per-step accuracy reward"),
+        ("w5_6_term_T4H4_lr0.03", "terminal reward, lr 0.03"),
+        ("w5_7_impr_T4H4_lr0.03", "improvement reward, lr 0.03"),
+    ]),
+    ("T = 8 steps, step input", [
+        ("w5_3_impr_T8H4_step", "improvement, history 4"),
+        ("w5_4_impr_T8H8_step", "improvement, history 8"),
+        ("w5_5_term_T8H8_step", "terminal, history 8"),
+        ("w5_8_impr_T8H8_step_bonus0.01", "improvement, history 8, class bonus 1%"),
+        ("w5_9_impr_T8H8_step_bonus0.05", "improvement, history 8, class bonus 5%"),
+    ]),
+]
+
+
+def load_stm(run, name):
+    hist = json.load(open(os.path.join(run, f"{name}.json")))["result"]["history"]
+    return hist, [(h["samples"], h["new_train_recall"], h["new_recall"], h["others_acc"]) for h in hist]
+
+
+def plot_wave5(args):
+    """Wave 5: learning signal (reward, lr, episode length, history, step input, class bonus) vs samples, with the
+    LTM and the wave-4 baseline (terminal reward, T 4) as references; last panel: accuracy after each step."""
+    refs = [("ltm200_lr0.001", "LTM (AdamW 1e-3)", INK, "-", "o"),
+            ("w4_where_a0.1_r64", "wave 4 baseline: terminal, T 4, lr 0.01", "#8f8d87", ":", "s")]
+    fig, axes = plt.subplots(2, 4, figsize=(19, 8.6), facecolor=SURFACE)
+    table = []
+    for row, (row_title, runs) in enumerate(WAVE5):
+        ax_row = axes[row]
+        for name, label, color, ls, marker in refs:
+            if name.startswith("ltm"):
+                rows, steps = load_ltm(args.run, name), None
+            else:
+                hist, rows = load_stm(args.run, name)
+                steps = hist[-1]["step_acc"]
+            xs = [max(r[0], 5) for r in rows]
+            for ax, k in zip(ax_row[:3], (1, 2, 3)):
+                ax.plot(xs, [r[k] for r in rows], color=color, lw=2, ls=ls, marker=marker, ms=5, mec=SURFACE,
+                        mew=1.5, label=label, zorder=3)
+            if steps is not None:
+                ax_row[3].plot(range(len(steps)), steps, color=color, lw=2, ls=ls, marker=marker, ms=5,
+                               mec=SURFACE, mew=1.5, label=label, zorder=3)
+            if row == 0:
+                table.append((label, rows[-1][1], rows[-1][2], rows[-1][3], steps))
+        for i, (name, label) in enumerate(runs):
+            hist, rows = load_stm(args.run, name)
+            xs = [max(r[0], 5) for r in rows]
+            for ax, k in zip(ax_row[:3], (1, 2, 3)):
+                ax.plot(xs, [r[k] for r in rows], color=SERIES[i], lw=2, ls="--", marker="s", ms=5, mec=SURFACE,
+                        mew=1.5, label=label, zorder=3)
+            steps = hist[-1]["step_acc"]
+            ax_row[3].plot(range(len(steps)), steps, color=SERIES[i], lw=2, ls="--", marker="s", ms=5,
+                           mec=SURFACE, mew=1.5, zorder=3)
+            table.append((f"{label} ({row_title})", rows[-1][1], rows[-1][2], rows[-1][3], steps))
+        titles = ("Memorised: recall on the 16 training nines", "Generalised: recall on held-out nines",
+                  "Accuracy on digits 0-8", "All digits after each STM step, at 200 samples")
+        for ax, title in zip(ax_row, titles):
+            ax.set_facecolor(SURFACE)
+            ax.set_title(title, color=INK, loc="left", fontsize=10.5)
+            ax.grid(True, color=GRID, lw=0.8, zorder=0)
+        for ax in ax_row[:3]:
+            ax.set_xscale("log")
+            ax.set_xlabel("samples presented (25% nines)")
+        ax_row[0].set_ylim(0, 1.02)
+        ax_row[1].set_ylim(0, 1.02)
+        ax_row[2].set_ylim(0.85, 1.0)
+        ax_row[3].set_ylim(0.87, 0.93)
+        ax_row[3].set_xlabel("STM step (0 = unbiased LTM)")
+        ax_row[3].set_xticks(range(9))
+        ax_row[0].set_ylabel(row_title, color=INK, fontsize=11)
+        ax_row[2].legend(loc="lower left", frameon=False, fontsize=8.5, labelcolor=INK)
+    fig.suptitle("Frozen gap snapshot, wave 5: RL STM learning signal (where bias, r 64, interleaved, actor 0.1, "
+                 "SGD lr 0.01 unless noted) vs LTM, in samples", color=INK, x=0.01, ha="left", fontsize=12)
+    fig.tight_layout()
+    path = os.path.join(args.out, "wave5_learning_signal.png")
+    fig.savefig(path, dpi=150, facecolor=SURFACE)
+    plt.close(fig)
+    with open(os.path.join(args.out, "wave5_learning_signal.md"), "w") as f:
+        f.write("| run | memorised | held-out 9 | digits 0-8 | all digits, step 0 -> last |\n|---|---|---|---|---|\n")
+        for label, m, n, o, steps in table:
+            st = f"{steps[0]:.3f} -> {steps[-1]:.3f}" if steps else "n/a"
+            f.write(f"| {label} | {m:.3f} | {n:.3f} | {o:.4f} | {st} |\n")
+    print(path)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--figure", default="speed", choices=["speed", "repeats"])
+    p.add_argument("--figure", default="speed", choices=["speed", "repeats", "wave5"])
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
     plt.rcParams.update({"font.size": 10, "axes.edgecolor": INK2, "axes.labelcolor": INK, "xtick.color": INK2,
                          "ytick.color": INK2, "axes.spines.top": False, "axes.spines.right": False})
     if args.figure == "repeats":
         plot_repeats(args)
+        return
+    if args.figure == "wave5":
+        plot_wave5(args)
         return
     plt.rcParams.update({"font.size": 10, "axes.edgecolor": INK2, "axes.labelcolor": INK, "xtick.color": INK2,
                          "ytick.color": INK2, "axes.spines.top": False, "axes.spines.right": False})
