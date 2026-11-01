@@ -126,7 +126,7 @@ def stream_order(args, yt):
 
 
 def eval_checkpoints(args):
-    return set(np.unique(np.geomspace(100, args.episodes, 8).astype(int)).tolist())
+    return set(np.unique(np.geomspace(args.first_checkpoint, args.episodes, args.checkpoints).astype(int)).tolist())
 
 
 def cmd_ltm(args, xt, yt, xv, yv, log):
@@ -193,7 +193,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         s0 = summary(pred[0], ye, args.new_digit)
         v = res["values"][-1]
         final = res["scores"][-1]
-        rec = {"episodes": ep, "new_samples": int((yt[order[:ep]] == args.new_digit).sum()), "step_acc": step_acc, "new_recall_unbiased": s0["new_recall"],
+        rec = {"episodes": ep, "samples": ep, "learning_episodes": ep * args.repeats, "new_samples": int((yt[order[:ep]] == args.new_digit).sum()), "step_acc": step_acc, "new_recall_unbiased": s0["new_recall"],
                "new_recall": s["new_recall"], "others_acc": s["others_acc"], "acc": s["acc"],
                "step_score": res["scores"].mean(1).tolist(), "value_last": float(v.mean()),
                "value_final_corr": float(torch.corrcoef(torch.stack([v, final]))[0, 1]) if v.std() > 0 else 0.0,
@@ -212,11 +212,13 @@ def cmd_rl(args, xt, yt, xv, yv, log):
     evaluate(0)
     for ep in range(1, args.episodes + 1):
         j = order[ep - 1]
-        res = stm.episode(xt[j:j + 1], yt[j:j + 1], learn=True)
-        train_scores.append(float(res["scores"][-1, 0]))
+        for k in range(args.repeats):  # r independent learning episodes per sample ("thinking time")
+            res = stm.episode(xt[j:j + 1], yt[j:j + 1], learn=True)
+            if k == 0:
+                train_scores.append(float(res["scores"][-1, 0]))
         if ep in checkpoints:
             evaluate(ep)
-    return {"history": history, "ms_per_episode": 1000 * (time.time() - t0) / args.episodes}
+    return {"history": history, "ms_per_episode": 1000 * (time.time() - t0) / (args.episodes * args.repeats)}
 
 
 def main():
@@ -235,7 +237,10 @@ def main():
     p.add_argument("--bias-mode", default="where", choices=["where", "what"])
     p.add_argument("--bound-steps", type=int, default=200)
     p.add_argument("--ltm-batch", type=int, default=16)
-    p.add_argument("--episodes", type=int, default=20000)
+    p.add_argument("--episodes", type=int, default=20000, help="samples presented (rl: x repeats episodes)")
+    p.add_argument("--repeats", type=int, default=1, help="rl: independent learning episodes per sample")
+    p.add_argument("--first-checkpoint", type=int, default=100)
+    p.add_argument("--checkpoints", type=int, default=8)
     p.add_argument("--new-fraction", type=float, default=0.0,
                    help="rl: fraction of training episodes drawn from the new digit's few-shot images")
     p.add_argument("--eval-images", type=int, default=2000)
