@@ -294,22 +294,24 @@ def seed_band(run, names):
     return xs, vals.mean(0), vals.min(0), vals.max(0)
 
 
-WAVE7 = [  # (row title, [(label, [seed runs])])
+WAVE7 = [  # (row title, [(label, [seed runs])]); replay = wave 7c (--interleave-source seen)
     ("what vs where, lr 0.01", [
-        ("what: interleave 4 replay mix", [f"w7_what_i4stream_lr0.01_s{s}" for s in range(3)]),
+        ("what: interleave 4 replay", [f"w7c_what_i4seen_lr0.01_s{s}" for s in range(3)]),
+        ("what: interleave 1 replay", [f"w7c_what_i1seen_lr0.01_s{s}" for s in range(3)]),
         ("what: 50% nines", [f"w7_what_nf0.5_lr0.01_s{s}" for s in range(3)]),
         ("what: base (interleave 1 others)", [f"w7_what_base_lr0.01_s{s}" for s in range(3)]),
-        ("where: interleave 1 replay mix", [f"w7_where_i1stream_lr0.01_s{s}" for s in range(3)]),
-        ("where: bursts of 4", [f"w7_where_burst4_lr0.01_s{s}" for s in range(3)])]),
+        ("where: interleave 1 replay", [f"w7c_where_i1seen_lr0.01_s{s}" for s in range(3)]),
+        ("where: bursts of 4, replay", [f"w7c_where_burst4seen_lr0.01_s{s}" for s in range(3)])]),
     ("what vs where, lr 0.03", [
-        ("what: interleave 4 replay mix", [f"w7_what_i4stream_lr0.03_s{s}" for s in range(3)]),
+        ("what: interleave 4 replay", [f"w7c_what_i4seen_lr0.03_s{s}" for s in range(3)]),
         ("what: 50% nines", [f"w7_what_nf0.5_lr0.03_s{s}" for s in range(3)]),
         ("what: base (interleave 1 others)", [f"w7_what_base_lr0.03_s{s}" for s in range(3)]),
-        ("where: interleave 1 replay mix", ["w6_mix_i1stream_lr0.03"] + [f"w7_where_i1stream_lr0.03_s{s}" for s in (1, 2)]),
+        ("where: interleave 1 replay", [f"w7c_where_i1seen_lr0.03_s{s}" for s in range(3)]),
+        ("where: bursts of 4, replay", [f"w7c_where_burst4seen_lr0.03_s{s}" for s in range(3)]),
         ("where: base (interleave 1 others)", ["w6_r64_lr0.03"] + [f"w7_where_base_lr0.03_s{s}" for s in (1, 2)])]),
     ("1000 samples, lr 0.01", [
-        ("what: interleave 1 replay mix", ["w7_what_long1000_i1stream_lr0.01"]),
-        ("where: interleave 1 replay mix", ["w7_where_long1000_i1stream_lr0.01"])]),
+        ("what: interleave 1 replay, all shots (leaks early)", ["w7_what_long1000_i1stream_lr0.01"]),
+        ("where: interleave 1 replay, all shots (leaks early)", ["w7_where_long1000_i1stream_lr0.01"])]),
 ]
 
 
