@@ -279,7 +279,10 @@ def cmd_rl(args, xt, yt, xv, yv, log):
                 # digits (stand-in for replay of other material), so repeats are not all back to back
                 if args.interleave_source == "others":
                     fill = others_idx[torch.randint(len(others_idx), (args.interleave,), generator=gf)]
-                else:  # the replay mixture: iid training images, new_fraction of them few-shot images
+                elif args.interleave_source == "seen":  # replay: iid from the samples presented so far
+                    fill = order[torch.randint(ep, (args.interleave,), generator=gf)]
+                else:  # the replay mixture: iid training images, new_fraction of them few-shot images (any shot,
+                    # including ones not yet presented: a leak in the early region; use "seen")
                     fill = torch.randint(len(yt), (args.interleave,), generator=gf)
                     pick = torch.rand(args.interleave, generator=gf) < args.new_fraction
                     fill[pick] = shots[torch.randint(len(shots), (int(pick.sum()),), generator=gf)]
@@ -334,9 +337,10 @@ def main():
                    help="rl: learning episodes on iid other-digit images between consecutive repeats")
     p.add_argument("--burst", type=int, default=1,
                    help="rl: repeats back to back between interleaves (1: interleave between every two repeats)")
-    p.add_argument("--interleave-source", default="others", choices=["others", "stream"],
-                   help="rl: interleaved episodes on other digits only, or on the replay mixture (new_fraction "
-                        "few-shot images, which can include the current sample's class)")
+    p.add_argument("--interleave-source", default="others", choices=["others", "stream", "seen"],
+                   help="rl: interleaved episodes on other digits only; on the replay mixture (new_fraction "
+                        "few-shot images drawn from all shots, including ones not yet presented: leaks); or iid "
+                        "replay of the samples presented so far (a replay buffer of the stream)")
     p.add_argument("--first-checkpoint", type=int, default=100)
     p.add_argument("--checkpoints", type=int, default=8)
     p.add_argument("--new-fraction", type=float, default=0.0,

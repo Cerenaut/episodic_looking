@@ -8,6 +8,8 @@ import argparse
 import json
 import os
 
+import numpy as np
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -283,11 +285,105 @@ def plot_wave6b(args):
     final_table(args, names, os.path.join(args.out, "wave6b_at200.md"))
 
 
+def seed_band(run, names):
+    """Seed mean and min/max of (memorised, held-out, others) on the shared checkpoints of the seed runs."""
+    hists = [load_stm(run, n)[1] for n in names]
+    n = min(len(h) for h in hists)
+    xs = [hists[0][i][0] for i in range(n)]
+    vals = np.array([[[h[i][k] for k in (1, 2, 3)] for i in range(n)] for h in hists])  # seeds x points x 3
+    return xs, vals.mean(0), vals.min(0), vals.max(0)
+
+
+WAVE7 = [  # (row title, [(label, [seed runs])])
+    ("what vs where, lr 0.01", [
+        ("what: interleave 4 replay mix", [f"w7_what_i4stream_lr0.01_s{s}" for s in range(3)]),
+        ("what: 50% nines", [f"w7_what_nf0.5_lr0.01_s{s}" for s in range(3)]),
+        ("what: base (interleave 1 others)", [f"w7_what_base_lr0.01_s{s}" for s in range(3)]),
+        ("where: interleave 1 replay mix", [f"w7_where_i1stream_lr0.01_s{s}" for s in range(3)]),
+        ("where: bursts of 4", [f"w7_where_burst4_lr0.01_s{s}" for s in range(3)])]),
+    ("what vs where, lr 0.03", [
+        ("what: interleave 4 replay mix", [f"w7_what_i4stream_lr0.03_s{s}" for s in range(3)]),
+        ("what: 50% nines", [f"w7_what_nf0.5_lr0.03_s{s}" for s in range(3)]),
+        ("what: base (interleave 1 others)", [f"w7_what_base_lr0.03_s{s}" for s in range(3)]),
+        ("where: interleave 1 replay mix", ["w6_mix_i1stream_lr0.03"] + [f"w7_where_i1stream_lr0.03_s{s}" for s in (1, 2)]),
+        ("where: base (interleave 1 others)", ["w6_r64_lr0.03"] + [f"w7_where_base_lr0.03_s{s}" for s in (1, 2)])]),
+    ("1000 samples, lr 0.01", [
+        ("what: interleave 1 replay mix", ["w7_what_long1000_i1stream_lr0.01"]),
+        ("where: interleave 1 replay mix", ["w7_where_long1000_i1stream_lr0.01"])]),
+]
+
+
+def plot_wave7(args):
+    """Wave 7: what vs where bias; seed means (3 STM seeds, same few-shot nines) with min-max bands, vs the LTM."""
+    fig, axes = plt.subplots(len(WAVE7), 3, figsize=(16, 4.4 * len(WAVE7)), facecolor=SURFACE, squeeze=False)
+    for ax_row, (row_title, groups) in zip(axes, WAVE7):
+        long = "1000" in row_title
+        ltm = load_ltm_any(args.run, "ltm_lr0.001" if long else "ltm200_lr0.001", 1000 if long else None)
+        if long:
+            ltm = ltm[1:]
+        for ax, k in zip(ax_row, (1, 2, 3)):
+            pts = [(max(r[0], 2), r[k]) for r in ltm if r[k] is not None]
+            if pts:
+                ax.plot(*zip(*pts), color=INK, lw=2, marker="o", ms=4.5, mec=SURFACE, mew=1.2,
+                        label="LTM only (AdamW 1e-3)" + (", longer stream" if long else ""), zorder=4)
+        for i, (label, names) in enumerate(groups):
+            xs, mean, lo, hi = seed_band(args.run, names)
+            xs = [max(x, 2) for x in xs]
+            ls = "--" if label.startswith("what") else ":"
+            for j, ax in enumerate(ax_row):
+                ax.plot(xs, mean[:, j], color=SERIES[i], lw=2, ls=ls, marker="s", ms=4, mec=SURFACE, mew=1,
+                        label=label + (f" ({len(names)} seeds)" if len(names) > 1 else ""), zorder=3)
+                if len(names) > 1:
+                    ax.fill_between(xs, lo[:, j], hi[:, j], color=SERIES[i], alpha=0.12, lw=0, zorder=2)
+        titles = ("Memorised: recall on the 16 training nines", "Generalised: recall on held-out nines",
+                  "Accuracy on digits 0-8")
+        for ax, t in zip(ax_row, titles):
+            ax.set_facecolor(SURFACE)
+            ax.set_title(t, color=INK, loc="left", fontsize=10.5)
+            ax.grid(True, color=GRID, lw=0.8, zorder=0)
+            ax.set_xscale("log")
+            ax.set_xlabel("samples presented (25% nines unless noted)")
+        ax_row[0].set_ylim(0, 1.02)
+        ax_row[1].set_ylim(0, 1.02)
+        ax_row[2].set_ylim(0.85, 1.0)
+        ax_row[0].set_ylabel(row_title, color=INK, fontsize=11)
+        ax_row[2].legend(loc="lower left", frameon=False, fontsize=8, labelcolor=INK)
+    fig.suptitle("Frozen gap snapshot, wave 7: RL STM with the what vs where bias (per-step accuracy, T 4, H 4, r 64, "
+                 "actor 0.1; seed mean, band = min-max) vs the LTM alone", color=INK, x=0.01, ha="left", fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.25 / (4.4 * len(WAVE7))))
+    path = os.path.join(args.out, "wave7_what_vs_where.png")
+    fig.savefig(path, dpi=150, facecolor=SURFACE)
+    plt.close(fig)
+    print(path)
+    with open(os.path.join(args.out, "wave7_table.md"), "w") as f:
+        f.write("| config | seeds | samples | memorised | held-out 9 | digits 0-8 |\n|---|---|---|---|---|---|\n")
+        rows = [(rt, g) for rt, gs in WAVE7 for g in gs]
+        for rt, (label, names) in rows:
+            for at in ((200, 1000) if "1000" in rt else (200,)):
+                vals = []
+                for n in names:
+                    h = json.load(open(os.path.join(args.run, f"{n}.json")))["result"]["history"]
+                    h = max((x for x in h if x["samples"] <= at), key=lambda x: x["samples"])
+                    vals.append((h["new_train_recall"], h["new_recall"], h["others_acc"]))
+                v = np.array(vals)
+                f.write(f"| {rt.split(',')[-1].strip()}: {label} | {len(names)} | {h['samples']} | "
+                        f"{v[:, 0].mean():.2f} | {v[:, 1].mean():.2f} ({v[:, 1].min():.2f}-{v[:, 1].max():.2f}) | "
+                        f"{v[:, 2].mean():.3f} |\n")
+        for name, at in (("ltm200_lr0.001", (27, 37, 52, 102, 200)), ("ltm_lr0.001", (1000,))):
+            for a in at:
+                h = max((x for x in json.load(open(os.path.join(args.run, f"{name}.json")))["result"]["history"]
+                         if x["samples"] <= a), key=lambda x: x["samples"])
+                m = h.get("new_train_recall")
+                f.write(f"| LTM only | 1 | {h['samples']} | {'-' if m is None else f'{m:.2f}'} | "
+                        f"{h['new_recall']:.2f} | {h['others_acc']:.3f} |\n")
+    print(open(os.path.join(args.out, "wave7_table.md")).read())
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--figure", default="speed", choices=["speed", "repeats", "wave5", "wave6", "wave6b"])
+    p.add_argument("--figure", default="speed", choices=["speed", "repeats", "wave5", "wave6", "wave6b", "wave7"])
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
     plt.rcParams.update({"font.size": 10, "axes.edgecolor": INK2, "axes.labelcolor": INK, "xtick.color": INK2,
@@ -303,6 +399,9 @@ def main():
         return
     if args.figure == "wave6b":
         plot_wave6b(args)
+        return
+    if args.figure == "wave7":
+        plot_wave7(args)
         return
     plt.rcParams.update({"font.size": 10, "axes.edgecolor": INK2, "axes.labelcolor": INK, "xtick.color": INK2,
                          "ytick.color": INK2, "axes.spines.top": False, "axes.spines.right": False})
