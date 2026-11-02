@@ -11,6 +11,9 @@ bounded by `bias_scale`, so a bias can reweight what the block computes but neve
   never biased). Same mechanism as padding masks and ALiBi; applied to every head and every query.
 - "what": a per-feature gain exp(s tanh(a)) in [e^-s, e^s] on the block's LayerNorm output, before the Q/K/V
   projections (not on the residual stream, where the next LayerNorm would normalise it away). bias_size = d_model.
+- "q", "k", "v" and their combinations ("qk", "qv", "kv", "qkv"; Dave 2 Nov 2026): per-channel gains exp(s tanh(a))
+  on the projected queries, keys and/or values (after the Q/K/V projections, before the split into heads), one
+  d_model block of the bias per part in q, k, v order. bias_size = d_model x number of parts.
 
 Hooks (`run` returns all of them in one pass):
 - "pre_bias": the residual stream entering the bias block (B, 1 + N, d_model); with bias_block 0 it does not depend
@@ -37,14 +40,19 @@ class Block(nn.Module):
         self.mlp = nn.Sequential(nn.Linear(d_model, mlp_ratio * d_model), nn.GELU(),
                                  nn.Linear(mlp_ratio * d_model, d_model))
 
-    def forward(self, x, gain=None, key_bias=None):
+    def forward(self, x, gain=None, key_bias=None, qkv_gain=None):
         """x (B, L, d); gain (B, d) multiplies the LayerNorm output; key_bias (B, L) is added to the attention logits
-        of every query for each key."""
+        of every query for each key; qkv_gain: {"q"|"k"|"v": (B, d)} multiplies the projected queries / keys /
+        values."""
         B, L, d = x.shape
         h = self.ln1(x)
         if gain is not None:
             h = h * gain[:, None, :]
         q, k, v = self.qkv(h).split(d, dim=2)
+        if qkv_gain:
+            q = q * qkv_gain["q"][:, None, :] if "q" in qkv_gain else q
+            k = k * qkv_gain["k"][:, None, :] if "k" in qkv_gain else k
+            v = v * qkv_gain["v"][:, None, :] if "v" in qkv_gain else v
         q, k, v = (t.reshape(B, L, self.heads, d // self.heads).transpose(1, 2) for t in (q, k, v))
         mask = None if key_bias is None else key_bias[:, None, None, :].to(q.dtype)
         a = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
@@ -56,11 +64,12 @@ class BiasableTransformer(nn.Module):
 
     BIAS_WHERE = "where"
     BIAS_WHAT = "what"
+    BIAS_QKV = ("q", "k", "v", "qk", "qv", "kv", "qkv")
 
     def __init__(self, num_tokens, token_size, num_classes, d_model=64, heads=4, blocks=1, mlp_ratio=2,
                  bias_block=0, bias_mode=BIAS_WHERE, bias_scale=math.log(4.0)):
         super().__init__()
-        if bias_mode not in (self.BIAS_WHERE, self.BIAS_WHAT):
+        if bias_mode not in (self.BIAS_WHERE, self.BIAS_WHAT) + self.BIAS_QKV:
             raise ValueError(f"unknown bias mode {bias_mode}")
         if not 0 <= bias_block < blocks:
             raise ValueError(f"bias_block {bias_block} outside 0..{blocks - 1}")
@@ -81,7 +90,11 @@ class BiasableTransformer(nn.Module):
 
     @property
     def bias_size(self):
-        return self.num_tokens if self.bias_mode == self.BIAS_WHERE else self.d_model
+        if self.bias_mode == self.BIAS_WHERE:
+            return self.num_tokens
+        if self.bias_mode in self.BIAS_QKV:
+            return self.d_model * len(self.bias_mode)
+        return self.d_model
 
     def tokens(self, x):
         """Flattened (B, N * token_size) or (B, N, token_size) input to (B, N, token_size)."""
@@ -92,16 +105,19 @@ class BiasableTransformer(nn.Module):
         x = torch.cat([self.cls.expand(len(x), -1, -1), x], dim=1) + self.pos
         pre_bias = None
         for i, block in enumerate(self.blocks):
-            gain = key_bias = None
+            gain = key_bias = qkv_gain = None
             if i == self.bias_block:
                 pre_bias = x
                 if bias is not None:
                     bounded = self.bias_scale * torch.tanh(bias)
                     if self.bias_mode == self.BIAS_WHERE:
                         key_bias = F.pad(bounded, (1, 0))   # CLS key unbiased
+                    elif self.bias_mode in self.BIAS_QKV:
+                        parts = torch.exp(bounded).split(self.d_model, dim=1)
+                        qkv_gain = dict(zip(self.bias_mode, parts))
                     else:
                         gain = torch.exp(bounded)
-            x = block(x, gain=gain, key_bias=key_bias)
+            x = block(x, gain=gain, key_bias=key_bias, qkv_gain=qkv_gain)
         features = self.norm(x[:, 0])
         return {"pre_bias": pre_bias, "features": features, "logits": self.head(features)}
 

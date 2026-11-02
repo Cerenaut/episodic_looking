@@ -55,5 +55,27 @@ class TestBiasableTransformer(unittest.TestCase):
         self.assertAlmostEqual(s, math.log(4.0))
 
 
+class TestQKVGains(unittest.TestCase):
+    """Per-channel gains on the projected queries / keys / values (Dave, 2 Nov 2026)."""
+
+    def make(self, mode):
+        torch.manual_seed(0)
+        net = BiasableTransformer(num_tokens=49, token_size=8, num_classes=10, d_model=16, heads=2, bias_mode=mode)
+        return net.eval()
+
+    def test_sizes_and_neutral_at_zero(self):
+        x = torch.randn(3, 49 * 8)
+        for mode, parts in (("q", 1), ("kv", 2), ("qkv", 3)):
+            net = self.make(mode)
+            self.assertEqual(net.bias_size, 16 * parts)
+            torch.testing.assert_close(net(x, torch.zeros(3, net.bias_size)), net(x))
+            self.assertFalse(torch.allclose(net(x, torch.randn(3, net.bias_size)), net(x)))
+
+    def test_q_and_k_gains_are_equivalent_with_one_block(self):
+        # only the CLS row is read out; its score for key j is sum_c q_c g_c k_jc either way
+        x, a = torch.randn(3, 49 * 8), torch.randn(3, 16)
+        torch.testing.assert_close(self.make("q")(x, a), self.make("k")(x, a))
+
+
 if __name__ == "__main__":
     unittest.main()
