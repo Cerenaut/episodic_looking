@@ -88,7 +88,8 @@ def fig_ltm_vs_stm(args):
     rows = [("25% nines (stream without replacement)", [
                 ("LTM alone, step every sample", ltm_names(1), SERIES[1], "-", "o"),
                 ("LTM alone, step every 16 samples", ltm_names(16), INK, "-", "o"),
-                ("STM (what, r 64, T 4), LTM frozen", GRID9, SERIES[0], "--", "s")]),
+                ("STM (what, r 64, T 4), LTM frozen", GRID9, SERIES[0], "--", "s"),
+                ("STM (what, r 256, T 8), LTM frozen", repeat_runs(256, 8), SERIES[2], "--", "s")]),
             ("50% nines (with replacement; STM from wave 7)", [
                 ("LTM alone, step every sample", [f"w8_ltm_nf0.5_every1_s{s}" for s in range(3)], SERIES[1], "-", "o"),
                 ("LTM alone, step every 16 samples", [f"w8_ltm_nf0.5_every16_s{s}" for s in range(3)], INK, "-", "o"),
