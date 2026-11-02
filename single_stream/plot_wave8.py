@@ -125,7 +125,7 @@ def fig_ltm_long(args):
         ax.plot(xs, v.mean(0), color=color, lw=2, label=label)
         ax.fill_between(xs, v.min(0), v.max(0), color=color, alpha=0.12, lw=0)
     style(ax, "Worst single digit of 0-8")
-    ax.set_ylim(0.4, 1.0)
+    ax.set_ylim(0, 1.0)
     axes[2].legend(loc="lower left", frameon=False, fontsize=9, labelcolor=INK)
     fig.suptitle("Wave 8: the two LTM cadences over 3000 samples (25% nines, 5 streams; mean, band = min-max)",
                  color=INK, x=0.01, ha="left", fontsize=12)
