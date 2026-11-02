@@ -46,11 +46,15 @@ def presentations(diag, max_sample=None, scale=1.0):
         if not d["new"]:
             continue
         t = d["target"]
+        if "p_T" in d["pre"]:  # p(y) logged directly (from wave 8; needed for non-probability rewards)
+            p0, pre, post = d["pre"]["p_0"], d["pre"]["p_T"], d["post"]["p_T"]
+        else:
+            p0, pre, post = p(d["pre"]["score_0"]), p(d["pre"]["score_T"]), p(d["post"]["score_T"])
         out.append({"sample": d["sample"], "index": d["index"], "k": d["times_presented"],
-                    "p0": p(d["pre"]["score_0"]), "pre": p(d["pre"]["score_T"]), "post": p(d["post"]["score_T"]),
+                    "p0": p0, "pre": pre, "post": post,
                     "prev_post": last.get(d["index"]), "return_std": t["return_std"],
                     "baseline_error": t["baseline_error"], "grad_actor_out": t["grad_actor_out"]})
-        last[d["index"]] = p(d["post"]["score_T"])
+        last[d["index"]] = post
     return out
 
 

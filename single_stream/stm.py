@@ -15,6 +15,11 @@ Training (label given): rewards from the per-step scores (MnistModel.episode_rew
 one episode), then `actor_updates - 1` further clipped-surrogate actor passes, then recruitment. The LTM is frozen
 within the episode and never trained here (it learns from replay, outside). Evaluation: no label, no learning, the
 policy mean (or a sample) as the bias. Episodes are independent: nothing is carried from one to the next.
+
+Group-normalised advantage (Dave, 2 Nov 2026): `episode(..., learn=True, defer=True)` returns the episode's update
+inputs instead of updating; `group_update` then takes one step on a group of episodes (consecutive repeats of one
+image, never mixed with other images' episodes) with advantage (G - group mean) / max(group std, floor) per step,
+in place of the critic baseline. The critic still regresses on the returns.
 """
 import torch
 
@@ -83,7 +88,7 @@ class RLSTM:
             bias = bias @ self.bias_basis
         return self.ltm.run(x, bias)
 
-    def episode(self, x, y=None, learn=False, sample=None):
+    def episode(self, x, y=None, learn=False, sample=None, defer=False):
         """
         x: [B, ...] LTM inputs; y: [B] labels (training) or None. learn requires y. sample: draw the bias from the
         policy (default: in training, or when eval_bias is "sample"). Returns a dict of per-step diagnostics:
@@ -143,7 +148,12 @@ class RLSTM:
         rewards = self.model.episode_rewards(scores, result["logits"].argmax(2))
         returns = self.model.returns(rewards, result["values"])
         result.update({"scores": torch.stack(scores), "rewards": rewards, "returns": returns})
-        if learn:
+        if learn and defer:
+            result["deferred"] = (inputs, windows, contexts, samples, log_p_old, returns.detach())
+            if active_a[0] is not None:
+                self.recruited += self.model.recruit(keys_a, active_a, keys_c, active_c)
+            self.episodes += 1
+        elif learn:
             self._update(inputs, windows, contexts, samples, log_p_old, values, returns)
             if active_a[0] is not None:
                 self.recruited += self.model.recruit(keys_a, active_a, keys_c, active_c)
@@ -165,6 +175,41 @@ class RLSTM:
             if k == 0:
                 critic_loss = self.model.critic_loss(v.flatten(), returns.flatten())
                 stats.update({"actor_loss": float(loss), "critic_loss": float(critic_loss)})
+                loss = loss + critic_loss
+            self.opt.zero_grad(set_to_none=True)
+            loss.backward()
+            if k == 0:
+                for name, params in self.param_groups.items():
+                    stats[f"grad_{name}"] = float(torch.sqrt(sum((p.grad ** 2).sum() for p in params
+                                                                 if p.grad is not None)))
+            self.opt.step()
+        self.last_update = stats
+
+    def group_update(self, deferred, std_floor=1e-3):
+        """One update on a group of deferred episodes (see the module docstring). The critic values are recomputed
+        from the stored inputs (the parameters may have changed since the episodes ran)."""
+        cfg = self.model.config
+        T = len(deferred[0][0])
+
+        def cat(k):  # step-major over the group: [T * G, ...]
+            return torch.cat([torch.cat([d[k][t] for d in deferred]) for t in range(T)])
+        inp, win, smp = cat(0), cat(1), cat(3)
+        ctx = cat(2) if deferred[0][2][0] is not None else None
+        log_p_old = cat(4)
+        returns = torch.cat([d[5] for d in deferred], dim=1)       # [T, G]
+        G = returns.shape[1]
+        std = returns.std(dim=1, keepdim=True).clamp(min=std_floor) if G > 1 else torch.ones(T, 1)
+        advantage = (returns - returns.mean(dim=1, keepdim=True)) / std
+        stats = {"advantage": float(advantage.mean()), "advantage_abs": float(advantage.abs().mean()),
+                 "return_0": float(returns[0].mean()), "group_return_std": float(returns[0].std()) if G > 1 else 0.0}
+        for k in range(cfg.actor_updates):
+            log_p = self.model.actor_log_p(inp, win, smp, ctx)
+            loss = self.model.actor_loss(log_p, log_p_old, advantage.flatten())
+            if k == 0:
+                v = self.model.do_critic(inp, ctx)[0].reshape(-1)
+                critic_loss = self.model.critic_loss(v, returns.flatten())
+                stats.update({"actor_loss": float(loss), "critic_loss": float(critic_loss),
+                              "value_0": float(v[:G].detach().mean())})
                 loss = loss + critic_loss
             self.opt.zero_grad(set_to_none=True)
             loss.backward()

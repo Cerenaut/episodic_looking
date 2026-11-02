@@ -295,5 +295,52 @@ class TestCLSScheduling(unittest.TestCase):
         self.assertEqual(set(v), {"stm", "ltm"})
 
 
+
+class TestWave8(unittest.TestCase):
+    """Wave 8 (2 Nov 2026): log-probability and logit-margin rewards, group-normalised advantage, the stream
+    without replacement."""
+
+    def test_log_accuracy_and_margin_rewards(self):
+        logits = torch.tensor([[2.0, 0.0, -1.0], [0.0, 50.0, 0.0]])
+        y = torch.tensor([0, 0])
+        _, stm = make_stm(reward_type="log-accuracy")
+        s = stm.model.step_score(logits, y)
+        torch.testing.assert_close(s[0], torch.log_softmax(logits[0], 0)[0])
+        self.assertAlmostEqual(float(s[1]), MnistModel.LOG_P_FLOOR, places=5)    # clipped
+        _, stm = make_stm(reward_type="margin")
+        s = stm.model.step_score(logits, y)
+        torch.testing.assert_close(s, torch.tensor([2.0, -MnistModel.MARGIN_CLIP]))
+
+    def test_group_update(self):
+        net, stm = make_stm(reward_type="accuracy")
+        x = torch.randn(1, 49 * 8)
+        y = torch.tensor([3])
+        before = [p.detach().clone() for p in stm.model.get_trainable_parameters()]
+        group = [stm.episode(x, y, learn=True, defer=True)["deferred"] for _ in range(4)]
+        for p, b in zip(stm.model.get_trainable_parameters(), before):   # deferring does not update
+            self.assertTrue(torch.equal(p.detach(), b))
+        stm.episode(torch.randn(1, 49 * 8), torch.tensor([1]), learn=True)  # an interleaved update in between
+        stm.group_update(group)
+        self.assertIn("group_return_std", stm.last_update)
+        changed = any(not torch.equal(p.detach(), b) for p, b in zip(stm.model.get_trainable_parameters(), before))
+        self.assertTrue(changed)
+        self.assertAlmostEqual(stm.last_update["advantage"], 0.0, places=5)   # zero mean within the group
+
+    def test_stream_without_replacement(self):
+        import argparse
+        from single_stream.stm_frozen import stream_order
+        yt = torch.tensor([9] * 16 + [0] * 1000)
+        args = argparse.Namespace(seed=0, stream_seed=None, episodes=400, new_fraction=0.25, new_digit=9,
+                                  new_order="shuffle")
+        o = stream_order(args, yt)
+        nines = o[yt[o] == 9].tolist()
+        self.assertEqual(len(set(nines[:16])), 16)         # every slot a new image until all are shown
+        self.assertEqual(len(set(nines[16:32])), 16)        # then a reshuffled pass
+        args.stream_seed = 5
+        self.assertFalse(torch.equal(stream_order(args, yt), o))
+        args.seed, args.stream_seed = 3, 0                  # the stream depends on the stream seed only
+        self.assertTrue(torch.equal(stream_order(args, yt), o))
+
+
 if __name__ == "__main__":
     unittest.main()

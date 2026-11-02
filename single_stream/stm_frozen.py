@@ -117,12 +117,26 @@ def stream_order(args, yt):
     """The training samples presented, one per episode (rl) or per sample (ltm): iid over the snapshot's training
     images, with --new-fraction of them drawn from the few-shot images (a stand-in for a prioritised buffer).
     Identical for rl and ltm with the same seed, so their curves share the x-axis."""
-    g = torch.Generator().manual_seed(args.seed + 7)
-    order = torch.randint(len(yt), (args.episodes,), generator=g)
+    stream_seed = getattr(args, "stream_seed", None)
+    g = torch.Generator().manual_seed((args.seed if stream_seed is None else stream_seed) + 7)
+    shuffle = getattr(args, "new_order", "replace") == "shuffle"
+    if shuffle and args.new_fraction > 0:
+        # the other slots draw iid from the other digits only, so few-shot images arrive only via their own slots
+        rest = torch.nonzero(yt != args.new_digit).flatten()
+        order = rest[torch.randint(len(rest), (args.episodes,), generator=g)]
+    else:
+        order = torch.randint(len(yt), (args.episodes,), generator=g)
     if args.new_fraction > 0:
         new_idx = torch.nonzero(yt == args.new_digit).flatten()
         pick_new = torch.rand(args.episodes, generator=g) < args.new_fraction
-        order[pick_new] = new_idx[torch.randint(len(new_idx), (int(pick_new.sum()),), generator=g)]
+        n_new = int(pick_new.sum())
+        if shuffle:
+            # without replacement: each few-shot slot gets a new image until all have been shown, then a reshuffled pass
+            passes = (n_new + len(new_idx) - 1) // len(new_idx)
+            seq = torch.cat([new_idx[torch.randperm(len(new_idx), generator=g)] for _ in range(passes)])[:n_new]
+        else:
+            seq = new_idx[torch.randint(len(new_idx), (n_new,), generator=g)]
+        order[pick_new] = seq
     return order
 
 
@@ -155,10 +169,10 @@ def cmd_ltm(args, xt, yt, xv, yv, log):
             f"others {s['others_acc']:.4f}")
 
     evaluate(0)
-    B = args.ltm_batch
+    B, every = args.ltm_batch, args.ltm_every or args.ltm_batch
     for n in range(1, args.episodes + 1):
-        if n % B == 0:
-            idx = order[n - B:n]
+        if n % every == 0:
+            idx = order[max(0, n - B):n]  # the last B samples (fewer at the start)
             net.train()
             loss = F.cross_entropy(net(xt[idx]), yt[idx])
             opt.zero_grad()
@@ -245,16 +259,18 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         final correctness, mean |bias|, the actor clique."""
         with torch.no_grad():
             r = stm.episode(xt[j:j + 1], yt[j:j + 1])
+        p_y = torch.softmax(r["logits"][:, 0], dim=-1)[:, yt[j]]
         return {"score_0": float(r["scores"][0, 0]), "score_T": float(r["scores"][-1, 0]),
+                "p_0": float(p_y[0]), "p_T": float(p_y[-1]),
                 "correct_T": int(r["logits"][-1, 0].argmax() == yt[j]), "bias_abs": float(r["bias"][-1].abs().mean()),
                 "clique_kept": float(torch.isin(r["active_actor"][-1][0], r["active_actor"][0][0]).float().mean())}, \
             r["active_actor"][0][0]
 
-    def summarise(stats):
+    def summarise(stats, episode_returns=None):
         """Mean of the per-update diagnostics over a block of episodes; return_std is the spread of the episode
         return over the block (the reward signal exploration produces), baseline_error the mean return - value."""
         out = {k: float(np.mean([u[k] for u in stats])) for k in stats[0]}
-        g = np.array([u["return_0"] for u in stats])
+        g = np.array(episode_returns if episode_returns is not None else [u["return_0"] for u in stats])
         out["return_std"] = float(g.std())
         out["baseline_error"] = float(np.mean([u["return_0"] - u["value_0"] for u in stats]))
         return out
@@ -272,7 +288,8 @@ def cmd_rl(args, xt, yt, xv, yv, log):
             pre, cells = probe(j)
             prior = actor_count[cells]
             w0 = {g: stm.param_vector(g) for g in stm.param_groups}
-            target, other = [], []
+            target, other, target_returns = [], [], []
+        group = []  # deferred repeats of this sample (group-normalised advantage)
         for k in range(args.repeats):  # r independent learning episodes per sample ("thinking time")
             if k > 0 and k % args.burst == 0:
                 # between bursts of `burst` repeats: `interleave` learning episodes on iid images of the other
@@ -290,9 +307,19 @@ def cmd_rl(args, xt, yt, xv, yv, log):
                     stm.episode(xt[f:f + 1], yt[f:f + 1], learn=True)
                     if diag:
                         other.append(stm.last_update)
-            res = stm.episode(xt[j:j + 1], yt[j:j + 1], learn=True)
-            if diag:
+            group_mode = args.group_size > 0
+            res = stm.episode(xt[j:j + 1], yt[j:j + 1], learn=True, defer=group_mode)
+            if group_mode:
+                group.append(res["deferred"])
+                if len(group) == args.group_size or k == args.repeats - 1:
+                    stm.group_update(group, std_floor=args.group_std_floor)
+                    group = []
+                    if diag:
+                        target.append(stm.last_update)
+            elif diag:
                 target.append(stm.last_update)
+            if diag:
+                target_returns.append(float(res["returns"][0, 0]))
             if k == 0:
                 train_scores.append(float(res["scores"][-1, 0]))
         if diag:
@@ -300,7 +327,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
             line = {"sample": ep, "index": int(j), "label": int(yt[j]), "new": int(yt[j] == args.new_digit),
                     "times_presented": int(presented[j]), "pre": pre, "post": post,
                     "clique_fresh": float((prior == 0).float().mean()), "clique_prior_mean": float(prior.float().mean()),
-                    "target": summarise(target), "interleaved": summarise(other) if other else None,
+                    "target": summarise(target, target_returns), "interleaved": summarise(other) if other else None,
                     "weight_change": {g: float((stm.param_vector(g) - w0[g]).norm()) for g in w0}}
             diag.write(json.dumps(line) + "\n")
             diag.flush()
@@ -341,6 +368,16 @@ def main():
                    help="rl: interleaved episodes on other digits only; on the replay mixture (new_fraction "
                         "few-shot images drawn from all shots, including ones not yet presented: leaks); or iid "
                         "replay of the samples presented so far (a replay buffer of the stream)")
+    p.add_argument("--new-order", default="shuffle", choices=["shuffle", "replace"],
+                   help="few-shot slots of the stream: without replacement (each slot a new image until all are shown; "
+                        "default from wave 8) or with replacement (waves <= 7)")
+    p.add_argument("--stream-seed", type=int, default=None, help="stream order seed (default: --seed)")
+    p.add_argument("--ltm-every", type=int, default=0,
+                   help="ltm: one step every N samples on the last --ltm-batch samples (0: every --ltm-batch)")
+    p.add_argument("--group-size", type=int, default=0,
+                   help="rl: group-normalised advantage over this many consecutive repeats of a sample (0: critic "
+                        "baseline, per-episode updates)")
+    p.add_argument("--group-std-floor", type=float, default=1e-3)
     p.add_argument("--first-checkpoint", type=int, default=100)
     p.add_argument("--checkpoints", type=int, default=8)
     p.add_argument("--new-fraction", type=float, default=0.0,
