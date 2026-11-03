@@ -88,7 +88,9 @@ def at_nines(h, k, nines=NINES):
 
 
 def mean_curves(ns):
-    """Seed mean, (len(NINES), 3) for KEYS."""
+    """Seed mean, (len(NINES), 3) for KEYS; all NaN if there are no runs (yet)."""
+    if not ns:
+        return np.full((len(NINES), len(KEYS)), np.nan)
     return np.nanmean([np.stack([at_nines(hist(RUN, n), k) for k in KEYS], 1) for n in ns], 0)
 
 
@@ -104,6 +106,8 @@ def dominance(ltm_cfg, stm_cfg, seeds=None):
     """Pre-registered test on seed means over the seeds both configs have (paired streams); returns (passes, worst
     margins mem / held / protection, seeds)."""
     s = [x for x in (SEEDS if seeds is None else seeds) if names(ltm_cfg, [x]) and names(stm_cfg, [x])]
+    if not s:
+        return None
     ltm, stm = names(ltm_cfg, s), names(stm_cfg, s)
     a, b = mean_curves(ltm), mean_curves(stm)
     i = lambda xs: [NINES.index(x) for x in xs]
@@ -190,7 +194,9 @@ def fig_tradeoff(args, rows):
                        edgecolor=INK, lw=1, zorder=4, label=None if ax is axes[1] or label != "r 64" else
                        "STM configs (filled: the two chosen)")
     for label, cfg, color, ls in PICKS:
-        r = next(r for r in rows if r["cfg"] == ltm_name(cfg))
+        r = next((r for r in rows if r["cfg"] == ltm_name(cfg)), None)
+        if r is None or r["prot"] < XMIN:
+            continue
         tag = label.split(":")[0].split(",")[0].replace("LTM ", "")
         for ax, k in zip(axes, ("held", "mem")):
             ax.annotate(tag, (r["prot"], r[k]), xytext=(5, -3), textcoords="offset points", fontsize=8, color=INK)
@@ -231,6 +237,8 @@ def fig_episodes(args):
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), facecolor=SURFACE)
     for label, color, ls, marker in ROW_REF + ROW_W10[1:]:
         ns = names(f"{W}_{STM[label]}", range(5))
+        if not ns:
+            continue
         eps = np.mean([at_nines(hist(RUN, n), "learning_episodes") for n in ns], 0)
         c = mean_curves(ns)
         for j, ax in enumerate(axes):
@@ -265,6 +273,8 @@ def table(args, rows):
          "/ at 200 samples | learning episodes @200 samples |", "|---|---|---|---|---|---|"]
     for label, cfg in STM.items():
         ns = names(f"{W}_{cfg}", range(5))
+        if not ns:
+            continue
         c = mean_curves(ns)
         eps = np.mean([hist(RUN, n)[-1]["learning_episodes"] for n in ns])
         end = np.mean([hist(RUN, n)[-1]["others_acc"] for n in ns])
@@ -276,6 +286,8 @@ def table(args, rows):
                  ("adapt256_prio_replay255", "adapt256_prio"), ("adapt256_prio_replay255", "r256_T4"),
                  ("adapt256_prio", "adapt256"), ("adapt256_prio_fstop9", "adapt256_prio")):
         m, se, n = paired(a, b, "new_recall", (1, 2, 3, 5, 9), range(5))
+        if not n:
+            continue
         L.append(f"| {a} - {b} | {n} | " + " / ".join(f"{x:+.2f}+-{e:.2f}" for x, e in zip(m, se)) + " |")
     L += ["", f"## LTM-only configs ({LP} and the {W} baselines), mean of seeds {SEEDS[0]}-{SEEDS[-1]}, and the "
           "pre-registered test",
@@ -291,6 +303,9 @@ def table(args, rows):
         c = r["curves"]
         cells = []
         for _, cfg, _ in BEST:
+            if r["dom"][cfg] is None:
+                cells.append("-")
+                continue
             ok, dm, dh, dp, n = r["dom"][cfg]
             cells.append(f"{'**yes**' if ok else 'no'} ({dm:+.2f} / {dh:+.2f} / {dp:+.3f})" + (
                 "" if n == len(SEEDS) else f" [{n} seeds]"))
@@ -366,6 +381,8 @@ def main():
     rows = []
     for cfg in ltm_configs():
         ns = names(cfg, SEEDS)
+        if not ns:
+            continue
         r = {"cfg": cfg, **summary(ns), "end": np.mean([hist(RUN, n)[-1]["others_acc"] for n in ns]), "dom": {}}
         for _, b, _ in BEST:
             r["dom"][b] = dominance(cfg, f"{W}_{b}")
