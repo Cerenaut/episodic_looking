@@ -12,6 +12,9 @@ presentation (--nine-checkpoints; no interpolation).
   wave11_table.md          STM table, paired diagnostics, LTM table with the pre-registered dominance test
 
   python -m single_stream.plot_wave11 --run runs_ss/stm_frozen_20261101/snap9 --out <dir>
+
+Wave 13 (75% nines, same configs, LTM picks at 5 seeds): --wave 13 gives the same figures as wave13_*, the dominance
+test on seeds 0-4, and wave13_streams.png / the stream table (25% = wave 11-12 vs 75% = wave 13).
 """
 import argparse
 import glob
@@ -51,12 +54,24 @@ ROW_W10 = [("adapt 256", GREY, "-", "o"), ("adapt 256 + prio", SERIES[0], "-", "
 BEST = [("STM + prio, replay 255 per sample", "adapt256_prio_replay255", SERIES[1]),
         ("STM + prio, first stop .9", "adapt256_prio_fstop9", SERIES[0])]
 # LTM tradeoff points for the comparison figure, chosen from the tradeoff plot: (label, config, color, linestyle)
-PICKS = [("LTM every sample: Adam 1e-3 (wave-8 baseline)", "w11_ltm_every1", INK, ":"),
-         ("LTM fast: SGD .01, window 16, every sample", "w12_b16_e1_sgd_lr0.01", SERIES[2], "--"),
-         ("LTM balanced: replay 15, 4 Adam steps 1e-4", "w12_b1_e1_rp15_lr1e-4_k4", SERIES[3], "--"),
-         ("LTM head only: replay 15, Adam 3e-3", "w12_b1_e1_rp15_head_lr3e-3", SERIES[4], "--"),
-         ("LTM protective: window 16 every 4, Adam 1e-4", "w12_b16_e4_lr1e-4", SERIES[5], "--")]
+# (configs without the wave prefix; see ltm_name)
+PICKS = [("LTM every sample: Adam 1e-3 (wave-8 baseline)", "ltm_every1", INK, ":"),
+         ("LTM fast: SGD .01, window 16, every sample", "b16_e1_sgd_lr0.01", SERIES[2], "--"),
+         ("LTM balanced: replay 15, 4 Adam steps 1e-4", "b1_e1_rp15_lr1e-4_k4", SERIES[3], "--"),
+         ("LTM head only: replay 15, Adam 3e-3", "b1_e1_rp15_head_lr3e-3", SERIES[4], "--"),
+         ("LTM protective: window 16 every 4, Adam 1e-4", "b16_e4_lr1e-4", SERIES[5], "--")]
 XMIN = 0.78  # tradeoff plot: protection axis starts here
+# wave set by --wave: W the STM runs and LTM baselines, LP the other LTM regimes, SEEDS for the LTM comparisons
+WAVES = {11: ("w11", "w12", range(3), "25% nines"), 13: ("w13", "w13", range(5), "75% nines")}
+WAVE, W, LP, SEEDS, STREAM = 11, *WAVES[11]
+
+
+def ltm_name(cfg):
+    return f"{W}_{cfg}" if cfg.startswith("ltm_") else f"{LP}_{cfg}"
+
+
+def out_name(name):
+    return f"wave{WAVE}_{name}"
 
 
 def names(cfg, seeds):
@@ -85,10 +100,10 @@ def summary(ns):
             "held40": c[-1, 1], "curves": c}
 
 
-def dominance(ltm_cfg, stm_cfg, seeds=range(3)):
+def dominance(ltm_cfg, stm_cfg, seeds=None):
     """Pre-registered test on seed means over the seeds both configs have (paired streams); returns (passes, worst
     margins mem / held / protection, seeds)."""
-    s = [x for x in seeds if names(ltm_cfg, [x]) and names(stm_cfg, [x])]
+    s = [x for x in (SEEDS if seeds is None else seeds) if names(ltm_cfg, [x]) and names(stm_cfg, [x])]
     ltm, stm = names(ltm_cfg, s), names(stm_cfg, s)
     a, b = mean_curves(ltm), mean_curves(stm)
     i = lambda xs: [NINES.index(x) for x in xs]
@@ -103,8 +118,8 @@ def dominance(ltm_cfg, stm_cfg, seeds=range(3)):
 
 
 def ltm_configs():
-    cfgs = sorted({os.path.basename(f)[:-len("_s0.json")] for f in glob.glob(os.path.join(RUN, "w12_*_s0.json"))})
-    return ["w11_ltm_every1", "w11_ltm_every16"] + cfgs
+    cfgs = sorted({os.path.basename(f)[:-len("_s0.json")] for f in glob.glob(os.path.join(RUN, f"{LP}_b*_s0.json"))})
+    return [f"{W}_ltm_every1", f"{W}_ltm_every16"] + cfgs
 
 
 def family(cfg):
@@ -117,8 +132,8 @@ def family(cfg):
         return "seen replay 15 per update", SERIES[1], "^"
     if "_k" in cfg:
         return "4 or 16 steps per update", SERIES[4], "P"
-    if cfg.startswith("w11_"):
-        return "wave 11 baselines (every 1, every 16)", INK, "X"
+    if "ltm_every" in cfg:
+        return "baselines (every 1, every 16)", INK, "X"
     return "window / cadence x lr (Adam)", SERIES[0], "o"
 
 
@@ -142,16 +157,17 @@ def fig_stm_all(args):
     fig, axes = plt.subplots(2, 3, figsize=(16, 9), facecolor=SURFACE)
     for row, groups, title in ((0, ROW_REF, "references and diagnostics"), (1, ROW_W10, "adaptive variants")):
         for label, color, ls, marker in groups:
-            ns = names(f"w11_{STM[label]}", range(5))
+            ns = names(f"{W}_{STM[label]}", range(5))
             plot_curves(axes[row], f"{label} ({len(ns)} seeds)", mean_curves(ns), color, ls, marker)
         axes_nines(axes[row])
         axes[row, 2].set_ylim(0.93, 0.97)
         axes[row, 2].legend(loc="lower left", frameon=False, fontsize=8.5, labelcolor=INK, title=title,
                             title_fontsize=9)
-    fig.suptitle("Wave 11: all STM configs, mean of 5 seeds (stream = seed), read right after each nine presentation",
+    fig.suptitle(f"Wave {WAVE} ({STREAM}): all STM configs, mean of 5 seeds (stream = seed), read right after each "
+                 "nine presentation",
                  color=INK, x=0.01, ha="left", fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
-    save(fig, args, "wave11_stm_all.png")
+    save(fig, args, out_name("stm_all.png"))
 
 
 def fig_tradeoff(args, rows):
@@ -167,14 +183,14 @@ def fig_tradeoff(args, rows):
                        label=None if fam in seen else fam)
         seen.add(fam)
     for label, cfg in STM.items():
-        s = summary(names(f"w11_{cfg}", range(3)))
+        s = summary(names(f"{W}_{cfg}", SEEDS))
         best = any(cfg == b[1] for b in BEST)
         for ax, k in zip(axes, ("held", "mem")):
             ax.scatter(s["prot"], s[k], s=150 if best else 60, color=INK if best else "none", marker="*",
                        edgecolor=INK, lw=1, zorder=4, label=None if ax is axes[1] or label != "r 64" else
                        "STM configs (filled: the two chosen)")
     for label, cfg, color, ls in PICKS:
-        r = next(r for r in rows if r["cfg"] == cfg)
+        r = next(r for r in rows if r["cfg"] == ltm_name(cfg))
         tag = label.split(":")[0].split(",")[0].replace("LTM ", "")
         for ax, k in zip(axes, ("held", "mem")):
             ax.annotate(tag, (r["prot"], r[k]), xytext=(5, -3), textcoords="offset points", fontsize=8, color=INK)
@@ -188,32 +204,33 @@ def fig_tradeoff(args, rows):
         fig.text(0.01, 0.01, f"Not shown, digits 0-8 below {XMIN}: " + ", ".join(r["cfg"][4:] for r in off)
                  + ". Labelled: LTM regimes in the comparison figure.",
                  fontsize=8, color=INK)
-    fig.suptitle("LTM-only regimes (wave 12) and STM configs: seeds 0-2 on the same streams; up and right is better",
+    fig.suptitle(f"{STREAM}: LTM-only regimes ({LP}) and STM configs, seeds {SEEDS[0]}-{SEEDS[-1]} on the same streams; "
+                 "up and right is better",
                  color=INK, x=0.01, ha="left", fontsize=12)
     fig.tight_layout(rect=(0, 0.04, 1, 0.94))
-    save(fig, args, "wave11_ltm_tradeoff.png")
+    save(fig, args, out_name("ltm_tradeoff.png"))
 
 
 def fig_best_vs_ltm(args):
     fig, axes = plt.subplots(1, 3, figsize=(16, 5.6), facecolor=SURFACE)
     for label, cfg, color, ls in PICKS:
-        plot_curves(axes, label, mean_curves(names(cfg, range(3))), color, ls, None, lw=1.6)
+        plot_curves(axes, label, mean_curves(names(ltm_name(cfg), SEEDS)), color, ls, None, lw=1.6)
     for label, cfg, color in BEST:
-        plot_curves(axes, label, mean_curves(names(f"w11_{cfg}", range(3))), color, "-", "o", lw=2.4)
+        plot_curves(axes, label, mean_curves(names(f"{W}_{cfg}", SEEDS)), color, "-", "o", lw=2.4)
     axes_nines(axes)
     axes[2].set_ylim(0.84, 0.975)
     fig.legend(*axes[0].get_legend_handles_labels(), loc="lower center", ncol=4, frameon=False, fontsize=8.5,
                labelcolor=INK)
-    fig.suptitle("Best STM configs vs LTM-only tradeoff points, mean of seeds 0-2 (paired streams)", color=INK, x=0.01,
-                 ha="left", fontsize=12)
+    fig.suptitle(f"{STREAM}: best STM configs vs LTM-only tradeoff points, mean of seeds {SEEDS[0]}-{SEEDS[-1]} "
+                 "(paired streams)", color=INK, x=0.01, ha="left", fontsize=12)
     fig.tight_layout(rect=(0, 0.12, 1, 0.93))
-    save(fig, args, "wave11_best_vs_ltm.png")
+    save(fig, args, out_name("best_vs_ltm.png"))
 
 
 def fig_episodes(args):
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), facecolor=SURFACE)
     for label, color, ls, marker in ROW_REF + ROW_W10[1:]:
-        ns = names(f"w11_{STM[label]}", range(5))
+        ns = names(f"{W}_{STM[label]}", range(5))
         eps = np.mean([at_nines(hist(RUN, n), "learning_episodes") for n in ns], 0)
         c = mean_curves(ns)
         for j, ax in enumerate(axes):
@@ -224,17 +241,17 @@ def fig_episodes(args):
         ax.set_xscale("log")
         ax.set_ylim(0, 1.02)
     axes[1].legend(loc="upper left", frameon=False, fontsize=7.5, labelcolor=INK)
-    fig.suptitle("Wave 11: recall against thinking time; markers at 1, 2, 3, ... 40 nines", color=INK, x=0.01,
+    fig.suptitle(f"Wave {WAVE} ({STREAM}): recall against thinking time; markers at 1, 2, 3, ... 40 nines", color=INK, x=0.01,
                  ha="left", fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.92))
-    save(fig, args, "wave11_episodes.png")
+    save(fig, args, out_name("episodes.png"))
 
 
 def paired(a, b, k, nines, seeds):
     """Mean and SE over seeds of a - b (configs) for key k at nines; seeds both configs have."""
-    s = [x for x in seeds if os.path.exists(os.path.join(RUN, f"w11_{a}_s{x}.json"))
-         and os.path.exists(os.path.join(RUN, f"w11_{b}_s{x}.json"))]
-    d = np.array([at_nines(hist(RUN, f"w11_{a}_s{x}"), k, nines) - at_nines(hist(RUN, f"w11_{b}_s{x}"), k, nines)
+    s = [x for x in seeds if os.path.exists(os.path.join(RUN, f"{W}_{a}_s{x}.json"))
+         and os.path.exists(os.path.join(RUN, f"{W}_{b}_s{x}.json"))]
+    d = np.array([at_nines(hist(RUN, f"{W}_{a}_s{x}"), k, nines) - at_nines(hist(RUN, f"{W}_{b}_s{x}"), k, nines)
                   for x in s])
     return d.mean(0), d.std(0, ddof=1) / np.sqrt(len(s)), len(s)
 
@@ -243,15 +260,16 @@ def table(args, rows):
     f = lambda v: " / ".join(f"{x:.2f}" for x in v)
     G = (1, 2, 3, 5, 9, 16, 40)
     i = [NINES.index(x) for x in G]
-    L = ["## STM configs (wave 11, mean of 5 seeds; values right after the n-th nine)", "",
-         "| config | seeds | memorised 1/2/3/5/9 | held-out 1/2/3/5/9/16/40 | digits 0-8 worst / at 40 | "
-         "learning episodes @200 samples |", "|---|---|---|---|---|---|"]
+    L = [f"## STM configs (wave {WAVE}, {STREAM}, mean of 5 seeds; values right after the n-th nine)", "",
+         "| config | seeds | memorised 1/2/3/5/9 | held-out 1/2/3/5/9/16/40 | digits 0-8 worst (1-40 nines) / at 40 "
+         "/ at 200 samples | learning episodes @200 samples |", "|---|---|---|---|---|---|"]
     for label, cfg in STM.items():
-        ns = names(f"w11_{cfg}", range(5))
+        ns = names(f"{W}_{cfg}", range(5))
         c = mean_curves(ns)
         eps = np.mean([hist(RUN, n)[-1]["learning_episodes"] for n in ns])
+        end = np.mean([hist(RUN, n)[-1]["others_acc"] for n in ns])
         L.append(f"| {label} | {len(ns)} | {f(c[i[:5], 0])} | {f(c[i, 1])} | {np.nanmin(c[:, 2]):.3f} / "
-                 f"{c[-1, 2]:.3f} | {eps:,.0f} |")
+                 f"{c[-1, 2]:.3f} / {end:.3f} | {eps:,.0f} |")
     L += ["", "## Paired differences in held-out recall (mean +- SE over seeds) at 1 / 2 / 3 / 5 / 9 nines", "",
           "| comparison | seeds | difference |", "|---|---|---|"]
     for a, b in (("r256_T4", "adapt256_prio"), ("adapt256_prio_first32", "adapt256_prio"),
@@ -259,12 +277,13 @@ def table(args, rows):
                  ("adapt256_prio", "adapt256"), ("adapt256_prio_fstop9", "adapt256_prio")):
         m, se, n = paired(a, b, "new_recall", (1, 2, 3, 5, 9), range(5))
         L.append(f"| {a} - {b} | {n} | " + " / ".join(f"{x:+.2f}+-{e:.2f}" for x, e in zip(m, se)) + " |")
-    L += ["", "## LTM-only configs (wave 12 and the wave-11 baselines), mean of seeds 0-2, and the pre-registered test",
+    L += ["", f"## LTM-only configs ({LP} and the {W} baselines), mean of seeds {SEEDS[0]}-{SEEDS[-1]}, and the "
+          "pre-registered test",
           "",
           "Test: beats a STM config if memorised >= at 1, 2, 5 nines, held-out >= at 1, 2, 5, 9 nines and digits 0-8 "
-          ">= (within -0.005) at every checkpoint, on seed means of the same seeds 0-2. Margins are the worst "
+          f">= (within -0.005) at every checkpoint, on seed means of the same seeds {SEEDS[0]}-{SEEDS[-1]}. Margins are the worst "
           "LTM - STM difference for each quality.", "",
-          "| config | memorised 1/2/5 | held-out 1/2/5/9/40 | digits 0-8 worst | "
+          "| config | memorised 1/2/5 | held-out 1/2/5/9/40 | digits 0-8 worst (1-40 nines) / at 200 samples | "
           + " | ".join(f"vs {b[0]}: pass (mem / held / digits 0-8 margins)" for b in BEST) + " |",
           "|---|---|---|---|" + "---|" * len(BEST)]
     j = [NINES.index(x) for x in (1, 2, 5, 9, 40)]
@@ -273,35 +292,92 @@ def table(args, rows):
         cells = []
         for _, cfg, _ in BEST:
             ok, dm, dh, dp, n = r["dom"][cfg]
-            cells.append(f"{'**yes**' if ok else 'no'} ({dm:+.2f} / {dh:+.2f} / {dp:+.3f})" + ("" if n == 3 else
-                                                                                         f" [{n} seeds]"))
-        L.append(f"| {r['cfg']} | {f(c[[0, 1, 4], 0])} | {f(c[j, 1])} | {r['prot']:.3f} | " + " | ".join(cells)
-                 + " |")
-    path = os.path.join(args.out, "wave11_table.md")
+            cells.append(f"{'**yes**' if ok else 'no'} ({dm:+.2f} / {dh:+.2f} / {dp:+.3f})" + (
+                "" if n == len(SEEDS) else f" [{n} seeds]"))
+        L.append(f"| {r['cfg']} | {f(c[[0, 1, 4], 0])} | {f(c[j, 1])} | {r['prot']:.3f} / {r['end']:.3f} | "
+                 + " | ".join(cells) + " |")
+    path = os.path.join(args.out, out_name("table.md"))
+    open(path, "w").write("\n".join(L) + "\n")
+    print(path)
+
+
+STREAM_CFGS = [("STM + prio, first stop .9", "adapt256_prio_fstop9", SERIES[0]),
+               ("STM + prio, replay 255 per sample", "adapt256_prio_replay255", SERIES[1]),
+               ("LTM every sample: Adam 1e-3", "ltm_every1", INK),
+               ("LTM balanced: replay 15, 4 Adam steps 1e-4", "b1_e1_rp15_lr1e-4_k4", SERIES[3])]
+
+
+def stream_pair(cfg):
+    """Run names for cfg on the 25% (waves 11-12) and the 75% (wave 13) stream."""
+    if cfg in STM.values() or cfg.startswith("ltm_"):
+        return names(f"w11_{cfg}", range(5)), names(f"w13_{cfg}", range(5))
+    return names(f"w12_{cfg}", range(5)), names(f"w13_{cfg}", range(5))
+
+
+def fig_streams(args):
+    """The same configs on both streams: 75% solid, 25% thin dashed."""
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5.6), facecolor=SURFACE)
+    for label, cfg, color in STREAM_CFGS:
+        lo, hi = stream_pair(cfg)
+        plot_curves(axes, f"{label}, 25% nines ({len(lo)} seeds)", mean_curves(lo), color, "--", None, lw=1.2)
+        plot_curves(axes, f"{label}, 75% nines ({len(hi)} seeds)", mean_curves(hi), color, "-", "o", lw=2.2)
+    axes_nines(axes)
+    axes[2].set_ylim(0.84, 0.975)
+    fig.legend(*axes[0].get_legend_handles_labels(), loc="lower center", ncol=4, frameon=False, fontsize=8,
+               labelcolor=INK)
+    fig.suptitle("Correlated stream: the same configs with 75% nines (wave 13, solid) and 25% nines (waves 11-12, "
+                 "dashed); x = nines presented", color=INK, x=0.01, ha="left", fontsize=12)
+    fig.tight_layout(rect=(0, 0.12, 1, 0.93))
+    save(fig, args, out_name("streams.png"))
+
+
+def stream_table(args):
+    f = lambda v: " / ".join(f"{x:.2f}" for x in v)
+    j = [NINES.index(x) for x in (1, 2, 5, 9, 40)]
+    L = ["## The same configs on both streams (all seeds run; 25% = waves 11-12, 75% = wave 13)", "",
+         "| config | stream | seeds | memorised 1/2/5 | held-out 1/2/5/9/40 | digits 0-8 worst (1-40 nines) / at 200 "
+         "samples | learning episodes @200 |", "|---|---|---|---|---|---|---|"]
+    cfgs = [(l, c) for l, c in STM.items()] + [(l, c) for l, c, *_ in PICKS] + [("LTM every 16", "ltm_every16")]
+    for label, cfg in cfgs:
+        for stream, ns in zip(("25%", "75%"), stream_pair(cfg)):
+            if not ns:
+                continue
+            c = mean_curves(ns)
+            end = np.mean([hist(RUN, n)[-1]["others_acc"] for n in ns])
+            eps = np.mean([hist(RUN, n)[-1].get("learning_episodes", np.nan) for n in ns])
+            L.append(f"| {label} | {stream} | {len(ns)} | {f(c[[0, 1, 4], 0])} | {f(c[j, 1])} | "
+                     f"{np.nanmin(c[:, 2]):.3f} / {end:.3f} | " + ("-" if np.isnan(eps) else f"{eps:,.0f}") + " |")
+    path = os.path.join(args.out, out_name("streams.md"))
     open(path, "w").write("\n".join(L) + "\n")
     print(path)
 
 
 def main():
-    global RUN
+    global RUN, WAVE, W, LP, SEEDS, STREAM
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--wave", type=int, default=11, choices=sorted(WAVES))
     args = ap.parse_args()
     RUN = args.run
+    WAVE = args.wave
+    W, LP, SEEDS, STREAM = WAVES[WAVE]
     os.makedirs(args.out, exist_ok=True)
     rows = []
     for cfg in ltm_configs():
-        ns = names(cfg, range(3))
-        r = {"cfg": cfg, **summary(ns), "dom": {}}
+        ns = names(cfg, SEEDS)
+        r = {"cfg": cfg, **summary(ns), "end": np.mean([hist(RUN, n)[-1]["others_acc"] for n in ns]), "dom": {}}
         for _, b, _ in BEST:
-            r["dom"][b] = dominance(cfg, f"w11_{b}")
+            r["dom"][b] = dominance(cfg, f"{W}_{b}")
         rows.append(r)
     fig_stm_all(args)
     fig_tradeoff(args, rows)
     fig_best_vs_ltm(args)
     fig_episodes(args)
     table(args, rows)
+    if WAVE == 13:
+        fig_streams(args)
+        stream_table(args)
 
 
 RUN = None
