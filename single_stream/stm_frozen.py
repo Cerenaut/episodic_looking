@@ -45,6 +45,19 @@ from single_stream.preprocessor import featurize, load_checkpoint
 from single_stream.stm import RLSTM, grid_basis
 
 
+def rng_neutral(fn):
+    """Run a measurement without consuming the global torch RNG: the actor draws a policy sample on every forward
+    pass, even when the mean is used, so without this the checkpoint schedule and --diag changed the training
+    trajectory (found 3 Nov 2026; runs before then are one random realisation each)."""
+    def wrapped(*a, **k):
+        state = torch.get_rng_state()
+        try:
+            return fn(*a, **k)
+        finally:
+            torch.set_rng_state(state)
+    return wrapped
+
+
 def load_data(args):
     train, val = datasets.load("mnist", args.data_root, val_holdout=600, split_seed=0)
     pre = load_checkpoint(args.preproc)
@@ -152,8 +165,14 @@ def stream_order(args, yt):
     return order
 
 
-def eval_checkpoints(args):
-    return set(np.unique(np.geomspace(args.first_checkpoint, args.episodes, args.checkpoints).astype(int)).tolist())
+def eval_checkpoints(args, order=None, yt=None):
+    """Log-spaced sample counts, plus (--nine-checkpoints n) the sample count right after each of the first n
+    presentations of the new digit in the stream, so recall is measured at every few-shot count from one shot."""
+    c = set(np.unique(np.geomspace(args.first_checkpoint, args.episodes, args.checkpoints).astype(int)).tolist())
+    if args.nine_checkpoints > 0 and order is not None:
+        nines = torch.nonzero(yt[order] == args.new_digit).flatten()[:args.nine_checkpoints]
+        c |= set((nines + 1).tolist())
+    return c
 
 
 def cmd_ltm(args, xt, yt, xv, yv, log):
@@ -165,7 +184,7 @@ def cmd_ltm(args, xt, yt, xv, yv, log):
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr)
     order = stream_order(args, yt)
     xe, ye = xv[:args.eval_images], yv[:args.eval_images]
-    checkpoints = eval_checkpoints(args)
+    checkpoints = eval_checkpoints(args, order, yt)
     history = []
 
     def evaluate(n):
@@ -173,7 +192,12 @@ def cmd_ltm(args, xt, yt, xv, yv, log):
         shots = torch.nonzero(yt == args.new_digit).flatten()
         with torch.no_grad():
             s = summary(net(xe).argmax(1), ye, args.new_digit)
-            s["new_train_recall"] = float((net(xt[shots]).argmax(1) == args.new_digit).float().mean())
+            hit = (net(xt[shots]).argmax(1) == args.new_digit).float()
+        s["new_train_recall"] = float(hit.mean())
+        seen = torch.isin(shots, order[:n])  # training nines shown so far (memorised), as in rl
+        s["shots_seen"] = int(seen.sum())
+        s["mem_seen"] = float(hit[seen].mean()) if seen.any() else None
+        s["mem_unseen"] = float(hit[~seen].mean()) if (~seen).any() else None
         s["samples"] = n
         s["new_samples"] = int((yt[order[:n]] == args.new_digit).sum())
         history.append(s)
@@ -254,6 +278,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
             r = stm.episode(xt[i:i + 1], yt[i:i + 1])
         return float(torch.softmax(r["logits"][-1, 0], dim=-1)[yt[i]])
 
+    @rng_neutral
     def evaluate(ep):
         with torch.no_grad():
             res = stm.episode(xe, ye)
@@ -288,6 +313,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
             f"corr {rec['value_final_corr']:.2f}  |b| {rec['bias_abs']:.2f}  seen {rec['shots_seen']} "
             f"mem seen/unseen {fmt(rec['mem_seen'])}/{fmt(rec['mem_unseen'])}  {rec['time']:.0f}s")
 
+    @rng_neutral
     def probe(j):
         """The STM's current answer on training image j (policy mean, no learning): unbiased and final score p(y),
         final correctness, mean |bias|, the actor clique."""
@@ -314,7 +340,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
     actor_count = dict(stm.model.model_actor.named_buffers())["active_count"]
     presented = torch.zeros(len(yt), dtype=torch.long)
 
-    checkpoints = eval_checkpoints(args)
+    checkpoints = eval_checkpoints(args, order, yt)
     evaluate(0)
     for ep in range(1, args.episodes + 1):
         j = order[ep - 1]
@@ -460,6 +486,8 @@ def main():
     p.add_argument("--replay-floor", type=float, default=0.05)
     p.add_argument("--first-checkpoint", type=int, default=100)
     p.add_argument("--checkpoints", type=int, default=8)
+    p.add_argument("--nine-checkpoints", type=int, default=0,
+                   help="also evaluate right after each of the first n presentations of the new digit (0: off)")
     p.add_argument("--new-fraction", type=float, default=0.0,
                    help="rl: fraction of training episodes drawn from the new digit's few-shot images")
     p.add_argument("--eval-images", type=int, default=2000)
