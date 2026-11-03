@@ -355,6 +355,8 @@ def cmd_rl(args, xt, yt, xv, yv, log):
     def draw_fill(ep, n):
         """n replay images: between bursts of `burst` repeats, `interleave` learning episodes (replay of other
         material), so repeats are not all back to back."""
+        if n <= 0:
+            return order[:0]
         if args.interleave_source == "others":
             return others_idx[torch.randint(len(others_idx), (n,), generator=gf)]
         if args.interleave_source == "seen" and args.replay_priority > 0:  # prioritised by failure
