@@ -20,7 +20,9 @@ blocks in a row brought no gain. --sigma-boost f: after a block with no gain (pr
 --gain-eps) while p(y) < --boost-below, the policy std for this sample's next block is multiplied by f (up to
 --sigma-max); a block with gain resets it. The interleaved replay episodes always use the base std.
 --replay-priority a: seen-replay draws weighted by ((1 - p(y) at the image's last learning episode) + --replay-floor)^a
-(0: uniform).
+(0: uniform). --first-stop-p / --first-min-blocks: on an image's first presentation, stop at this p(y) instead of
+--stop-p, and do not stop (by stop-p or patience) before this many blocks (wave 10: few-shot speed; uses only whether
+this image has been seen before, as a replay buffer would).
 
 Example:
   python -m single_stream.stm_frozen --out runs_ss/stm_frozen_20261101/snap9 snapshot
@@ -325,6 +327,9 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         sigma, sigmas = sigma0, []
         p_prev = probe_p(j) if probing else None
         k_done, flat = 0, 0   # repeats run; consecutive blocks without gain
+        first = presented[j] == 0
+        stop_p = args.first_stop_p if first and args.first_stop_p is not None else args.stop_p
+        min_blocks = args.first_min_blocks if first else 0
         for k in range(args.repeats):  # up to r independent learning episodes per sample ("thinking time")
             if k > 0 and k % args.burst == 0:
                 # between bursts of `burst` repeats: `interleave` learning episodes on iid images of the other
@@ -367,7 +372,8 @@ def cmd_rl(args, xt, yt, xv, yv, log):
                 p_now = probe_p(j)
                 no_gain = p_now - p_prev < args.gain_eps
                 flat = flat + 1 if no_gain else 0
-                if p_now >= args.stop_p or (args.patience and p_now >= 0.5 and flat >= args.patience):
+                if (k + 1) // args.block >= min_blocks and (
+                        p_now >= stop_p or (args.patience and p_now >= 0.5 and flat >= args.patience)):
                     break
                 if args.sigma_boost > 1:
                     stuck = no_gain and p_now < args.boost_below
@@ -445,6 +451,10 @@ def main():
     p.add_argument("--patience", type=int, default=0,
                    help="rl, with --block: also stop once p(y) >= 0.5 and this many blocks in a row gained less than "
                         "--gain-eps (0: off)")
+    p.add_argument("--first-stop-p", type=float, default=None,
+                   help="rl, with --block: --stop-p for an image's first presentation (default: --stop-p)")
+    p.add_argument("--first-min-blocks", type=int, default=0,
+                   help="rl, with --block: on an image's first presentation, no early stop before this many blocks")
     p.add_argument("--replay-priority", type=float, default=0.0,
                    help="rl, seen replay: weights ((1 - last p(y)) + floor)^a (0: uniform)")
     p.add_argument("--replay-floor", type=float, default=0.05)
