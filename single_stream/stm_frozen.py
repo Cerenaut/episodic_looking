@@ -341,6 +341,24 @@ def cmd_rl(args, xt, yt, xv, yv, log):
     presented = torch.zeros(len(yt), dtype=torch.long)
 
     checkpoints = eval_checkpoints(args, order, yt)
+    def draw_fill(ep, n):
+        """n replay images: between bursts of `burst` repeats, `interleave` learning episodes (replay of other
+        material), so repeats are not all back to back."""
+        if args.interleave_source == "others":
+            return others_idx[torch.randint(len(others_idx), (n,), generator=gf)]
+        if args.interleave_source == "seen" and args.replay_priority > 0:  # prioritised by failure
+            seen_idx = torch.unique(order[:ep])
+            w = ((1 - last_p[seen_idx]).clamp(min=0) + args.replay_floor) ** args.replay_priority
+            return seen_idx[torch.multinomial(w, n, replacement=True, generator=gf)]
+        if args.interleave_source == "seen":  # replay: iid from the samples presented so far
+            return order[torch.randint(ep, (n,), generator=gf)]
+        # the replay mixture: iid training images, new_fraction of them few-shot images (any shot, including ones
+        # not yet presented: a leak in the early region; use "seen")
+        fill = torch.randint(len(yt), (n,), generator=gf)
+        pick = torch.rand(n, generator=gf) < args.new_fraction
+        fill[pick] = shots[torch.randint(len(shots), (int(pick.sum()),), generator=gf)]
+        return fill
+
     evaluate(0)
     for ep in range(1, args.episodes + 1):
         j = order[ep - 1]
@@ -358,21 +376,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         min_blocks = args.first_min_blocks if first else 0
         for k in range(args.repeats):  # up to r independent learning episodes per sample ("thinking time")
             if k > 0 and k % args.burst == 0:
-                # between bursts of `burst` repeats: `interleave` learning episodes on iid images of the other
-                # digits (stand-in for replay of other material), so repeats are not all back to back
-                if args.interleave_source == "others":
-                    fill = others_idx[torch.randint(len(others_idx), (args.interleave,), generator=gf)]
-                elif args.interleave_source == "seen" and args.replay_priority > 0:  # prioritised by failure
-                    seen_idx = torch.unique(order[:ep])
-                    w = ((1 - last_p[seen_idx]).clamp(min=0) + args.replay_floor) ** args.replay_priority
-                    fill = seen_idx[torch.multinomial(w, args.interleave, replacement=True, generator=gf)]
-                elif args.interleave_source == "seen":  # replay: iid from the samples presented so far
-                    fill = order[torch.randint(ep, (args.interleave,), generator=gf)]
-                else:  # the replay mixture: iid training images, new_fraction of them few-shot images (any shot,
-                    # including ones not yet presented: a leak in the early region; use "seen")
-                    fill = torch.randint(len(yt), (args.interleave,), generator=gf)
-                    pick = torch.rand(args.interleave, generator=gf) < args.new_fraction
-                    fill[pick] = shots[torch.randint(len(shots), (int(pick.sum()),), generator=gf)]
+                fill = draw_fill(ep, args.interleave)
                 for f in fill:
                     learn(int(f), sigma0)
                     if diag:
@@ -405,6 +409,12 @@ def cmd_rl(args, xt, yt, xv, yv, log):
                     stuck = no_gain and p_now < args.boost_below
                     sigma = min(sigma * args.sigma_boost, args.sigma_max) if stuck else sigma0
                 p_prev = p_now
+        if args.replay_per_sample > 0:  # top up to a fixed replay budget per sample, after the target repeats
+            n_replayed = ((k_done - 1) // args.burst) * args.interleave
+            for f in draw_fill(ep, max(0, args.replay_per_sample - n_replayed)):
+                learn(int(f), sigma0)
+                if diag:
+                    other.append(stm.last_update)
         repeats_done.append(k_done)
         if diag:
             post, _ = probe(j)
@@ -481,6 +491,9 @@ def main():
                    help="rl, with --block: --stop-p for an image's first presentation (default: --stop-p)")
     p.add_argument("--first-min-blocks", type=int, default=0,
                    help="rl, with --block: on an image's first presentation, no early stop before this many blocks")
+    p.add_argument("--replay-per-sample", type=int, default=0,
+                   help="rl: replay episodes per sample regardless of repeats: those interleaved between repeats, "
+                        "topped up after the sample's last repeat (0: off; decouples replay from adaptive repeats)")
     p.add_argument("--replay-priority", type=float, default=0.0,
                    help="rl, seen replay: weights ((1 - last p(y)) + floor)^a (0: uniform)")
     p.add_argument("--replay-floor", type=float, default=0.05)
