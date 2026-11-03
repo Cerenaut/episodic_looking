@@ -254,8 +254,11 @@ def episodes_per_sample(args):
 def cmd_rl(args, xt, yt, xv, yv, log):
     net = load_snapshot(args, args.bias_mode)
     if args.hybrid:
-        # hybrid (Dave, 4 Nov 2026): the LTM also learns, slowly, from the stream samples (not from the STM's repeats or
-        # replays), and the STM works on its current state. Its parameters need gradients only inside ltm_update.
+        # hybrid (Dave, 4 Nov 2026): the LTM also learns, slowly, from the stream (not from the STM's repeats or
+        # replays): (2) the current input only (--ltm-batch 1), or (1) the current input plus --ltm-replay samples from
+        # the stream so far (the STM's replay source; not consolidation, whose buffer is larger and persistent). It
+        # updates on each new sample before the STM's repeats, so the STM works on the updated LTM. Its parameters need
+        # gradients only inside ltm_update.
         ltm_params = list(net.head.parameters() if args.ltm_train == "head" else net.parameters())
         for p in ltm_params:
             p.requires_grad_(True)
@@ -408,6 +411,13 @@ def cmd_rl(args, xt, yt, xv, yv, log):
             prior = actor_count[cells]
             w0 = {g: stm.param_vector(g) for g in stm.param_groups}
             target, other, target_returns = [], [], []
+        if args.hybrid:  # the LTM learns from the new sample first, so the STM's repeats run on the updated LTM
+            for p in ltm_params:
+                p.requires_grad_(True)
+            ltm_update(args, net, ltm_opt, gr, order, xt, yt, ep)
+            for p in ltm_params:
+                p.requires_grad_(False)
+            net.eval()
         group = []  # deferred repeats of this sample (group-normalised advantage)
         sigma, sigmas = sigma0, []
         p_prev = probe_p(j) if probing else None
@@ -468,13 +478,6 @@ def cmd_rl(args, xt, yt, xv, yv, log):
             diag.write(json.dumps(line) + "\n")
             diag.flush()
         presented[j] += 1
-        if args.hybrid:
-            for p in ltm_params:
-                p.requires_grad_(True)
-            ltm_update(args, net, ltm_opt, gr, order, xt, yt, ep)
-            for p in ltm_params:
-                p.requires_grad_(False)
-            net.eval()
         if ep in checkpoints:
             evaluate(ep)
     n_episodes = counts["learning_episodes"]
