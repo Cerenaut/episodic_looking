@@ -12,6 +12,16 @@ first RL check). Freezing the LTM removes the moving target, so these test the S
             evaluated (no label, policy mean) on validation images: per-step accuracy (within-episode curve), new-digit
             recall, others' accuracy, critic value vs outcome, cell utilisation.
 
+Thinking time per sample (wave 9, Dave 3 Nov 2026): with --block b the repeats of a sample run in blocks of b, and
+after each block the STM's answer on the sample is probed (policy mean, no learning; the label is the training
+reward's, so this is allowed). --stop-p: stop the sample's repeats once the probed p(y) reaches it (adaptive
+persistence; --repeats is then the cap); --patience n: also stop once the answer is right (p(y) >= 0.5) and n
+blocks in a row brought no gain. --sigma-boost f: after a block with no gain (probed p(y) up by less than
+--gain-eps) while p(y) < --boost-below, the policy std for this sample's next block is multiplied by f (up to
+--sigma-max); a block with gain resets it. The interleaved replay episodes always use the base std.
+--replay-priority a: seen-replay draws weighted by ((1 - p(y) at the image's last learning episode) + --replay-floor)^a
+(0: uniform).
+
 Example:
   python -m single_stream.stm_frozen --out runs_ss/stm_frozen_20261101/snap9 snapshot
   python -m single_stream.stm_frozen --out runs_ss/stm_frozen_20261101/snap9 bound
@@ -188,7 +198,8 @@ def fmt(x):
 
 
 def episodes_per_sample(args):
-    """Learning episodes per sample: the repeats, plus the interleaved episodes between bursts."""
+    """Learning episodes per sample: the repeats, plus the interleaved episodes between bursts (fixed repeats; with
+    --stop-p the actual count is recorded instead)."""
     return args.repeats + args.interleave * ((args.repeats - 1) // args.burst)
 
 
@@ -219,6 +230,27 @@ def cmd_rl(args, xt, yt, xv, yv, log):
     t0 = time.time()
     order = stream_order(args, yt)
     train_scores = []
+    if args.group_size > 0 and args.block > 0:
+        raise ValueError("--group-size and --block are not combined")
+    probing = args.block > 0
+    sigma0 = args.policy_std
+    last_p = torch.ones(len(yt))   # p(y) at each image's last learning episode (replay priority)
+    counts = {"learning_episodes": 0}
+    repeats_done = []              # repeats run per sample
+
+    def learn(i, sigma):
+        """One learning episode on training image i with policy std sigma."""
+        stm.model.policy_config.policy_std = sigma
+        r = stm.episode(xt[i:i + 1], yt[i:i + 1], learn=True, defer=args.group_size > 0)
+        stm.model.policy_config.policy_std = sigma0
+        last_p[i] = float(torch.softmax(r["logits"][-1, 0], dim=-1)[yt[i]])
+        counts["learning_episodes"] += 1
+        return r
+
+    def probe_p(i):
+        with torch.no_grad():
+            r = stm.episode(xt[i:i + 1], yt[i:i + 1])
+        return float(torch.softmax(r["logits"][-1, 0], dim=-1)[yt[i]])
 
     def evaluate(ep):
         with torch.no_grad():
@@ -234,7 +266,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         rec_mem = float((mem == args.new_digit).float().mean())
         seen = torch.isin(shots, order[:ep])
         mem_hit = (mem == args.new_digit).float()
-        rec = {"new_train_recall": rec_mem, "episodes": ep, "samples": ep, "learning_episodes": ep * episodes_per_sample(args), "new_samples": int((yt[order[:ep]] == args.new_digit).sum()), "step_acc": step_acc, "new_recall_unbiased": s0["new_recall"],
+        rec = {"new_train_recall": rec_mem, "episodes": ep, "samples": ep, "learning_episodes": counts["learning_episodes"], "new_samples": int((yt[order[:ep]] == args.new_digit).sum()), "step_acc": step_acc, "new_recall_unbiased": s0["new_recall"],
                "new_recall": s["new_recall"], "others_acc": s["others_acc"], "acc": s["acc"],
                "step_score": res["scores"].mean(1).tolist(), "value_last": float(v.mean()),
                "value_final_corr": float(torch.corrcoef(torch.stack([v, final]))[0, 1]) if v.std() > 0 else 0.0,
@@ -290,12 +322,19 @@ def cmd_rl(args, xt, yt, xv, yv, log):
             w0 = {g: stm.param_vector(g) for g in stm.param_groups}
             target, other, target_returns = [], [], []
         group = []  # deferred repeats of this sample (group-normalised advantage)
-        for k in range(args.repeats):  # r independent learning episodes per sample ("thinking time")
+        sigma, sigmas = sigma0, []
+        p_prev = probe_p(j) if probing else None
+        k_done, flat = 0, 0   # repeats run; consecutive blocks without gain
+        for k in range(args.repeats):  # up to r independent learning episodes per sample ("thinking time")
             if k > 0 and k % args.burst == 0:
                 # between bursts of `burst` repeats: `interleave` learning episodes on iid images of the other
                 # digits (stand-in for replay of other material), so repeats are not all back to back
                 if args.interleave_source == "others":
                     fill = others_idx[torch.randint(len(others_idx), (args.interleave,), generator=gf)]
+                elif args.interleave_source == "seen" and args.replay_priority > 0:  # prioritised by failure
+                    seen_idx = torch.unique(order[:ep])
+                    w = ((1 - last_p[seen_idx]).clamp(min=0) + args.replay_floor) ** args.replay_priority
+                    fill = seen_idx[torch.multinomial(w, args.interleave, replacement=True, generator=gf)]
                 elif args.interleave_source == "seen":  # replay: iid from the samples presented so far
                     fill = order[torch.randint(ep, (args.interleave,), generator=gf)]
                 else:  # the replay mixture: iid training images, new_fraction of them few-shot images (any shot,
@@ -304,11 +343,13 @@ def cmd_rl(args, xt, yt, xv, yv, log):
                     pick = torch.rand(args.interleave, generator=gf) < args.new_fraction
                     fill[pick] = shots[torch.randint(len(shots), (int(pick.sum()),), generator=gf)]
                 for f in fill:
-                    stm.episode(xt[f:f + 1], yt[f:f + 1], learn=True)
+                    learn(int(f), sigma0)
                     if diag:
                         other.append(stm.last_update)
             group_mode = args.group_size > 0
-            res = stm.episode(xt[j:j + 1], yt[j:j + 1], learn=True, defer=group_mode)
+            res = learn(int(j), sigma)
+            sigmas.append(sigma)
+            k_done = k + 1
             if group_mode:
                 group.append(res["deferred"])
                 if len(group) == args.group_size or k == args.repeats - 1:
@@ -322,10 +363,22 @@ def cmd_rl(args, xt, yt, xv, yv, log):
                 target_returns.append(float(res["returns"][0, 0]))
             if k == 0:
                 train_scores.append(float(res["scores"][-1, 0]))
+            if probing and (k + 1) % args.block == 0 and k + 1 < args.repeats:
+                p_now = probe_p(j)
+                no_gain = p_now - p_prev < args.gain_eps
+                flat = flat + 1 if no_gain else 0
+                if p_now >= args.stop_p or (args.patience and p_now >= 0.5 and flat >= args.patience):
+                    break
+                if args.sigma_boost > 1:
+                    stuck = no_gain and p_now < args.boost_below
+                    sigma = min(sigma * args.sigma_boost, args.sigma_max) if stuck else sigma0
+                p_prev = p_now
+        repeats_done.append(k_done)
         if diag:
             post, _ = probe(j)
             line = {"sample": ep, "index": int(j), "label": int(yt[j]), "new": int(yt[j] == args.new_digit),
                     "times_presented": int(presented[j]), "pre": pre, "post": post,
+                    "repeats": k_done, "sigma_max_used": max(sigmas),
                     "clique_fresh": float((prior == 0).float().mean()), "clique_prior_mean": float(prior.float().mean()),
                     "target": summarise(target, target_returns), "interleaved": summarise(other) if other else None,
                     "weight_change": {g: float((stm.param_vector(g) - w0[g]).norm()) for g in w0}}
@@ -334,8 +387,9 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         presented[j] += 1
         if ep in checkpoints:
             evaluate(ep)
-    n_episodes = args.episodes * episodes_per_sample(args)
-    return {"history": history, "learning_episodes": n_episodes, "ms_per_episode": 1000 * (time.time() - t0) / n_episodes}
+    n_episodes = counts["learning_episodes"]
+    return {"history": history, "learning_episodes": n_episodes, "repeats_per_sample": repeats_done,
+            "ms_per_episode": 1000 * (time.time() - t0) / n_episodes}
 
 
 def main():
@@ -378,6 +432,22 @@ def main():
                    help="rl: group-normalised advantage over this many consecutive repeats of a sample (0: critic "
                         "baseline, per-episode updates)")
     p.add_argument("--group-std-floor", type=float, default=1e-3)
+    p.add_argument("--block", type=int, default=0,
+                   help="rl: probe the STM's p(y) on the sample after every block of this many repeats (0: off)")
+    p.add_argument("--stop-p", type=float, default=1.01,
+                   help="rl, with --block: stop the sample's repeats once the probed p(y) reaches this (--repeats = cap)")
+    p.add_argument("--sigma-boost", type=float, default=1.0,
+                   help="rl, with --block: policy std x this after a block without gain (1: off)")
+    p.add_argument("--sigma-max", type=float, default=2.0)
+    p.add_argument("--gain-eps", type=float, default=0.02)
+    p.add_argument("--boost-below", type=float, default=0.5,
+                   help="rl: boost only while the probed p(y) is below this (default: while the answer is wrong)")
+    p.add_argument("--patience", type=int, default=0,
+                   help="rl, with --block: also stop once p(y) >= 0.5 and this many blocks in a row gained less than "
+                        "--gain-eps (0: off)")
+    p.add_argument("--replay-priority", type=float, default=0.0,
+                   help="rl, seen replay: weights ((1 - last p(y)) + floor)^a (0: uniform)")
+    p.add_argument("--replay-floor", type=float, default=0.05)
     p.add_argument("--first-checkpoint", type=int, default=100)
     p.add_argument("--checkpoints", type=int, default=8)
     p.add_argument("--new-fraction", type=float, default=0.0,
