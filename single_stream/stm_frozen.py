@@ -178,10 +178,18 @@ def eval_checkpoints(args, order=None, yt=None):
 def cmd_ltm(args, xt, yt, xv, yv, log):
     """The LTM's own learning from the same sample stream as `rl`: the snapshot trained on (AdamW, its lr), one
     minibatch of the last `ltm_batch` samples every `ltm_batch` samples (one sample-gradient per sample, as the
-    replay LTM's batch 16 every 16). Evaluated at the same checkpoints on the same images."""
+    replay LTM's batch 16 every 16). Evaluated at the same checkpoints on the same images.
+    LTM-only regimes (Dave, 3 Nov 2026): --ltm-steps k optimiser steps per update; --ltm-replay m samples drawn
+    uniformly from those presented so far added to each batch (the STM's seen replay); --ltm-optim sgd with
+    --ltm-momentum; --ltm-train head: only the classifier head learns."""
     net = make_net(args, "where")
     net.load_state_dict(torch.load(os.path.join(args.out, "snapshot.pt"), weights_only=True))
-    opt = torch.optim.AdamW(net.parameters(), lr=args.lr)
+    params = net.head.parameters() if args.ltm_train == "head" else net.parameters()
+    if args.ltm_optim == "sgd":
+        opt = torch.optim.SGD(params, lr=args.lr, momentum=args.ltm_momentum)
+    else:
+        opt = torch.optim.AdamW(params, lr=args.lr)
+    gr = torch.Generator().manual_seed(args.seed + 11)  # replay draws
     order = stream_order(args, yt)
     xe, ye = xv[:args.eval_images], yv[:args.eval_images]
     checkpoints = eval_checkpoints(args, order, yt)
@@ -209,11 +217,14 @@ def cmd_ltm(args, xt, yt, xv, yv, log):
     for n in range(1, args.episodes + 1):
         if n % every == 0:
             idx = order[max(0, n - B):n]  # the last B samples (fewer at the start)
+            if args.ltm_replay > 0:
+                idx = torch.cat([idx, order[torch.randint(n, (args.ltm_replay,), generator=gr)]])
             net.train()
-            loss = F.cross_entropy(net(xt[idx]), yt[idx])
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+            for _ in range(args.ltm_steps):
+                loss = F.cross_entropy(net(xt[idx]), yt[idx])
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
         if n in checkpoints:
             evaluate(n)
     return {"history": history}
@@ -454,6 +465,12 @@ def main():
     p.add_argument("--bias-grid", type=int, default=0, help="rl: where-bias action on a coarse g x g grid (0 = 7x7)")
     p.add_argument("--bound-steps", type=int, default=200)
     p.add_argument("--ltm-batch", type=int, default=16)
+    p.add_argument("--ltm-steps", type=int, default=1, help="ltm: optimiser steps per update")
+    p.add_argument("--ltm-replay", type=int, default=0,
+                   help="ltm: samples drawn uniformly from those presented so far, added to each update's batch")
+    p.add_argument("--ltm-optim", choices=["adamw", "sgd"], default="adamw")
+    p.add_argument("--ltm-momentum", type=float, default=0.5, help="ltm, sgd")
+    p.add_argument("--ltm-train", choices=["all", "head"], default="all")
     p.add_argument("--episodes", type=int, default=20000, help="samples presented (rl: x repeats episodes)")
     p.add_argument("--repeats", type=int, default=1, help="rl: independent learning episodes per sample")
     p.add_argument("--interleave", type=int, default=0,
