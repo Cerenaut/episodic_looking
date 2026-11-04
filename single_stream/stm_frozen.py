@@ -265,6 +265,17 @@ def sleep(args, net, buf, xt, yt, g):
             if args.sleep_steps else None, "p_y_before": p_start, "p_y_after": float(p_y(buf).mean())}
 
 
+def sleep_settings(args):
+    """--sleep-sweep "lr:steps:priority,...": the sleep options for each setting (batch and floor from args)."""
+    out = []
+    for item in args.sleep_sweep.split(","):
+        lr, steps, prio = item.split(":")
+        out.append(argparse.Namespace(sleep_lr=float(lr), sleep_steps=int(steps), sleep_priority=float(prio),
+                                      sleep_batch=args.sleep_batch, sleep_floor=args.sleep_floor,
+                                      new_digit=args.new_digit))
+    return out
+
+
 def phase2_keys(args, pred, y, mem_pred, order, n, yt, pre=""):
     """Phase-2 metrics: held-out recall of the phase-2 digit, its shown training images, the digits other than it and
     the new digit."""
@@ -345,7 +356,15 @@ def cmd_ltm(args, xt, yt, xv, yv, log):
             st = sleep(args, net, torch.unique(order[:n]), xt, yt, gs)
             evaluate(n)
             history[-1].update({"after_sleep": True, "sleep": st})
-    return {"history": history}
+    sweep = []
+    if args.sleep_sweep:  # sleeps at the end of the stream, each from the same state
+        net_state = copy.deepcopy(net.state_dict())
+        for setting in sleep_settings(args):
+            st = sleep(setting, net, torch.unique(order), xt, yt, torch.Generator().manual_seed(args.seed + 19))
+            evaluate(len(order))
+            sweep.append({"setting": vars(setting), "sleep": st, "keep": history.pop()})
+            net.load_state_dict(net_state)
+    return {"history": history, "sleep_sweep": sweep}
 
 
 def ltm_optimiser(args, net):
@@ -414,7 +433,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         basis = grid_basis(args.bias_grid)
     action_size = net.bias_size if basis is None else basis.shape[0]
     stm_model = MnistModel(config, encoded_size=net.d_model, bias_size=action_size)
-    stm_initial = copy.deepcopy(stm_model) if args.sleep_reset_stm else None  # --sleep-reset-stm restarts from here
+    stm_initial = copy.deepcopy(stm_model)  # --sleep-reset-stm restarts from here
     stm = RLSTM(net, stm_model, steps=args.steps, lr=args.stm_lr, momentum=args.stm_momentum, bias_basis=basis,
                 incremental=args.incremental)
     xe, ye = xv[:args.eval_images], yv[:args.eval_images]
@@ -478,7 +497,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
             with torch.no_grad():
                 mem2 = stm.episode(xt[phase2_shots(args, yt)], yt[phase2_shots(args, yt)])["logits"][-1].argmax(1)
             rec.update(phase2_keys(args, pred[-1], ye, mem2, order, ep, yt))
-        if args.hybrid or args.sleep_at_nines:  # the LTM on its own (no bias): its contribution to the system's recall
+        if args.hybrid or args.sleep_at_nines or args.sleep_sweep:  # the LTM on its own (no bias): its contribution to the system's recall
             with torch.no_grad():
                 lp = net(xe).argmax(1)
                 lm = (net(xt[shots]).argmax(1) == args.new_digit).float()
@@ -635,9 +654,24 @@ def cmd_rl(args, xt, yt, xv, yv, log):
                 last_p.fill_(1.0)
             evaluate(ep)
             history[-1].update({"after_sleep": True, "sleep": st})
+    sweep = []
+    if args.sleep_sweep:  # sleeps at the end of the stream, each from the same state: with the STM kept, and reset
+        net_state, stm_kept = copy.deepcopy(net.state_dict()), stm
+        for setting in sleep_settings(args):
+            st = sleep(setting, net, torch.unique(order), xt, yt, torch.Generator().manual_seed(args.seed + 19))
+            out = {"setting": vars(setting), "sleep": st}
+            for mode in ("keep", "reset"):
+                stm = stm_kept if mode == "keep" else RLSTM(
+                    net, copy.deepcopy(stm_initial), steps=args.steps, lr=args.stm_lr, momentum=args.stm_momentum,
+                    bias_basis=basis, incremental=args.incremental)
+                evaluate(len(order))
+                out[mode] = history.pop()
+            stm = stm_kept
+            net.load_state_dict(net_state)
+            sweep.append(out)
     n_episodes = counts["learning_episodes"]
     return {"history": history, "learning_episodes": n_episodes, "repeats_per_sample": repeats_done,
-            "ms_per_episode": 1000 * (time.time() - t0) / n_episodes}
+            "ms_per_episode": 1000 * (time.time() - t0) / n_episodes, "sleep_sweep": sweep}
 
 
 def main():
@@ -718,6 +752,9 @@ def main():
     p.add_argument("--sleep-batch", type=int, default=16)
     p.add_argument("--sleep-priority", type=float, default=1.0, help="sleep draw weights ((1 - p(y)) + floor)^a")
     p.add_argument("--sleep-floor", type=float, default=0.05)
+    p.add_argument("--sleep-sweep", default="",
+                   help="after the last sample, sleep with each of these settings from the same state (\"lr:steps:priority,...\"); "
+                        "rl reads each with the STM kept and reset; the state is restored between settings")
     p.add_argument("--sleep-reset-stm", action="store_true", help="rl: the STM restarts from its initial state after each sleep")
     p.add_argument("--phase1-nines", type=int, default=0, help="end phase 1 right after the n-th new-digit sample (0: off)")
     p.add_argument("--phase2-digit", type=int, default=-1, help="second phase: this digit at --phase2-fraction (-1: off)")
