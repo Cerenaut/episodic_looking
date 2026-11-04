@@ -184,11 +184,7 @@ def cmd_ltm(args, xt, yt, xv, yv, log):
     --ltm-momentum; --ltm-train head: only the classifier head learns."""
     net = make_net(args, "where")
     net.load_state_dict(torch.load(os.path.join(args.out, "snapshot.pt"), weights_only=True))
-    params = net.head.parameters() if args.ltm_train == "head" else net.parameters()
-    if args.ltm_optim == "sgd":
-        opt = torch.optim.SGD(params, lr=args.lr, momentum=args.ltm_momentum)
-    else:
-        opt = torch.optim.AdamW(params, lr=args.lr)
+    opt = ltm_optimiser(args, net)
     gr = torch.Generator().manual_seed(args.seed + 11)  # replay draws
     order = stream_order(args, yt)
     xe, ye = xv[:args.eval_images], yv[:args.eval_images]
@@ -213,21 +209,36 @@ def cmd_ltm(args, xt, yt, xv, yv, log):
             f"others {s['others_acc']:.4f}")
 
     evaluate(0)
-    B, every = args.ltm_batch, args.ltm_every or args.ltm_batch
     for n in range(1, args.episodes + 1):
-        if n % every == 0:
-            idx = order[max(0, n - B):n]  # the last B samples (fewer at the start)
-            if args.ltm_replay > 0:
-                idx = torch.cat([idx, order[torch.randint(n, (args.ltm_replay,), generator=gr)]])
-            net.train()
-            for _ in range(args.ltm_steps):
-                loss = F.cross_entropy(net(xt[idx]), yt[idx])
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
+        ltm_update(args, net, opt, gr, order, xt, yt, n)
         if n in checkpoints:
             evaluate(n)
     return {"history": history}
+
+
+def ltm_optimiser(args, net):
+    params = net.head.parameters() if args.ltm_train == "head" else net.parameters()
+    if args.ltm_optim == "sgd":
+        return torch.optim.SGD(params, lr=args.lr, momentum=args.ltm_momentum)
+    return torch.optim.AdamW(params, lr=args.lr)
+
+
+def ltm_update(args, net, opt, gr, order, xt, yt, n):
+    """The LTM's own learning after stream sample n (ltm, and rl --hybrid): every `ltm_every` samples (default
+    `ltm_batch`), `ltm_steps` steps on the last `ltm_batch` stream samples plus `ltm_replay` drawn uniformly from those
+    presented so far; unbiased forward pass, labels from the stream."""
+    B, every = args.ltm_batch, args.ltm_every or args.ltm_batch
+    if n % every:
+        return
+    idx = order[max(0, n - B):n]  # the last B samples (fewer at the start)
+    if args.ltm_replay > 0:
+        idx = torch.cat([idx, order[torch.randint(n, (args.ltm_replay,), generator=gr)]])
+    net.train()
+    for _ in range(args.ltm_steps):
+        loss = F.cross_entropy(net(xt[idx]), yt[idx])
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
 
 
 def fmt(x):
@@ -242,6 +253,19 @@ def episodes_per_sample(args):
 
 def cmd_rl(args, xt, yt, xv, yv, log):
     net = load_snapshot(args, args.bias_mode)
+    if args.hybrid:
+        # hybrid (Dave, 4 Nov 2026): the LTM also learns, slowly, from the stream (not from the STM's repeats or
+        # replays): (2) the current input only (--ltm-batch 1), or (1) the current input plus --ltm-replay samples from
+        # the stream so far (the STM's replay source; not consolidation, whose buffer is larger and persistent). It
+        # updates on each new sample before the STM's repeats, so the STM works on the updated LTM. Its parameters need
+        # gradients only inside ltm_update.
+        ltm_params = list(net.head.parameters() if args.ltm_train == "head" else net.parameters())
+        for p in ltm_params:
+            p.requires_grad_(True)
+        ltm_opt = ltm_optimiser(args, net)
+        for p in ltm_params:
+            p.requires_grad_(False)
+        gr = torch.Generator().manual_seed(args.seed + 13)  # LTM replay draws, apart from the STM's
     torch.manual_seed(args.seed)
     config = MnistModelConfig(
         encoder_sparsity=args.sparsity, history_size=args.history, model_hidden_size=args.hidden,
@@ -315,6 +339,13 @@ def cmd_rl(args, xt, yt, xv, yv, log):
                "mem_seen": float(mem_hit[seen].mean()) if seen.any() else None,
                "mem_unseen": float(mem_hit[~seen].mean()) if (~seen).any() else None,
                "actor_shared_norm": float(stm.param_vector("actor_shared").norm())}
+        if args.hybrid:  # the LTM on its own (no bias): its contribution to the system's recall
+            with torch.no_grad():
+                lp = net(xe).argmax(1)
+                lm = (net(xt[shots]).argmax(1) == args.new_digit).float()
+            ls = summary(lp, ye, args.new_digit)
+            rec.update({"ltm_new_recall": ls["new_recall"], "ltm_others_acc": ls["others_acc"], "ltm_acc": ls["acc"],
+                        "ltm_mem_seen": float(lm[seen].mean()) if seen.any() else None})
         if config.encoder_sparsity > 0:
             for name, m in (("actor", stm.model.model_actor), ("critic", stm.model.model_critic)):
                 rec.update({f"{name}_{k}": val for k, val in m.utilisation().items()})
@@ -380,6 +411,13 @@ def cmd_rl(args, xt, yt, xv, yv, log):
             prior = actor_count[cells]
             w0 = {g: stm.param_vector(g) for g in stm.param_groups}
             target, other, target_returns = [], [], []
+        if args.hybrid:  # the LTM learns from the new sample first, so the STM's repeats run on the updated LTM
+            for p in ltm_params:
+                p.requires_grad_(True)
+            ltm_update(args, net, ltm_opt, gr, order, xt, yt, ep)
+            for p in ltm_params:
+                p.requires_grad_(False)
+            net.eval()
         group = []  # deferred repeats of this sample (group-normalised advantage)
         sigma, sigmas = sigma0, []
         p_prev = probe_p(j) if probing else None
@@ -487,6 +525,9 @@ def main():
                    help="few-shot slots of the stream: without replacement (each slot a new image until all are shown; "
                         "default from wave 8) or with replacement (waves <= 7)")
     p.add_argument("--stream-seed", type=int, default=None, help="stream order seed (default: --seed)")
+    p.add_argument("--hybrid", action="store_true",
+                   help="rl: the LTM learns too, after each stream sample, with the ltm options (--lr, --ltm-batch, "
+                        "--ltm-every, --ltm-steps, --ltm-replay, --ltm-optim, --ltm-train); the STM sees its current state")
     p.add_argument("--ltm-every", type=int, default=0,
                    help="ltm: one step every N samples on the last --ltm-batch samples (0: every --ltm-batch)")
     p.add_argument("--group-size", type=int, default=0,
