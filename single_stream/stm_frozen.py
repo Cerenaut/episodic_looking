@@ -24,12 +24,24 @@ blocks in a row brought no gain. --sigma-boost f: after a block with no gain (pr
 --stop-p, and do not stop (by stop-p or patience) before this many blocks (wave 10: few-shot speed; uses only whether
 this image has been seen before, as a replay buffer would).
 
+Consolidation and a second phase (wave 16, Dave 5 Nov 2026; exploratory, so the sleep points are placed by the
+experimenter, not by the model): --sleep-at-nines n1,n2 runs a sleep right after the n-th presentation of the new digit:
+--sleep-steps Adam steps on the LTM (all weights, fresh optimiser, --sleep-lr), minibatches of --sleep-batch drawn from
+the buffer (every distinct image presented so far) with weights ((1 - the LTM's own p(y)) + --sleep-floor)^a
+(--sleep-priority a; 0: uniform), the drawn images' p(y) recomputed after each step. rl --sleep-reset-stm: the STM
+restarts from its initial state after each sleep. --phase1-nines n ends the stream right after the n-th new-digit
+sample (a prefix of the usual stream, so it reproduces earlier runs); --phase2-digit d appends --phase2-samples samples,
+--phase2-fraction of them from --new-shots fixed training images of d (without replacement per pass), the rest iid
+from the digits other than d and the new digit (which stops). Phase-2 metrics: mem2_seen (the shown images of d),
+new2_recall (held-out d), others2_acc (digits other than d and the new digit); the new digit's keys measure retention.
+
 Example:
   python -m single_stream.stm_frozen --out runs_ss/stm_frozen_20261101/snap9 snapshot
   python -m single_stream.stm_frozen --out runs_ss/stm_frozen_20261101/snap9 bound
   python -m single_stream.stm_frozen --out runs_ss/stm_frozen_20261101/snap9 rl --name where_term --episodes 20000
 """
 import argparse
+import copy
 import json
 import os
 import time
@@ -164,7 +176,110 @@ def stream_order(args, yt):
         else:
             seq = new_idx[torch.randint(len(new_idx), (n_new,), generator=g)]
         order[pick_new] = seq
-    return order
+    return phase_stream(args, yt, order)
+
+
+def phase2_shots(args, yt):
+    """The phase-2 digit's fixed training images (memorisation), chosen with the data seed (as the new digit's)."""
+    if getattr(args, "phase2_digit", -1) < 0:
+        return None
+    data_seed = args.seed if args.data_seed is None else args.data_seed
+    idx = torch.nonzero(yt == args.phase2_digit).flatten()
+    rng = np.random.default_rng(data_seed + 1000)
+    return idx[torch.from_numpy(np.sort(rng.choice(len(idx), args.new_shots, replace=False)))]
+
+
+def phase_stream(args, yt, order):
+    """--phase1-nines: the usual stream cut right after the n-th new-digit sample (a prefix: the same samples as the
+    uncut runs). --phase2-digit: then --phase2-samples samples, --phase2-fraction from the phase-2 shots (without
+    replacement per pass) and the rest iid from the digits other than it and the new digit."""
+    if getattr(args, "phase1_nines", 0) > 0:
+        nines = torch.nonzero(yt[order] == args.new_digit).flatten()
+        if len(nines) < args.phase1_nines:
+            raise ValueError(f"the stream has only {len(nines)} new-digit samples")
+        order = order[:int(nines[args.phase1_nines - 1]) + 1]
+    shots2 = phase2_shots(args, yt)
+    if shots2 is None:
+        return order
+    stream_seed = args.seed if args.stream_seed is None else args.stream_seed
+    g = torch.Generator().manual_seed(stream_seed + 17)
+    m = args.phase2_samples
+    rest = torch.nonzero((yt != args.new_digit) & (yt != args.phase2_digit)).flatten()
+    order2 = rest[torch.randint(len(rest), (m,), generator=g)]
+    pick = torch.rand(m, generator=g) < args.phase2_fraction
+    n = int(pick.sum())
+    passes = (n + len(shots2) - 1) // len(shots2)
+    order2[pick] = torch.cat([shots2[torch.randperm(len(shots2), generator=g)] for _ in range(passes)])[:n]
+    return torch.cat([order, order2])
+
+
+def phase1_length(args, order, yt):
+    """Samples in phase 1 (the whole stream without --phase2-digit)."""
+    if getattr(args, "phase2_digit", -1) < 0:
+        return len(order)
+    return len(order) - args.phase2_samples
+
+
+def sleep_points(args, order, yt):
+    """Sample counts (1-based) right after the n-th new-digit presentation, for n in --sleep-at-nines."""
+    if not getattr(args, "sleep_at_nines", ""):
+        return set()
+    nines = torch.nonzero(yt[order] == args.new_digit).flatten()
+    return {int(nines[n - 1]) + 1 for n in map(int, args.sleep_at_nines.split(",")) if n <= len(nines)}
+
+
+def sleep(args, net, buf, xt, yt, g):
+    """Consolidation (Dave, 5 Nov 2026): --sleep-steps Adam steps on all LTM weights (a fresh optimiser), minibatches
+    of --sleep-batch drawn with replacement from buf (the distinct images presented so far) with weights
+    ((1 - p(y)) + floor)^a, p(y) the LTM's own (no STM bias), recomputed for the drawn images after each step, so
+    learned images (mostly the many nines) give way to the rest."""
+    params = list(net.parameters())
+    req = [q.requires_grad for q in params]
+    for q in params:
+        q.requires_grad_(True)
+    opt = torch.optim.AdamW(params, lr=args.sleep_lr)
+
+    def p_y(idx):
+        net.eval()
+        with torch.no_grad():
+            return torch.softmax(net(xt[idx]), -1)[torch.arange(len(idx)), yt[idx]]
+
+    p = p_y(buf)
+    p_start = float(p.mean())
+    draws = torch.zeros(len(buf))
+    for _ in range(args.sleep_steps):
+        w = ((1 - p).clamp(min=0) + args.sleep_floor) ** args.sleep_priority
+        k = torch.multinomial(w, args.sleep_batch, replacement=True, generator=g)
+        net.train()
+        loss = F.cross_entropy(net(xt[buf[k]]), yt[buf[k]])
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        p[k] = p_y(buf[k])
+        draws.index_add_(0, k, torch.ones(len(k)))
+    for q, r in zip(params, req):
+        q.requires_grad_(r)
+    net.eval()
+    new = yt[buf] == args.new_digit
+    return {"buffer": len(buf), "buffer_new": int(new.sum()), "draws_new_frac": float(draws[new].sum() / draws.sum())
+            if args.sleep_steps else None, "p_y_before": p_start, "p_y_after": float(p_y(buf).mean())}
+
+
+def phase2_keys(args, pred, y, mem_pred, order, n, yt, pre=""):
+    """Phase-2 metrics: held-out recall of the phase-2 digit, its shown training images, the digits other than it and
+    the new digit."""
+    d = args.phase2_digit
+    shots2 = phase2_shots(args, yt)
+    seen2 = torch.isin(shots2, order[:n])
+    hit = (mem_pred == d).float()
+    m = (y != args.new_digit) & (y != d)
+    out = {pre + "new2_recall": float((pred[y == d] == d).float().mean()),
+           pre + "mem2_seen": float(hit[seen2].mean()) if seen2.any() else None,
+           pre + "others2_acc": float((pred[m] == y[m]).float().mean())}
+    if not pre:
+        p1 = phase1_length(args, order, yt)
+        out.update({"phase2_samples": max(0, n - p1), "new2_samples": int((yt[order[p1:n]] == d).sum())})
+    return out
 
 
 def eval_checkpoints(args, order=None, yt=None):
@@ -174,6 +289,11 @@ def eval_checkpoints(args, order=None, yt=None):
     if args.nine_checkpoints > 0 and order is not None:
         nines = torch.nonzero(yt[order] == args.new_digit).flatten()[:args.nine_checkpoints]
         c |= set((nines + 1).tolist())
+        if getattr(args, "phase2_digit", -1) >= 0:
+            p1 = phase1_length(args, order, yt)
+            sevens = p1 + torch.nonzero(yt[order[p1:]] == args.phase2_digit).flatten()[:args.nine_checkpoints]
+            c |= set((sevens + 1).tolist()) | {p1, len(order)}
+            c = {x for x in c if x <= len(order)}
     return c
 
 
@@ -206,15 +326,25 @@ def cmd_ltm(args, xt, yt, xv, yv, log):
         s["mem_unseen"] = float(hit[~seen].mean()) if (~seen).any() else None
         s["samples"] = n
         s["new_samples"] = int((yt[order[:n]] == args.new_digit).sum())
+        if args.phase2_digit >= 0:
+            with torch.no_grad():
+                s.update(phase2_keys(args, net(xe).argmax(1), ye, net(xt[phase2_shots(args, yt)]).argmax(1), order, n,
+                                     yt))
         history.append(s)
         log(f"{args.name} samples {n:>6d}  acc {s['acc']:.4f}  mem {s['new_train_recall']:.3f}  new {s['new_recall']:.3f}  "
             f"others {s['others_acc']:.4f}")
 
+    sleeps = sleep_points(args, order, yt)
+    gs = torch.Generator().manual_seed(args.seed + 19)  # sleep draws
     evaluate(0)
-    for n in range(1, args.episodes + 1):
+    for n in range(1, len(order) + 1):
         ltm_update(args, net, opt, gr, order, xt, yt, n)
-        if n in checkpoints:
+        if n in checkpoints or n in sleeps:
             evaluate(n)
+        if n in sleeps:
+            st = sleep(args, net, torch.unique(order[:n]), xt, yt, gs)
+            evaluate(n)
+            history[-1].update({"after_sleep": True, "sleep": st})
     return {"history": history}
 
 
@@ -283,8 +413,10 @@ def cmd_rl(args, xt, yt, xv, yv, log):
             raise ValueError("--bias-grid applies to the where bias (7x7 tokens)")
         basis = grid_basis(args.bias_grid)
     action_size = net.bias_size if basis is None else basis.shape[0]
-    stm = RLSTM(net, MnistModel(config, encoded_size=net.d_model, bias_size=action_size), steps=args.steps,
-                lr=args.stm_lr, momentum=args.stm_momentum, bias_basis=basis, incremental=args.incremental)
+    stm_model = MnistModel(config, encoded_size=net.d_model, bias_size=action_size)
+    stm_initial = copy.deepcopy(stm_model) if args.sleep_reset_stm else None  # --sleep-reset-stm restarts from here
+    stm = RLSTM(net, stm_model, steps=args.steps, lr=args.stm_lr, momentum=args.stm_momentum, bias_basis=basis,
+                incremental=args.incremental)
     xe, ye = xv[:args.eval_images], yv[:args.eval_images]
     shots = torch.nonzero(yt == args.new_digit).flatten()  # the few-shot training images (memorisation)
     others_idx = torch.nonzero(yt != args.new_digit).flatten()
@@ -342,7 +474,11 @@ def cmd_rl(args, xt, yt, xv, yv, log):
                "mem_seen": float(mem_hit[seen].mean()) if seen.any() else None,
                "mem_unseen": float(mem_hit[~seen].mean()) if (~seen).any() else None,
                "actor_shared_norm": float(stm.param_vector("actor_shared").norm())}
-        if args.hybrid:  # the LTM on its own (no bias): its contribution to the system's recall
+        if args.phase2_digit >= 0:
+            with torch.no_grad():
+                mem2 = stm.episode(xt[phase2_shots(args, yt)], yt[phase2_shots(args, yt)])["logits"][-1].argmax(1)
+            rec.update(phase2_keys(args, pred[-1], ye, mem2, order, ep, yt))
+        if args.hybrid or args.sleep_at_nines:  # the LTM on its own (no bias): its contribution to the system's recall
             with torch.no_grad():
                 lp = net(xe).argmax(1)
                 lm = (net(xt[shots]).argmax(1) == args.new_digit).float()
@@ -350,6 +486,10 @@ def cmd_rl(args, xt, yt, xv, yv, log):
             rec.update({"ltm_new_recall": ls["new_recall"], "ltm_others_acc": ls["others_acc"], "ltm_acc": ls["acc"],
                         "ltm_per_digit": ls["per_digit"], "ltm_others_as_new": ls["others_as_new"],
                         "ltm_mem_seen": float(lm[seen].mean()) if seen.any() else None})
+            if args.phase2_digit >= 0:
+                with torch.no_grad():
+                    lm2 = net(xt[phase2_shots(args, yt)]).argmax(1)
+                rec.update(phase2_keys(args, lp, ye, lm2, order, ep, yt, pre="ltm_"))
         if config.encoder_sparsity > 0:
             for name, m in (("actor", stm.model.model_actor), ("critic", stm.model.model_critic)):
                 rec.update({f"{name}_{k}": val for k, val in m.utilisation().items()})
@@ -407,8 +547,10 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         fill[pick] = shots[torch.randint(len(shots), (int(pick.sum()),), generator=gf)]
         return fill
 
+    sleeps = sleep_points(args, order, yt)
+    gs = torch.Generator().manual_seed(args.seed + 19)  # sleep draws
     evaluate(0)
-    for ep in range(1, args.episodes + 1):
+    for ep in range(1, len(order) + 1):
         j = order[ep - 1]
         if diag:
             pre, cells = probe(j)
@@ -482,8 +624,17 @@ def cmd_rl(args, xt, yt, xv, yv, log):
             diag.write(json.dumps(line) + "\n")
             diag.flush()
         presented[j] += 1
-        if ep in checkpoints:
+        if ep in checkpoints or ep in sleeps:
             evaluate(ep)
+        if ep in sleeps:
+            st = sleep(args, net, torch.unique(order[:ep]), xt, yt, gs)
+            if args.sleep_reset_stm:  # the STM restarts; its replay priorities with it
+                stm = RLSTM(net, copy.deepcopy(stm_initial), steps=args.steps, lr=args.stm_lr,
+                            momentum=args.stm_momentum, bias_basis=basis, incremental=args.incremental)
+                actor_count = dict(stm.model.model_actor.named_buffers())["active_count"]
+                last_p.fill_(1.0)
+            evaluate(ep)
+            history[-1].update({"after_sleep": True, "sleep": st})
     n_episodes = counts["learning_episodes"]
     return {"history": history, "learning_episodes": n_episodes, "repeats_per_sample": repeats_done,
             "ms_per_episode": 1000 * (time.time() - t0) / n_episodes}
@@ -561,6 +712,17 @@ def main():
     p.add_argument("--replay-priority", type=float, default=0.0,
                    help="rl, seen replay: weights ((1 - last p(y)) + floor)^a (0: uniform)")
     p.add_argument("--replay-floor", type=float, default=0.05)
+    p.add_argument("--sleep-at-nines", default="", help="sleep (consolidation) right after these new-digit counts, e.g. 16,64")
+    p.add_argument("--sleep-steps", type=int, default=0)
+    p.add_argument("--sleep-lr", type=float, default=1e-4)
+    p.add_argument("--sleep-batch", type=int, default=16)
+    p.add_argument("--sleep-priority", type=float, default=1.0, help="sleep draw weights ((1 - p(y)) + floor)^a")
+    p.add_argument("--sleep-floor", type=float, default=0.05)
+    p.add_argument("--sleep-reset-stm", action="store_true", help="rl: the STM restarts from its initial state after each sleep")
+    p.add_argument("--phase1-nines", type=int, default=0, help="end phase 1 right after the n-th new-digit sample (0: off)")
+    p.add_argument("--phase2-digit", type=int, default=-1, help="second phase: this digit at --phase2-fraction (-1: off)")
+    p.add_argument("--phase2-samples", type=int, default=200)
+    p.add_argument("--phase2-fraction", type=float, default=0.75)
     p.add_argument("--first-checkpoint", type=int, default=100)
     p.add_argument("--checkpoints", type=int, default=8)
     p.add_argument("--nine-checkpoints", type=int, default=0,
