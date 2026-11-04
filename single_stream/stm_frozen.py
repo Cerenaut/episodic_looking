@@ -79,7 +79,9 @@ def summary(pred, y, new_digit):
     others = (y != new_digit)
     return {"acc": float((pred == y).float().mean()), "new_recall": pd[new_digit],
             "others_acc": float((pred[others] == y[others]).float().mean()),
-            "new_predicted_frac": float((pred == new_digit).float().mean()), "per_digit": pd}
+            "new_predicted_frac": float((pred == new_digit).float().mean()), "per_digit": pd,
+            # digits 0-8 answered as the new digit: the share of the damage on them that is a false "9"
+            "others_as_new": float((pred[others] == new_digit).float().mean())}
 
 
 def make_net(args, mode):
@@ -330,6 +332,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
         mem_hit = (mem == args.new_digit).float()
         rec = {"new_train_recall": rec_mem, "episodes": ep, "samples": ep, "learning_episodes": counts["learning_episodes"], "new_samples": int((yt[order[:ep]] == args.new_digit).sum()), "step_acc": step_acc, "new_recall_unbiased": s0["new_recall"],
                "new_recall": s["new_recall"], "others_acc": s["others_acc"], "acc": s["acc"],
+               "per_digit": s["per_digit"], "others_as_new": s["others_as_new"],
                "step_score": res["scores"].mean(1).tolist(), "value_last": float(v.mean()),
                "value_final_corr": float(torch.corrcoef(torch.stack([v, final]))[0, 1]) if v.std() > 0 else 0.0,
                "bias_abs": float(res["bias"].abs().mean()),
@@ -345,6 +348,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
                 lm = (net(xt[shots]).argmax(1) == args.new_digit).float()
             ls = summary(lp, ye, args.new_digit)
             rec.update({"ltm_new_recall": ls["new_recall"], "ltm_others_acc": ls["others_acc"], "ltm_acc": ls["acc"],
+                        "ltm_per_digit": ls["per_digit"], "ltm_others_as_new": ls["others_as_new"],
                         "ltm_mem_seen": float(lm[seen].mean()) if seen.any() else None})
         if config.encoder_sparsity > 0:
             for name, m in (("actor", stm.model.model_actor), ("critic", stm.model.model_critic)):
