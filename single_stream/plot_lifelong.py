@@ -88,7 +88,9 @@ def task_metrics(run):
         recs = [r for r in run["ckpt"] if r["task"] == k]
         goal = 0.9 * per[k]["final"]
         ts.append(next((r["t_task"] for r in recs if r["acc"] >= goal), recs[-1]["t_task"]))
-    out["t90"] = float(np.exp(np.mean(np.log(np.maximum(ts, 1)))))  # geometric mean over tasks
+    # geometric mean over tasks; undefined when a task is never learned (final below 0.3: chance is 0.1)
+    learned = all(per[k]["final"] >= 0.3 for k in range(1, len(names)))
+    out["t90"] = float(np.exp(np.mean(np.log(np.maximum(ts, 1))))) if learned else np.nan
     return out
 
 
@@ -292,10 +294,11 @@ def fig_fewshot(args, runs):
             ax.set_xticklabels([str(n) for n in ns])
             style(ax, f"{f}: {title}", xlabel="the class's n-th exposure in the task" if j == 1 else "")
             ax.set_ylim(0, 1)
-    axes[0, 0].legend(loc="lower right", frameon=False, fontsize=7.5, labelcolor=INK, ncol=2)
+    h, l = axes[0, 0].get_legend_handles_labels()
+    fig.legend(h, l, loc="lower center", frameon=False, fontsize=9, labelcolor=INK, ncol=len(l))
     fig.suptitle("Few-shot within tasks 2-4 (each class's n-th exposure after the switch; mean of classes, tasks, "
                  "seeds)", color=INK, x=0.01, ha="left", fontsize=12)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.tight_layout(rect=(0, 0.05, 1, 0.95))
     save(fig, args, "lifelong_fewshot.png")
 
 
@@ -319,6 +322,36 @@ def fig_period(args, runs):
                  x=0.01, ha="left", fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.93))
     save(fig, args, "lifelong_period.png")
+
+
+def fig_family(args, runs):
+    """Which family is harder? Each configuration (c, P, K) as a point: dihedral against label permutation."""
+    panels = [("zero_shot", "Zero-shot at the switch"), ("rec_256", "Accuracy 256 after the switch"),
+              ("rec_1024", "Accuracy 1,024 after the switch"), ("anytime", "Anytime accuracy"),
+              ("worst", "Protection: worst class"), ("final", "Final accuracy"),
+              ("retention_task1", "Retention: task 1 at the end")]
+    markers = {1 / 64: "v", 1 / 16: "s", 1 / 4: "D", 1: "o"}
+    fig, axes = plt.subplots(2, 4, figsize=(17, 8.4), facecolor=SURFACE)
+    for ax, (key, title) in zip(axes.ravel(), panels):
+        for c in CS:
+            for r in RATES:
+                for P, K in PK[r]:
+                    a, b = metric(runs, key, "dih", c, P, K), metric(runs, key, "lp", c, P, K)
+                    ax.scatter(a, b, color=C_COLOUR[c], marker=markers[r], s=36, edgecolor=SURFACE, zorder=3)
+        ax.plot([0, 1], [0, 1], color=GREY, lw=1, ls="--", zorder=1)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        style(ax, f"{title} (tasks 2-4)" if key != "retention_task1" else title, xlabel="dihedral")
+        ax.set_ylabel("label permutation")
+    ax = axes.ravel()[-1]
+    ax.axis("off")
+    h = [plt.Line2D([], [], ls="", marker="o", color=C_COLOUR[c], label=f"c {c}") for c in CS]
+    h += [plt.Line2D([], [], ls="", marker=m, color=GREY, label=f"r {RATE_LABEL[r]}") for r, m in markers.items()]
+    ax.legend(handles=h, loc="center", frameon=False, fontsize=10, labelcolor=INK, ncol=2)
+    fig.suptitle("Dihedral against label permutation, configuration by configuration (above the diagonal: label "
+                 "permutation is easier)", color=INK, x=0.01, ha="left", fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    save(fig, args, "lifelong_family.png")
 
 
 def fig_seeds(args, runs):
@@ -394,6 +427,7 @@ def main():
     fig_recovery(args, runs)
     fig_fewshot(args, runs)
     fig_period(args, runs)
+    fig_family(args, runs)
     fig_seeds(args, runs)
     table(args, runs, probe)
 
