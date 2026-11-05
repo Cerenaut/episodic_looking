@@ -30,7 +30,11 @@ from single_stream.stream import ClusteredStream, run_lengths
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    return build_parser().parse_args(argv)
+
+
+def build_parser(description=__doc__):
+    p = argparse.ArgumentParser(description=description, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dataset", default="mnist", choices=sorted(datasets.LOADERS))
     p.add_argument("--data-root", default=os.path.expanduser("~/dev/claude/mnist"))
     p.add_argument("--permutation-seed", type=int, default=None, help="fixed pixel permutation (permuted MNIST)")
@@ -138,7 +142,7 @@ def parse_args(argv=None):
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--out", required=True)
-    return p.parse_args(argv)
+    return p
 
 
 def build_model(args, train, token_shape=None):
