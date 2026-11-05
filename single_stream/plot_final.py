@@ -211,28 +211,66 @@ def fig_phase2(args):
     save(fig, args, "final_phase2.png")
 
 
+SLEEP_AT = 16
+
+
+def at_sleep(H, n=SLEEP_AT):
+    """(Memorisation, Generalisation, digits 0-8) right before and right after the sleep at the n-th nine: two
+    3-vectors, seed means (point values, not the phase summaries)."""
+    keys = ("mem_seen", "new_recall", "others_acc")
+    pick = lambda h, after: [e for e in h if e.get("new_samples") == n and bool(e.get("after_sleep")) == after][-1]
+    return [np.mean([[pick(h, after)[k] for k in keys] for h in H], 0) for after in (False, True)]
+
+
 def summary(args):
+    """Rows of the summary: each best model (six metrics), and under each model with a sleep in phase 1 a row with
+    its values at the 16th nine just before and just after the sleep (first three metrics only)."""
     S = []
     for label, c1, c2, col, ls in BEST:
-        S.append((label, col, ls, phase1(hists(c1)) + phase2(hists(c2))))
-    fig, axes = plt.subplots(1, 6, figsize=(16, 3.8), facecolor=SURFACE, sharey=True)
+        H1 = hists(c1)
+        S.append((label, col, ls, phase1(H1) + phase2(hists(c2)), None))
+        if any(e.get("after_sleep") for e in H1[0]):
+            pre, post = at_sleep(H1)
+            S.append((f"  {SLEEP_AT} nines: pre \u2192 post sleep", col, ls, None, (pre, post)))
+    fig, axes = plt.subplots(1, 6, figsize=(16, 4.6), facecolor=SURFACE, sharey=True)
     ys = np.arange(len(S))[::-1]
+    fmt = lambda j, x: f"{x:.2f}" if j not in (2, 5) else f"{x:.3f}"
     for j, ax in enumerate(axes):
-        vals = [s[3][j] for s in S]
-        for y, (label, col, ls, v) in zip(ys, S):
-            ax.plot([0, v[j]], [y, y], color=GREY, lw=0.8, zorder=1)
-            ax.scatter(v[j], y, s=80, color=col, marker="o" if ls == "-" else "D", zorder=3, edgecolor=SURFACE)
-            ax.annotate(f"{v[j]:.2f}" if j not in (2, 5) else f"{v[j]:.3f}", (v[j], y), xytext=(0, 7),
-                        textcoords="offset points", ha="center", fontsize=8, color=INK)
-        lo = min(vals)
-        span = max(vals) - lo
-        ax.set_xlim(lo - 0.25 * span - 0.01, max(vals) + 0.25 * span + 0.01)
+        vals = []
+        for y, (label, col, ls, v, pp) in zip(ys, S):
+            if v is not None:
+                vals.append(v[j])
+                ax.plot([0, v[j]], [y, y], color=GREY, lw=0.8, zorder=1)
+                ax.scatter(v[j], y, s=80, color=col, marker="o" if ls == "-" else "D", zorder=3, edgecolor=SURFACE)
+                ax.annotate(fmt(j, v[j]), (v[j], y), xytext=(0, 7), textcoords="offset points", ha="center",
+                            fontsize=8, color=INK)
+            elif j < 3:
+                a, b = pp[0][j], pp[1][j]
+                vals += [a, b]
+                ax.annotate("", (b, y), (a, y), arrowprops=dict(arrowstyle="->", color=col, lw=1.2), zorder=2)
+                ax.scatter(a, y, s=60, facecolor=SURFACE, edgecolor=col, lw=1.5, zorder=3)
+                ax.scatter(b, y, s=60, color=col, edgecolor=SURFACE, zorder=3)
+                if abs(b - a) < 1e-3:
+                    ax.annotate(fmt(j, b), (b, y), xytext=(0, 7), textcoords="offset points", ha="center",
+                                fontsize=7.5, color=INK)
+                else:
+                    for x, dx in ((a, -4 if b > a else 4), (b, 4 if b > a else -4)):
+                        ax.annotate(fmt(j, x), (x, y), xytext=(dx, 6), textcoords="offset points",
+                                    ha="right" if dx < 0 else "left", fontsize=7.5, color=INK)
+        lo, hi = min(vals), max(vals)
+        span = hi - lo
+        ax.set_xlim(lo - 0.25 * span - 0.01, hi + 0.25 * span + 0.01)
         style(ax, NAMES[j], xlabel="")
         ax.set_ylim(-0.6, len(S) - 0.3)
     axes[0].set_yticks(ys)
     axes[0].set_yticklabels([s[0] for s in S])
+    for t, (_, _, _, v, _) in zip(axes[0].get_yticklabels(), S):
+        if v is None:
+            t.set_fontsize(8.5)
+            t.set_color(GREY)
     fig.suptitle("The six metrics for the best model of each architecture (mean of 5 seeds; each axis zoomed to its "
-                 "own range)", color=INK, x=0.01, ha="left", fontsize=12)
+                 "own range); open = just before the sleep, filled = just after", color=INK, x=0.01, ha="left",
+                 fontsize=11.5)
     fig.tight_layout(rect=(0, 0, 1, 0.9))
     save(fig, args, "final_summary.png")
     return S
@@ -245,8 +283,12 @@ def table(args, rows, S):
         L.append(f"| {fam} | {label} | {kind} | {m:.2f} | {g:.2f} | {p:.3f} |")
     L += ["", "## Best model of each architecture", "", "| model | " + " | ".join(NAMES) + " |",
           "|---|" + "---|" * len(NAMES)]
-    for label, _, _, v in S:
-        L.append(f"| {label} | " + " | ".join(f"{x:.3f}" for x in v) + " |")
+    for label, _, _, v, pp in S:
+        if v is not None:
+            L.append(f"| {label} | " + " | ".join(f"{x:.3f}" for x in v) + " |")
+        else:
+            L.append(f"| {label.strip()} | " + " | ".join(f"{a:.3f} -> {b:.3f}" for a, b in zip(*pp))
+                     + " | - | - | - |")
     path = os.path.join(args.out, "final_tables.md")
     open(path, "w").write("\n".join(L) + "\n")
     print(path)
