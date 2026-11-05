@@ -435,13 +435,17 @@ class CLSModel(StreamModel):
     4. `reset_on_sleep` (Dave 5 Nov 2026): after each LTM replay update (a sleep), the STM restarts from its initial
        state (a fresh RLSTM from `stm_factory`), so it never double-counts what the LTM has just consolidated.
 
+    `stm_delay` (Dave 5 Nov 2026): the STM comes online only after this many exposures since the model started (a
+    biasing STM cannot help an untrained LTM; a one-off, not a reaction to the LTM's performance). Before then the
+    STM neither learns nor biases: the model is its LTM (predictions unbiased), and the LTM's sleeps run as usual.
+
     Evaluation (`predict`): one STM episode per image, no learning, the policy mean as bias (eval_bias), output =
     the LTM logits after the last bias. `predict_variants` also returns the unbiased LTM logits from the same pass
     (step 0), so the STM's contribution is measured on identical LTM weights.
     """
 
     def __init__(self, ltm, stm, repeats=1, replay_ratio=0.0, learn_live=True, block=0, stop_p=1.0, patience=0,
-                 gain_eps=0.02, interleave=0, reset_on_sleep=False, stm_factory=None):
+                 gain_eps=0.02, interleave=0, reset_on_sleep=False, stm_factory=None, stm_delay=0):
         if reset_on_sleep and stm_factory is None:
             raise ValueError("reset_on_sleep needs stm_factory")
         self.ltm = ltm
@@ -456,6 +460,8 @@ class CLSModel(StreamModel):
         self.interleave = interleave
         self.reset_on_sleep = reset_on_sleep
         self.stm_factory = stm_factory
+        self.stm_delay = stm_delay
+        self.exposures = 0
         self.replay_pending = 0.0
         self.replay_episodes = 0
         self.live_episodes = 0
@@ -502,7 +508,16 @@ class CLSModel(StreamModel):
                 p_prev = p_now
         return pred
 
+    @property
+    def online(self):
+        """Whether the STM is online (learning and biasing)."""
+        return self.exposures >= self.stm_delay
+
     def observe(self, x, y):
+        if not self.online:
+            self.exposures += len(x)
+            return self.ltm.observe(x, y)
+        self.exposures += len(x)
         pred = self._live(x, y)
         self.replay_pending += self.replay_ratio
         while self.replay_pending >= 1:
@@ -518,10 +533,15 @@ class CLSModel(StreamModel):
 
     @torch.no_grad()
     def predict(self, x):
+        if not self.online:
+            return self.ltm.predict(x)
         return self.stm.episode(x)["logits"][-1]
 
     @torch.no_grad()
     def predict_variants(self, x):
+        if not self.online:
+            logits = self.ltm.predict(x)
+            return {"stm": logits, "ltm": logits}
         logits = self.stm.episode(x)["logits"]
         return {"stm": logits[-1], "ltm": logits[0]}
 

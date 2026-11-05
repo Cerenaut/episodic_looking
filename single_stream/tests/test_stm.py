@@ -341,6 +341,26 @@ class TestCLSScheduling(unittest.TestCase):
         cls.observe(torch.rand(1, 49 * 8), torch.tensor([2]))
         self.assertEqual(cls.replay_episodes, 2 * 2)             # before repeats 2 and 3
 
+    def test_stm_delay_is_the_bare_ltm_until_online(self):
+        torch.manual_seed(1)
+        xs, ys = torch.rand(8, 49 * 8), torch.randint(0, 10, (8,))
+        cls, _ = self._cls(period=2, repeats=2, stm_delay=5, reset_on_sleep=True)
+        net2, _ = make_stm(steps=2, history=2)   # the same initial LTM weights (make_stm seeds)
+        buf2 = PriorityBuffer(50, part_specs(torch.rand(1, 49 * 8), torch.zeros(1, dtype=torch.long)))
+        bare = BufferedReplayLTM(net2, lr=0.01, buffer=buf2, batch=4, period=2)
+        for i in range(5):
+            self.assertFalse(cls.online)
+            torch.testing.assert_close(cls.predict(xs), bare.predict(xs))   # offline: the unbiased LTM
+            cls.observe(xs[i:i + 1], ys[i:i + 1])
+            bare.observe(xs[i:i + 1], ys[i:i + 1])
+        self.assertEqual(cls.live_episodes + cls.replay_episodes, 0)
+        self.assertEqual(cls.resets, 0)
+        self.assertEqual(cls.ltm.updates, bare.updates)
+        torch.testing.assert_close(cls.ltm.predict(xs), bare.predict(xs))  # identical LTM training
+        self.assertTrue(cls.online)
+        cls.observe(xs[5:6], ys[5:6])
+        self.assertEqual(cls.live_episodes, 2)
+
     def test_live_ltm_trains_on_the_live_sample(self):
         net, _ = make_stm()
         buffer = PriorityBuffer(50, part_specs(torch.rand(1, 49 * 8), torch.zeros(1, dtype=torch.long)))

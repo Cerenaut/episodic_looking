@@ -112,6 +112,8 @@ def parse_args(argv=None):
     p.add_argument("--stm-gain-eps", type=float, default=0.02)
     p.add_argument("--stm-interleave", type=int, default=0,
                    help="STM replay episodes (from the LTM's buffer) before each repeat after the first")
+    p.add_argument("--stm-delay", type=int, default=0,
+                   help="cls: exposures before the STM comes online (until then the model is its LTM, sleeps as usual)")
     p.add_argument("--sleep-reset-stm", action="store_true",
                    help="cls: the STM restarts from its initial state after each LTM replay update (a sleep: every "
                         "--replay-period exposures, --replay-steps steps)")
@@ -195,7 +197,7 @@ def build_model(args, train, token_shape=None):
         return CLSModel(ltm, stm, repeats=args.stm_repeats, replay_ratio=args.stm_replay_ratio,
                         learn_live=not args.stm_no_live, block=args.stm_block, stop_p=args.stm_stop_p,
                         patience=args.stm_patience, gain_eps=args.stm_gain_eps, interleave=args.stm_interleave,
-                        reset_on_sleep=args.sleep_reset_stm, stm_factory=stm_factory)
+                        reset_on_sleep=args.sleep_reset_stm, stm_factory=stm_factory, stm_delay=args.stm_delay)
     return ReplayLTM(net, capacity=args.replay_capacity, replay_batch=args.replay_batch,
                      input_shape=train.x.shape[1:], seed=args.seed, **common)
 
@@ -425,6 +427,7 @@ def main(argv=None):
                 if hasattr(model, "buffer"):
                     rec.update(buffer_diagnostics(model.buffer, eval_set.num_classes))
                 if isinstance(model, CLSModel):
+                    rec["stm_online"] = model.online
                     with rng_neutral():
                         rec.update(stm_diagnostics(model, eval_set, args.stm_diag_images))
                 ckpt_file.write(json.dumps(rec) + "\n")
