@@ -364,12 +364,13 @@ class BufferedReplayLTM(StreamModel):
     """
 
     def __init__(self, net, lr, buffer, batch, period, steps=1, momentum=0.0, weight_decay=0.0, cbp=None,
-                 optimizer="sgd"):
+                 optimizer="sgd", live=False):
         self.net = net
         self.buffer = buffer
         self.batch = batch
         self.period = period
         self.steps = steps
+        self.live = live  # also train on the live sample: each update's batch = it + `batch` buffer draws
         self.opt = make_optimizer(optimizer, net.parameters(), lr, momentum, weight_decay)
         self.cbp = cbp
         self.pending = 0
@@ -379,11 +380,14 @@ class BufferedReplayLTM(StreamModel):
     def novelty(logits, y):
         return 1.0 - F.softmax(logits, dim=1).gather(1, y[:, None]).squeeze(1)
 
-    def _replay_step(self):
+    def _replay_step(self, live=None):
         (bx, by), idx = self.buffer.sample(self.batch)
         self.net.train()
+        if live is not None:
+            bx, by = torch.cat([live[0], bx]), torch.cat([live[1], by])
         logits = self.net(bx)
-        self.buffer.rescore(idx, self.novelty(logits.detach(), by))  # pre-update error, free from this pass
+        n_live = 0 if live is None else len(live[1])
+        self.buffer.rescore(idx, self.novelty(logits[n_live:].detach(), by[n_live:]))  # pre-update error, free
         loss = F.cross_entropy(logits, by)
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -403,7 +407,7 @@ class BufferedReplayLTM(StreamModel):
             if self.buffer.written == 0:
                 continue  # the gate has stored nothing yet
             for _ in range(self.steps):
-                self._replay_step()
+                self._replay_step((x, y) if self.live else None)
         return logits.argmax(1)
 
     @torch.no_grad()
@@ -420,26 +424,43 @@ class CLSModel(StreamModel):
     LTM + replay + RL STM. The LTM is a BufferedReplayLTM (trained only from its replay buffer) whose net takes a
     bias (BiasableTransformer); the STM (single_stream/stm.py) biases it. Per exposure, in order:
 
-    1. `repeats` STM episodes on the live sample, each independent, learning if `learn_live` (more "thinking time";
-       the online prediction is the first episode's output);
-    2. STM episodes on samples drawn one at a time from the LTM's replay buffer, `replay_ratio` per exposure on
-       average (fractional ratios accumulate), learning, interleaved serially with the live stream (minibatch 1;
-       the draws do not rescore the buffer);
-    3. the LTM's own step (buffer write, replay updates).
+    1. STM learning episodes on the live sample ("thinking time"; the online prediction is the first episode's
+       output, before it learns). Fixed: `repeats` episodes. Adaptive (`block` > 0, as in stm_frozen, Dave 3 Nov
+       2026): blocks of `block` episodes, after each block the STM's answer is probed (policy mean, no learning);
+       stop when its p(y) reaches `stop_p`, or when it is right (p(y) >= .5) and `patience` blocks in a row gained
+       less than `gain_eps`; `repeats` is then the cap.
+    2. STM replay episodes on samples drawn from the LTM's buffer (its own priority), learning: `interleave` before
+       each repeat after the first (as stm_frozen's interleave), plus `replay_ratio` per exposure on average.
+    3. The LTM's own step (buffer write; every `period` exposures, a replay update of `steps` steps).
+    4. `reset_on_sleep` (Dave 5 Nov 2026): after each LTM replay update (a sleep), the STM restarts from its initial
+       state (a fresh RLSTM from `stm_factory`), so it never double-counts what the LTM has just consolidated.
 
     Evaluation (`predict`): one STM episode per image, no learning, the policy mean as bias (eval_bias), output =
     the LTM logits after the last bias. `predict_variants` also returns the unbiased LTM logits from the same pass
     (step 0), so the STM's contribution is measured on identical LTM weights.
     """
 
-    def __init__(self, ltm, stm, repeats=1, replay_ratio=0.0, learn_live=True):
+    def __init__(self, ltm, stm, repeats=1, replay_ratio=0.0, learn_live=True, block=0, stop_p=1.0, patience=0,
+                 gain_eps=0.02, interleave=0, reset_on_sleep=False, stm_factory=None):
+        if reset_on_sleep and stm_factory is None:
+            raise ValueError("reset_on_sleep needs stm_factory")
         self.ltm = ltm
         self.stm = stm
         self.repeats = repeats
         self.replay_ratio = replay_ratio
         self.learn_live = learn_live
+        self.block = block
+        self.stop_p = stop_p
+        self.patience = patience
+        self.gain_eps = gain_eps
+        self.interleave = interleave
+        self.reset_on_sleep = reset_on_sleep
+        self.stm_factory = stm_factory
         self.replay_pending = 0.0
         self.replay_episodes = 0
+        self.live_episodes = 0
+        self.resets = 0
+        self.stm_episodes_before = 0  # learning episodes of STMs discarded by resets
 
     @property
     def buffer(self):
@@ -449,21 +470,50 @@ class CLSModel(StreamModel):
     def updates(self):
         return self.ltm.updates
 
-    def observe(self, x, y):
-        pred = None
-        for _ in range(self.repeats):
-            res = self.stm.episode(x, y, learn=self.learn_live)
-            if pred is None:
-                pred = res["logits"][-1].argmax(1)
-        self.replay_pending += self.replay_ratio
-        while self.replay_pending >= 1:
-            self.replay_pending -= 1
+    def _replay(self, n):
+        for _ in range(n):
             if self.ltm.buffer.written == 0:
-                continue
+                return
             (bx, by), _ = self.ltm.buffer.sample(1)
             self.stm.episode(bx, by, learn=True)
             self.replay_episodes += 1
+
+    @torch.no_grad()
+    def _probe(self, x, y):
+        logits = self.stm.episode(x)["logits"][-1]
+        return float(F.softmax(logits, dim=1).gather(1, y[:, None]).mean())
+
+    def _live(self, x, y):
+        pred = None
+        p_prev = self._probe(x, y) if self.block > 0 else None
+        flat = 0
+        for k in range(self.repeats):
+            if k > 0:
+                self._replay(self.interleave)
+            res = self.stm.episode(x, y, learn=self.learn_live)
+            self.live_episodes += 1
+            if pred is None:
+                pred = res["logits"][-1].argmax(1)
+            if self.block > 0 and (k + 1) % self.block == 0 and k + 1 < self.repeats:
+                p_now = self._probe(x, y)
+                flat = flat + 1 if p_now - p_prev < self.gain_eps else 0
+                if p_now >= self.stop_p or (self.patience and p_now >= 0.5 and flat >= self.patience):
+                    break
+                p_prev = p_now
+        return pred
+
+    def observe(self, x, y):
+        pred = self._live(x, y)
+        self.replay_pending += self.replay_ratio
+        while self.replay_pending >= 1:
+            self.replay_pending -= 1
+            self._replay(1)
+        before = self.ltm.updates
         self.ltm.observe(x, y)
+        if self.reset_on_sleep and self.ltm.updates > before:
+            self.stm_episodes_before += self.stm.episodes
+            self.stm = self.stm_factory()
+            self.resets += 1
         return pred
 
     @torch.no_grad()

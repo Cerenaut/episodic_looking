@@ -294,6 +294,64 @@ class TestCLSScheduling(unittest.TestCase):
         v = cls.predict_variants(torch.rand(6, 49 * 8))
         self.assertEqual(set(v), {"stm", "ltm"})
 
+    def _cls(self, period=4, **kw):
+        net, stm = make_stm(steps=2, history=2)
+        buffer = PriorityBuffer(50, part_specs(torch.rand(1, 49 * 8), torch.zeros(1, dtype=torch.long)))
+        ltm = BufferedReplayLTM(net, lr=0.01, buffer=buffer, batch=4, period=period)
+        initial = copy.deepcopy(stm.model)
+        factory = lambda: RLSTM(net, copy.deepcopy(initial), steps=2)
+        return CLSModel(ltm, stm, stm_factory=factory, **kw), initial
+
+    def test_reset_after_each_sleep(self):
+        cls, initial = self._cls(period=4, repeats=2, reset_on_sleep=True)
+        first = cls.stm
+        for i in range(10):
+            cls.observe(torch.rand(1, 49 * 8), torch.tensor([i % 10]))
+        self.assertEqual(cls.ltm.updates, 2)
+        self.assertEqual(cls.resets, 2)
+        self.assertIsNot(cls.stm, first)
+        # the STM after the last reset learned only from exposures 9 and 10: 2 x 2 live episodes
+        self.assertEqual(cls.stm.episodes, 4)
+        self.assertEqual(cls.stm.episodes + cls.stm_episodes_before, cls.live_episodes)
+        # a fresh STM starts from the initial weights
+        fresh = cls.stm_factory()
+        for a, b in zip(fresh.model.get_trainable_parameters(), initial.get_trainable_parameters()):
+            torch.testing.assert_close(a, b)
+
+    def test_no_reset_by_default(self):
+        cls, _ = self._cls(period=4, repeats=2)
+        first = cls.stm
+        for i in range(8):
+            cls.observe(torch.rand(1, 49 * 8), torch.tensor([i]))
+        self.assertIs(cls.stm, first)
+        self.assertEqual(cls.resets, 0)
+
+    def test_adaptive_repeats_stop_and_cap(self):
+        cls, _ = self._cls(repeats=8, block=2, stop_p=0.0)
+        cls.observe(torch.rand(1, 49 * 8), torch.tensor([3]))
+        self.assertEqual(cls.live_episodes, 2)   # stopped after the first block
+        cls, _ = self._cls(repeats=8, block=2, stop_p=1.1)
+        cls.observe(torch.rand(1, 49 * 8), torch.tensor([3]))
+        self.assertEqual(cls.live_episodes, 8)   # never reached: the cap
+
+    def test_interleaved_replay(self):
+        cls, _ = self._cls(period=100, repeats=3, interleave=2)
+        cls.observe(torch.rand(1, 49 * 8), torch.tensor([1]))   # buffer empty during the first exposure's repeats
+        self.assertEqual(cls.replay_episodes, 0)
+        cls.observe(torch.rand(1, 49 * 8), torch.tensor([2]))
+        self.assertEqual(cls.replay_episodes, 2 * 2)             # before repeats 2 and 3
+
+    def test_live_ltm_trains_on_the_live_sample(self):
+        net, _ = make_stm()
+        buffer = PriorityBuffer(50, part_specs(torch.rand(1, 49 * 8), torch.zeros(1, dtype=torch.long)))
+        ltm = BufferedReplayLTM(net, lr=0.1, buffer=buffer, batch=2, period=1, live=True)
+        x, y = torch.rand(1, 49 * 8), torch.tensor([7])
+        before = torch.softmax(ltm.predict(x), 1)[0, 7]
+        for _ in range(20):
+            ltm.observe(x, y)
+        self.assertEqual(ltm.updates, 20)
+        self.assertGreater(float(torch.softmax(ltm.predict(x), 1)[0, 7]), float(before))
+
 
 
 class TestWave8(unittest.TestCase):

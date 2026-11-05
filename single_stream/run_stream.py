@@ -13,6 +13,7 @@ first reaches one of --fewshot-thresholds (default 1, 2, 4, ..., 512), so every 
 threshold however the stream is clustered. The trigger is the harness's bookkeeping; the model sees nothing.
 """
 import argparse
+import copy
 import json
 import os
 import sys
@@ -68,6 +69,9 @@ def parse_args(argv=None):
     p.add_argument("--replay-steps", type=int, default=1, help="replayonly: gradient steps per replay update")
     p.add_argument("--replay-policy", default="fifo", choices=["fifo", "reservoir"], help="replayonly")
     p.add_argument("--replay-float", action="store_true", help="replayonly: store float32 instead of uint8")
+    p.add_argument("--replay-live", action="store_true",
+                   help="buffered: each update also trains on the live sample (batch = it + --replay-batch draws); "
+                        "with --replay-period 1 this is the snap9 'balanced' LTM regime")
     p.add_argument("--buffer", default="ring", choices=["ring", "priority", "neural"],
                    help="buffered: ring = FIFO of --replay-capacity; priority = PriorityBuffer of --replay-capacity; "
                         "neural = NeuralBuffer of --nb-cells")
@@ -100,6 +104,17 @@ def parse_args(argv=None):
     p.add_argument("--stm-repeats", type=int, default=1, help="r: independent episodes per live sample")
     p.add_argument("--stm-replay-ratio", type=float, default=0.0, help="STM replay episodes per exposure")
     p.add_argument("--stm-no-live", action="store_true", help="STM learns from replay episodes only")
+    p.add_argument("--stm-block", type=int, default=0,
+                   help="adaptive repeats: probe the STM's answer every b episodes (0 = fixed --stm-repeats)")
+    p.add_argument("--stm-stop-p", type=float, default=1.0, help="adaptive: stop once the probed p(y) reaches this")
+    p.add_argument("--stm-patience", type=int, default=0,
+                   help="adaptive: also stop once right and this many blocks in a row gained < --stm-gain-eps")
+    p.add_argument("--stm-gain-eps", type=float, default=0.02)
+    p.add_argument("--stm-interleave", type=int, default=0,
+                   help="STM replay episodes (from the LTM's buffer) before each repeat after the first")
+    p.add_argument("--sleep-reset-stm", action="store_true",
+                   help="cls: the STM restarts from its initial state after each LTM replay update (a sleep: every "
+                        "--replay-period exposures, --replay-steps steps)")
     p.add_argument("--stm-sparse-init", default="none", choices=["none", "critic", "actor", "both"],
                    help="sparsity-aware init (layers after the masked one scaled by sqrt(H/k), hidden biases 0)")
     p.add_argument("--stm-step-input", action="store_true", help="fraction of the episode remaining as an STM input")
@@ -113,6 +128,9 @@ def parse_args(argv=None):
     p.add_argument("--n-log-checkpoints", type=int, default=12)
     p.add_argument("--fewshot-thresholds", default="1,2,4,8,16,32,64,128,256,512",
                    help="evaluate when a group's exposure count first reaches each of these ('' = off)")
+    p.add_argument("--mem-images", type=int, default=256,
+                   help="few-shot triggers: Memorisation = accuracy on up to this many of the group's training "
+                        "samples presented so far (the most recent)")
     p.add_argument("--grid-per-epoch", type=int, default=10)
     p.add_argument("--max-exposures", type=int, default=0, help="stop early (smoke tests and timing only)")
     p.add_argument("--seed", type=int, default=0)
@@ -162,11 +180,22 @@ def build_model(args, train, token_shape=None):
                                   util_decay=args.nb_util_decay, match_threshold=args.nb_match_threshold, gate=gate,
                                   seed=args.seed)
         ltm = BufferedReplayLTM(net, buffer=buffer, batch=args.replay_batch, period=args.replay_period,
-                                steps=args.replay_steps, optimizer=args.optimizer, **common)
+                                steps=args.replay_steps, optimizer=args.optimizer, live=args.replay_live, **common)
         if args.model == "buffered":
             return ltm
-        return CLSModel(ltm, build_stm(args, net, train.num_classes), repeats=args.stm_repeats,
-                        replay_ratio=args.stm_replay_ratio, learn_live=not args.stm_no_live)
+        if args.replay_live:
+            raise ValueError("cls: the LTM learns only in sleep (no --replay-live)")
+        stm = build_stm(args, net, train.num_classes)
+        initial = copy.deepcopy(stm.model)  # --sleep-reset-stm restarts from here
+
+        def stm_factory():
+            from single_stream.stm import RLSTM
+            return RLSTM(net, copy.deepcopy(initial), steps=args.stm_steps, lr=args.stm_lr, momentum=args.stm_momentum,
+                         incremental=args.stm_incremental)
+        return CLSModel(ltm, stm, repeats=args.stm_repeats, replay_ratio=args.stm_replay_ratio,
+                        learn_live=not args.stm_no_live, block=args.stm_block, stop_p=args.stm_stop_p,
+                        patience=args.stm_patience, gain_eps=args.stm_gain_eps, interleave=args.stm_interleave,
+                        reset_on_sleep=args.sleep_reset_stm, stm_factory=stm_factory)
     return ReplayLTM(net, capacity=args.replay_capacity, replay_batch=args.replay_batch,
                      input_shape=train.x.shape[1:], seed=args.seed, **common)
 
@@ -208,8 +237,9 @@ def stm_diagnostics(model, data, n):
     out = {"stm_step_acc": acc.tolist(), "stm_step_score": res["scores"].mean(1).tolist(),
            "stm_step_value": v.mean(1).tolist(), "stm_value_final_corr": corr,
            "stm_bias_abs": res["bias"].abs().mean((1, 2)).tolist(),
-           "stm_episodes": model.stm.episodes, "stm_replay_episodes": model.replay_episodes,
-           "stm_recruited": model.stm.recruited}
+           "stm_episodes": model.stm.episodes + model.stm_episodes_before,
+           "stm_live_episodes": model.live_episodes, "stm_replay_episodes": model.replay_episodes,
+           "stm_resets": model.resets, "stm_recruited": model.stm.recruited}
     m = model.stm.model
     if m.config.encoder_sparsity > 0:
         for name, net in (("actor", m.model_actor), ("critic", m.model_critic)):
@@ -227,6 +257,17 @@ def buffer_diagnostics(buffer, num_classes):
         out.update({"buffer_mean_age": float(buffer.ages().float().mean()),
                     "buffer_mean_score": float(buffer.score[:buffer.size].mean())})
     return out
+
+
+class rng_neutral:
+    """Evaluation must not consume the global torch RNG (the STM's actor draws a policy sample on every forward pass,
+    even when the mean is used), so the training trajectory does not depend on the evaluation schedule."""
+
+    def __enter__(self):
+        self.state = torch.get_rng_state()
+
+    def __exit__(self, *exc):
+        torch.set_rng_state(self.state)
 
 
 class Tee:
@@ -286,6 +327,7 @@ def main(argv=None):
     n = np.zeros(len(group_ids), dtype=np.int64)
     q = np.zeros(len(group_ids), dtype=np.int64)
     last_seen = np.full(len(group_ids), -1, dtype=np.int64)
+    seen = [[] for _ in group_ids]  # training samples presented, per group (Memorisation; harness bookkeeping)
     online_correct = online_count = 0
     t = 0
     next_ckpt = 0
@@ -322,24 +364,36 @@ def main(argv=None):
                 n[gi] += 1
                 q[gi] += int(cluster_start[i + j])
                 last_seen[gi] = t + j + 1
+                seen[gi].append(int(k))
             t += len(idx)
 
             crossed = [(gi, int(v)) for gi in np.flatnonzero(n > n_before)
                        for v in thresholds if n_before[gi] < v <= n[gi]]
             if crossed:
                 t0 = time.perf_counter()
+                rng = rng_neutral()
+                rng.__enter__()
                 variants = metrics.evaluate_variants(model, eval_set)
-                eval_time += time.perf_counter() - t0
                 scored = {}
                 for name, vp in variants.items():
                     vc = metrics.group_confusion(vp, eval_set.groups, group_ids, eval_set.num_classes)
                     scored[name] = (vc, metrics.balanced_group_score(vc, group_label),
                                     float((vp == eval_set.y.numpy()).mean()))
                 confusion, balanced, acc = scored["main"]
+                hits = np.array([confusion[g, group_label[g]] for g in range(len(group_ids))], dtype=float)
+                totals = confusion.sum(1).astype(float)
                 for gi, v in crossed:
                     row = confusion[gi]
+                    others = np.arange(len(group_ids)) != gi
+                    mem_idx = torch.tensor(seen[gi][-args.mem_images:])
+                    with torch.no_grad():
+                        mem_pred = model.predict(train.x[mem_idx]).argmax(1)
                     rec = {"t": t, "group": int(group_ids[gi]), "threshold": v, "n": int(n[gi]), "q": int(q[gi]),
                            "balanced": float(balanced[gi]), "recall": float(row[group_label[gi]] / row.sum()),
+                           # Memorisation: the group's own training samples presented so far (most recent first);
+                           # Protection: accuracy on the other groups' evaluation images
+                           "memorisation": float((mem_pred == train.y[mem_idx]).float().mean()),
+                           "protection": float(hits[others].sum() / totals[others].sum()),
                            "acc": acc, "confusion": confusion.tolist()}
                     for name, (vc, vb, va) in scored.items():
                         if name != "main":
@@ -348,10 +402,13 @@ def main(argv=None):
                             rec[f"{name}_acc"] = va
                     fewshot_file.write(json.dumps(rec) + "\n")
                 fewshot_file.flush()
+                rng.__exit__()
+                eval_time += time.perf_counter() - t0
 
             if next_ckpt < len(checkpoints) and t >= checkpoints[next_ckpt]:
                 t0 = time.perf_counter()
-                variants = metrics.evaluate_variants(model, eval_set)
+                with rng_neutral():
+                    variants = metrics.evaluate_variants(model, eval_set)
                 preds = variants["main"]
                 eval_time += time.perf_counter() - t0
                 correct = preds == eval_set.y.numpy()
@@ -368,7 +425,8 @@ def main(argv=None):
                 if hasattr(model, "buffer"):
                     rec.update(buffer_diagnostics(model.buffer, eval_set.num_classes))
                 if isinstance(model, CLSModel):
-                    rec.update(stm_diagnostics(model, eval_set, args.stm_diag_images))
+                    with rng_neutral():
+                        rec.update(stm_diagnostics(model, eval_set, args.stm_diag_images))
                 ckpt_file.write(json.dumps(rec) + "\n")
                 ckpt_file.flush()
                 log(f"t {t:>8d}  ep {epoch}  acc {rec['acc']:.4f}  online {rec['online_acc']:.4f}  "
@@ -396,8 +454,9 @@ def main(argv=None):
     if hasattr(model, "memory_bytes"):
         summary["memory_bytes"] = model.memory_bytes()
     if isinstance(model, CLSModel):
-        summary.update({"stm_episodes": model.stm.episodes, "stm_replay_episodes": model.replay_episodes,
-                        "stm_values": model.stm.num_values()})
+        summary.update({"stm_episodes": model.stm.episodes + model.stm_episodes_before,
+                        "stm_live_episodes": model.live_episodes, "stm_replay_episodes": model.replay_episodes,
+                        "stm_resets": model.resets, "stm_values": model.stm.num_values()})
     summary.update({"exposures": t, "memory_values": model.memory_values(), "preprocessor_values": preproc_values,
                     "train_time": train_time,
                     "eval_time": eval_time, "ms_per_step": 1000 * train_time / max(t // b, 1)})
