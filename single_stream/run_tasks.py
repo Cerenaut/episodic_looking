@@ -33,6 +33,8 @@ def parse_args(argv=None):
     p = build_parser(__doc__)
     p.add_argument("--tasks", default="id,rot90,hflip,rot180", help="comma-separated task names (tasks.py)")
     p.add_argument("--feature-cache", default="", help="directory for the preprocessor's tokens per task (shared)")
+    p.add_argument("--full-first-task", action="store_true",
+                   help="--max-exposures applies to the tasks after the first only (the first runs in full)")
     return p.parse_args(argv)
 
 
@@ -89,7 +91,7 @@ def main(argv=None):
         group_label = metrics.group_labels(train.groups, train.y.numpy(), group_ids)
         epoch_len = len(train)
         total = epoch_len * args.epochs
-        if args.max_exposures:
+        if args.max_exposures and not (ti == 0 and args.full_first_task):
             total = min(total, args.max_exposures)
         checkpoints, grid = metrics.checkpoint_schedule(epoch_len, args.epochs, args.n_log_checkpoints,
                                                         args.grid_per_epoch)
