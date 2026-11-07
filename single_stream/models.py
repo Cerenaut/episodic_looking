@@ -435,6 +435,11 @@ class CLSModel(StreamModel):
     4. `reset_on_sleep` (Dave 5 Nov 2026): after each LTM replay update (a sleep), the STM restarts from its initial
        state (a fresh RLSTM from `stm_factory`), so it never double-counts what the LTM has just consolidated.
 
+    `stm_buffer` (Dave 8 Nov 2026): the STM's own replay buffer (a RingBuffer = FIFO, or a PriorityBuffer), or None
+    to replay from the LTM's buffer. Each live sample is written to it while the STM is online, with novelty = the
+    STM's error on it, 1 - p(y), before learning; replayed samples are rescored with the replay episode's error. It is
+    never wiped (not at sleeps either): older samples age out as new ones arrive.
+
     `stm_delay` (Dave 5 Nov 2026): the STM comes online only after this many exposures since the model started (a
     biasing STM cannot help an untrained LTM; a one-off, not a reaction to the LTM's performance). Before then the
     STM neither learns nor biases: the model is its LTM (predictions unbiased), and the LTM's sleeps run as usual.
@@ -445,7 +450,7 @@ class CLSModel(StreamModel):
     """
 
     def __init__(self, ltm, stm, repeats=1, replay_ratio=0.0, learn_live=True, block=0, stop_p=1.0, patience=0,
-                 gain_eps=0.02, interleave=0, reset_on_sleep=False, stm_factory=None, stm_delay=0):
+                 gain_eps=0.02, interleave=0, reset_on_sleep=False, stm_factory=None, stm_delay=0, stm_buffer=None):
         if reset_on_sleep and stm_factory is None:
             raise ValueError("reset_on_sleep needs stm_factory")
         self.ltm = ltm
@@ -461,6 +466,7 @@ class CLSModel(StreamModel):
         self.reset_on_sleep = reset_on_sleep
         self.stm_factory = stm_factory
         self.stm_delay = stm_delay
+        self.stm_buffer = stm_buffer
         self.exposures = 0
         self.replay_pending = 0.0
         self.replay_episodes = 0
@@ -477,11 +483,14 @@ class CLSModel(StreamModel):
         return self.ltm.updates
 
     def _replay(self, n):
+        buffer = self.ltm.buffer if self.stm_buffer is None else self.stm_buffer
         for _ in range(n):
-            if self.ltm.buffer.written == 0:
+            if buffer.written == 0:
                 return
-            (bx, by), _ = self.ltm.buffer.sample(1)
-            self.stm.episode(bx, by, learn=True)
+            (bx, by), idx = buffer.sample(1)
+            res = self.stm.episode(bx, by, learn=True)
+            if self.stm_buffer is not None:
+                buffer.rescore(idx, self.ltm.novelty(res["logits"][-1].detach(), by))
             self.replay_episodes += 1
 
     @torch.no_grad()
@@ -491,6 +500,7 @@ class CLSModel(StreamModel):
 
     def _live(self, x, y):
         pred = None
+        first = None
         p_prev = self._probe(x, y) if self.block > 0 else None
         flat = 0
         for k in range(self.repeats):
@@ -499,13 +509,16 @@ class CLSModel(StreamModel):
             res = self.stm.episode(x, y, learn=self.learn_live)
             self.live_episodes += 1
             if pred is None:
-                pred = res["logits"][-1].argmax(1)
+                first = res["logits"][-1].detach()
+                pred = first.argmax(1)
             if self.block > 0 and (k + 1) % self.block == 0 and k + 1 < self.repeats:
                 p_now = self._probe(x, y)
                 flat = flat + 1 if p_now - p_prev < self.gain_eps else 0
                 if p_now >= self.stop_p or (self.patience and p_now >= 0.5 and flat >= self.patience):
                     break
                 p_prev = p_now
+        if self.stm_buffer is not None:
+            self.stm_buffer.write((x, y), self.ltm.novelty(first, y))
         return pred
 
     @property
@@ -546,4 +559,5 @@ class CLSModel(StreamModel):
         return {"stm": logits[-1], "ltm": logits[0]}
 
     def memory_values(self):
-        return self.ltm.memory_values() + self.stm.num_values()
+        extra = self.stm_buffer.num_values() if self.stm_buffer is not None else 0
+        return self.ltm.memory_values() + self.stm.num_values() + extra

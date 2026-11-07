@@ -116,6 +116,10 @@ def build_parser(description=__doc__):
     p.add_argument("--stm-gain-eps", type=float, default=0.02)
     p.add_argument("--stm-interleave", type=int, default=0,
                    help="STM replay episodes (from the LTM's buffer) before each repeat after the first")
+    p.add_argument("--stm-buffer", default="shared", choices=["shared", "ring", "priority"],
+                   help="STM replay source: the LTM's buffer (shared), or its own FIFO (ring) or priority buffer "
+                        "(--alpha-evict / --alpha-replay as the LTM's), never wiped")
+    p.add_argument("--stm-buffer-capacity", type=int, default=256)
     p.add_argument("--stm-delay", type=int, default=0,
                    help="cls: exposures before the STM comes online (until then the model is its LTM, sleeps as usual)")
     p.add_argument("--sleep-reset-stm", action="store_true",
@@ -193,6 +197,12 @@ def build_model(args, train, token_shape=None):
             raise ValueError("cls: the LTM learns only in sleep (no --replay-live)")
         stm = build_stm(args, net, train.num_classes)
         initial = copy.deepcopy(stm.model)  # --sleep-reset-stm restarts from here
+        stm_buffer = None
+        if args.stm_buffer == "ring":
+            stm_buffer = RingBuffer(args.stm_buffer_capacity, parts, seed=args.seed + 1)
+        elif args.stm_buffer == "priority":
+            stm_buffer = PriorityBuffer(args.stm_buffer_capacity, parts, alpha_evict=args.alpha_evict,
+                                        alpha_replay=args.alpha_replay, seed=args.seed + 1)
 
         def stm_factory():
             from single_stream.stm import RLSTM
@@ -201,7 +211,8 @@ def build_model(args, train, token_shape=None):
         return CLSModel(ltm, stm, repeats=args.stm_repeats, replay_ratio=args.stm_replay_ratio,
                         learn_live=not args.stm_no_live, block=args.stm_block, stop_p=args.stm_stop_p,
                         patience=args.stm_patience, gain_eps=args.stm_gain_eps, interleave=args.stm_interleave,
-                        reset_on_sleep=args.sleep_reset_stm, stm_factory=stm_factory, stm_delay=args.stm_delay)
+                        reset_on_sleep=args.sleep_reset_stm, stm_factory=stm_factory, stm_delay=args.stm_delay,
+                        stm_buffer=stm_buffer)
     return ReplayLTM(net, capacity=args.replay_capacity, replay_batch=args.replay_batch,
                      input_shape=train.x.shape[1:], seed=args.seed, **common)
 

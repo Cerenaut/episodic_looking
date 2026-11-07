@@ -10,7 +10,7 @@ import torch
 from environment.mnist.mnist_model import MnistModel, MnistModelConfig
 from model.sparse.sparse_distributed_encoder import SparseDistributedEncoder
 from model.transformer import BiasableTransformer
-from single_stream.buffers import PriorityBuffer, part_specs
+from single_stream.buffers import PriorityBuffer, RingBuffer, part_specs
 from single_stream.models import BufferedReplayLTM, CLSModel
 from single_stream.stm import RLSTM
 
@@ -317,6 +317,23 @@ class TestCLSScheduling(unittest.TestCase):
         fresh = cls.stm_factory()
         for a, b in zip(fresh.model.get_trainable_parameters(), initial.get_trainable_parameters()):
             torch.testing.assert_close(a, b)
+
+    def test_own_stm_buffer(self):
+        specs = part_specs(torch.rand(1, 49 * 8), torch.zeros(1, dtype=torch.long))
+        for own in (RingBuffer(3, specs), PriorityBuffer(3, specs, alpha_evict=3, alpha_replay=1)):
+            cls, _ = self._cls(period=4, repeats=2, interleave=1, reset_on_sleep=True, stm_buffer=own)
+            ltm_written = []
+            for i in range(10):
+                cls.observe(torch.rand(1, 49 * 8), torch.tensor([i % 10]))
+                ltm_written.append(cls.ltm.buffer.written)
+            # every live sample goes to both buffers; the STM's own buffer is kept through the sleeps
+            self.assertEqual(own.written, 10)
+            self.assertEqual(own.size, 3)
+            self.assertEqual(cls.ltm.buffer.written, 10)
+            self.assertEqual(cls.resets, 2)
+            # one interleaved replay per exposure, drawn from the STM's buffer (non-empty from the second write)
+            self.assertEqual(cls.replay_episodes, 9)
+            self.assertGreater(cls.memory_values(), cls.ltm.memory_values() + cls.stm.num_values())
 
     def test_no_reset_by_default(self):
         cls, _ = self._cls(period=4, repeats=2)
