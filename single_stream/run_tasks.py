@@ -21,7 +21,7 @@ import time
 import numpy as np
 import torch
 
-from single_stream import datasets, metrics, tasks
+from single_stream import datasets, metrics, stm_probe, tasks
 from single_stream.models import CLSModel
 from single_stream.run_stream import Tee, buffer_diagnostics, build_model, build_parser, rng_neutral, stm_diagnostics
 from single_stream.stream import ClusteredStream
@@ -33,6 +33,11 @@ def parse_args(argv=None):
     p = build_parser(__doc__)
     p.add_argument("--tasks", default="id,rot90,hflip,rot180", help="comma-separated task names (tasks.py)")
     p.add_argument("--feature-cache", default="", help="directory for the preprocessor's tokens per task (shared)")
+    p.add_argument("--stm-probe-at", default="",
+                   help="diagnostic: exposures (counted within each task after the first, 1 = its first sample) at which "
+                        "to run the factorial STM probe (stm_probe.py) on the live sample; to stm_probe.jsonl")
+    p.add_argument("--stm-probe-temperature", type=float, default=4.0)
+    p.add_argument("--stm-probe-ceiling", type=int, default=1024, help="repeats of the probe's ceiling condition")
     p.add_argument("--full-first-task", action="store_true",
                    help="--max-exposures applies to the tasks after the first only (the first runs in full)")
     return p.parse_args(argv)
@@ -78,6 +83,8 @@ def main(argv=None):
     ckpt_file = open(os.path.join(args.out, "checkpoints.jsonl"), "w")
     fewshot_file = open(os.path.join(args.out, "fewshot.jsonl"), "w")
     trace_file = None
+    probe_at = {int(v) for v in args.stm_probe_at.split(",") if v.strip()}
+    probe_file = open(os.path.join(args.out, "stm_probe.jsonl"), "w") if probe_at else None
     if args.stm_trace and isinstance(model, CLSModel):
         model.trace = []
         trace_file = open(os.path.join(args.out, "stm_trace.jsonl"), "w")
@@ -151,6 +158,15 @@ def main(argv=None):
                     break
                 k = int(ep.order[i])
                 idx = ep.order[i:i + 1]
+                if probe_file is not None and ti > 0 and tt + 1 in probe_at and isinstance(model, CLSModel) \
+                        and model.online:
+                    gi = group_index[train.groups[k]]
+                    for rec in stm_probe.probe(model, train.x[idx], train.y[idx], args.stm_probe_temperature,
+                                               args.stm_probe_ceiling):
+                        rec.update(task=ti, t_task=tt + 1, group=int(group_ids[gi]), n=int(n[gi]) + 1,
+                                   exposures_since_reset=model.exposures - model.last_reset)
+                        probe_file.write(json.dumps(rec) + "\n")
+                    probe_file.flush()
                 t0 = time.perf_counter()
                 pred = model.observe(train.x[idx], train.y[idx])
                 train_time += time.perf_counter() - t0
@@ -219,6 +235,8 @@ def main(argv=None):
     fewshot_file.close()
     if trace_file is not None:
         trace_file.close()
+    if probe_file is not None:
+        probe_file.close()
     if hasattr(model, "updates"):
         summary["replay_updates"] = model.updates
     if isinstance(model, CLSModel):

@@ -354,6 +354,28 @@ class TestCLSScheduling(unittest.TestCase):
         self.assertEqual([b[0] for b in trace[0]["blocks"]], [2, 4])   # no probe after the last repeat
         self.assertEqual(len(trace[-1]["blocks"][0]), 3)               # probe after the following replay
 
+    def test_factorial_probe_leaves_training_unchanged(self):
+        from single_stream import stm_probe
+        xs = torch.rand(8, 49 * 8)
+        runs = []
+        for probed in (False, True):
+            torch.manual_seed(0)
+            cls, _ = self._cls(period=4, repeats=4, block=2, stop_p=1.1, interleave=1, reset_on_sleep=True)
+            preds = []
+            for i in range(8):
+                x, y = xs[i:i + 1], torch.tensor([i % 10])
+                if probed and i in (2, 5):
+                    recs = stm_probe.probe(cls, x, y, temperature=4.0, ceiling_repeats=6)
+                    self.assertEqual(len(recs), 9)
+                    self.assertEqual(recs[-1]["repeats"], 6)
+                    self.assertEqual({(r["stm"], r["replay"], r["temperature"]) for r in recs[:8]},
+                                     {(a, b, c) for a in ("as_is", "fresh") for b in (True, False) for c in (1.0, 4.0)})
+                    self.assertIsNone(cls.trace)
+                preds.append(int(cls.observe(x, y)))
+            runs.append((preds, cls.predict(xs)))
+        self.assertEqual(runs[0][0], runs[1][0])
+        torch.testing.assert_close(runs[0][1], runs[1][1])
+
     def test_no_reset_by_default(self):
         cls, _ = self._cls(period=4, repeats=2)
         first = cls.stm

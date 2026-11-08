@@ -479,6 +479,7 @@ class CLSModel(StreamModel):
         self.resets = 0
         self.stm_episodes_before = 0  # learning episodes of STMs discarded by resets
         self.trace = None
+        self.last_reset = 0  # exposure count at the last STM reset (diagnostics)
 
     @property
     def buffer(self):
@@ -564,6 +565,7 @@ class CLSModel(StreamModel):
             self.stm_episodes_before += self.stm.episodes
             self.stm = self.stm_factory()
             self.resets += 1
+            self.last_reset = self.exposures
         return pred
 
     @torch.no_grad()
