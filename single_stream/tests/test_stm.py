@@ -3,6 +3,7 @@ Unit tests of the RL STM (environment/mnist/mnist_model.py, single_stream/stm.py
 recruitment and the CLS model's scheduling. The learning tests run the whole stack on a frozen random transformer.
 """
 import copy
+import math
 import unittest
 
 import torch
@@ -394,6 +395,38 @@ class TestCLSScheduling(unittest.TestCase):
         for q, q0 in zip(cls.stm.ltm.parameters(), params):
             self.assertTrue(q.requires_grad)
             torch.testing.assert_close(q, q0)
+
+    def test_reward_probe_sets_reward_and_leaves_training_unchanged(self):
+        from single_stream import stm_probe
+        xs = torch.rand(6, 49 * 8)
+        runs = []
+        for probed in (False, True):
+            torch.manual_seed(0)
+            cls, _ = self._cls(period=4, repeats=4, block=2, stop_p=1.1, interleave=1, reset_on_sleep=True)
+            reward = cls.stm.model.config.reward_type
+            preds = []
+            for i in range(6):
+                x, y = xs[i:i + 1], torch.tensor([i % 10])
+                if probed and i == 3:
+                    recs = stm_probe.rewards(cls, x, y, repeats=6, log_p_floor=1e-8, margin_clip=20.0)
+                    self.assertEqual([r["reward"] for r in recs], ["accuracy", "log-accuracy", "margin"])
+                    self.assertTrue(all(r["repeats"] == 6 for r in recs))
+                    self.assertEqual(cls.stm.model.config.reward_type, reward)
+                    self.assertIsNone(cls.trace)
+                preds.append(int(cls.observe(x, y)))
+            runs.append((preds, cls.predict(xs)))
+        self.assertEqual(runs[0][0], runs[1][0])
+        torch.testing.assert_close(runs[0][1], runs[1][1])
+
+    def test_reward_clips_are_configurable(self):
+        import dataclasses
+        logits, y = torch.tensor([[0.0, 0.0, 0.0], [0.0, 30.0, 0.0]]), torch.tensor([0, 0])
+        _, stm = make_stm(reward_type="log-accuracy")
+        stm.model.config = dataclasses.replace(stm.model.config, log_p_floor=math.log(1e-8))
+        self.assertAlmostEqual(float(stm.model.step_score(logits, y)[1]), math.log(1e-8), places=4)
+        _, stm = make_stm(reward_type="margin")
+        stm.model.config = dataclasses.replace(stm.model.config, margin_clip=20.0)
+        torch.testing.assert_close(stm.model.step_score(logits, y), torch.tensor([0.0, -20.0]))
 
     def test_no_reset_by_default(self):
         cls, _ = self._cls(period=4, repeats=2)

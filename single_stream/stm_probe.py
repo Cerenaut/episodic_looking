@@ -15,9 +15,16 @@ Oracle bias test (Dave 9 Nov 2026), `oracle`: on the same sample and LTM weights
 (Adam on the raw bias, cross-entropy on y, no RL) within the LTM's bias range (gain exp(s tanh(a))) and with wider
 ranges (s times `scales`). If the oracle flips the sample at s, the range suffices and the STM lacks a signal or
 speed; if not even the oracle can, no STM with this bias can.
+
+Reward probe (Dave 9 Nov 2026), `rewards`: a fresh STM, no replay, up to `repeats` repeats, once per reward type
+(the run's p(y) "accuracy", log p(y) clipped at a low floor, the logit margin), each from the same random state, so
+the conditions differ only in the reward. Tests whether a reward with a slope at tiny p(y) lets the STM find the bias
+the oracle finds.
 """
 import copy
+import dataclasses
 import itertools
+import math
 
 import torch
 import torch.nn.functional as F
@@ -75,6 +82,27 @@ def oracle(model, x, y, scales=(1, 2, 4, 8), steps=500, lr=0.1, record=(0, 10, 2
             rec.update(p_end=rec["p"][-1][1], top=int(logits.argmax(1)[0]),
                        saturated=float((torch.tanh(a).abs() > 0.95).float().mean()))
         records.append(rec)
+    return records
+
+
+def rewards(model, x, y, types=("accuracy", "log-accuracy", "margin"), repeats=1024, log_p_floor=1e-8,
+            margin_clip=20.0):
+    """One trace record per reward type: fresh STM, no replay, cap `repeats`, the live STM's settings otherwise."""
+    records = []
+    with torch.random.fork_rng(devices=[]):
+        state = torch.get_rng_state()
+        for r in types:
+            torch.set_rng_state(state)
+            m = copy.deepcopy(model)
+            m.stm = m.stm_factory()
+            m.stm.model.config = dataclasses.replace(m.stm.model.config, reward_type=r,
+                                                     log_p_floor=math.log(log_p_floor), margin_clip=margin_clip)
+            m.interleave = 0
+            m.repeats = repeats
+            m.trace = []
+            m._live(x, y)
+            records.append({**m.trace[0], "reward": r, "log_p_floor": log_p_floor, "margin_clip": margin_clip,
+                            "repeats_cap": repeats})
     return records
 
 

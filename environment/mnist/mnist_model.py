@@ -53,6 +53,8 @@ class MnistModelConfig:
 
     reward_scale: float = 1.0
     reward_type: str = "terminal-accuracy"
+    log_p_floor: float = -9.210340371976184  # log-accuracy: log p(y) clipped below here (default log 1e-4)
+    margin_clip: float = 10.0  # margin: clipped to +- this
 
     loss_actor_scale: float = 0.01
     loss_critic_scale: float = 1.0
@@ -362,12 +364,12 @@ class MnistModel:
             return self.get_class_entropy_reward(logits)
         if self.config.reward_type == MnistModel.REWARD_TYPE_LOG_ACCURACY:
             # log p(y) does not flatten where p(y) is small (its slope in the logits is 1 - p(y))
-            return (-F.cross_entropy(logits, targets, reduction="none")).clamp(min=MnistModel.LOG_P_FLOOR)
+            return (-F.cross_entropy(logits, targets, reduction="none")).clamp(min=self.config.log_p_floor)
         if self.config.reward_type == MnistModel.REWARD_TYPE_MARGIN:
             # linear in the logits, never saturates: how far y is from being the argmax
             z_y = logits.gather(1, targets[:, None])[:, 0]
             other = logits.scatter(1, targets[:, None], float("-inf")).max(1).values
-            return (z_y - other).clamp(-MnistModel.MARGIN_CLIP, MnistModel.MARGIN_CLIP)
+            return (z_y - other).clamp(-self.config.margin_clip, self.config.margin_clip)
         return self.get_class_accuracy_reward(logits, targets)
 
     def episode_rewards(self, scores: list[torch.Tensor], classes: torch.Tensor | None = None) -> torch.Tensor:

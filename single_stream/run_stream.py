@@ -15,6 +15,7 @@ threshold however the stream is clustered. The trigger is the harness's bookkeep
 import argparse
 import copy
 import json
+import math
 import os
 import sys
 import time
@@ -95,7 +96,10 @@ def build_parser(description=__doc__):
     p.add_argument("--stm-lr", type=float, default=0.01)
     p.add_argument("--stm-momentum", type=float, default=0.5)
     p.add_argument("--stm-reward", default="terminal-accuracy",
-                   choices=["terminal-accuracy", "accuracy", "accuracy-improvement", "entropy", "entropy-improvement"])
+                   choices=["terminal-accuracy", "accuracy", "accuracy-improvement", "entropy", "entropy-improvement",
+                            "log-accuracy", "margin"])
+    p.add_argument("--stm-log-p-floor", type=float, default=1e-4, help="log-accuracy reward: p(y) floor (log clipped there)")
+    p.add_argument("--stm-margin-clip", type=float, default=10.0, help="margin reward: clipped to +- this")
     p.add_argument("--stm-returns", default="mc", choices=["mc", "td"])
     p.add_argument("--stm-discount", type=float, default=1.0)
     p.add_argument("--stm-policy-std", type=float, default=0.5)
@@ -228,7 +232,8 @@ def build_stm(args, net, num_classes):
     config = MnistModelConfig(
         encoder_sparsity=args.stm_sparsity, history_size=args.stm_history, model_hidden_size=args.stm_hidden,
         model_layers=args.stm_layers, discount_factor=args.stm_discount, returns=args.stm_returns,
-        reward_type=args.stm_reward, loss_actor_scale=args.stm_actor_scale, actor_updates=args.stm_actor_updates,
+        reward_type=args.stm_reward, log_p_floor=math.log(args.stm_log_p_floor), margin_clip=args.stm_margin_clip,
+        loss_actor_scale=args.stm_actor_scale, actor_updates=args.stm_actor_updates,
         num_classes=num_classes, policy_std=args.stm_policy_std, eval_bias=args.stm_eval_bias,
         actor_value_input=not args.stm_no_value_input, input_conditioning=args.stm_conditioning,
         mask_key=args.stm_mask_key, recruit_rate=args.stm_recruit_rate, recruit_idle_steps=args.stm_recruit_idle,

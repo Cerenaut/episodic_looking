@@ -38,8 +38,11 @@ def parse_args(argv=None):
                         "to run the factorial STM probe (stm_probe.py) on the live sample; to stm_probe.jsonl")
     p.add_argument("--stm-probe-temperature", type=float, default=4.0)
     p.add_argument("--stm-probe-ceiling", type=int, default=1024, help="repeats of the probe's ceiling condition")
-    p.add_argument("--stm-probe-kind", default="factorial", choices=("factorial", "oracle"),
-                   help="factorial: the STM conditions; oracle: the gradient-optimal bias at several ranges (stm_probe.py)")
+    p.add_argument("--stm-probe-kind", default="factorial", choices=("factorial", "oracle", "reward"),
+                   help="factorial: the STM conditions; oracle: the gradient-optimal bias at several ranges; reward: a "
+                        "fresh STM per reward type (stm_probe.py)")
+    p.add_argument("--stm-probe-log-p-floor", type=float, default=1e-8, help="reward probe: log-accuracy floor on p(y)")
+    p.add_argument("--stm-probe-margin-clip", type=float, default=20.0, help="reward probe: margin clip")
     p.add_argument("--full-first-task", action="store_true",
                    help="--max-exposures applies to the tasks after the first only (the first runs in full)")
     return p.parse_args(argv)
@@ -165,6 +168,10 @@ def main(argv=None):
                     gi = group_index[train.groups[k]]
                     if args.stm_probe_kind == "oracle":
                         recs = stm_probe.oracle(model, train.x[idx], train.y[idx])
+                    elif args.stm_probe_kind == "reward":
+                        recs = stm_probe.rewards(model, train.x[idx], train.y[idx], repeats=args.stm_probe_ceiling,
+                                                 log_p_floor=args.stm_probe_log_p_floor,
+                                                 margin_clip=args.stm_probe_margin_clip)
                     else:
                         recs = stm_probe.probe(model, train.x[idx], train.y[idx], args.stm_probe_temperature,
                                                args.stm_probe_ceiling)
