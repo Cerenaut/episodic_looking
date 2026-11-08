@@ -34,8 +34,9 @@ class SoftLogits:
 
 
 def conditions(temperature, ceiling_repeats):
+    temps = (1.0,) if temperature == 1.0 else (1.0, temperature)  # temperature 1: no LTM factor
     out = [{"stm": stm, "replay": replay, "temperature": t, "repeats": None}
-           for stm, replay, t in itertools.product(("as_is", "fresh"), (True, False), (1.0, temperature))]
+           for stm, replay, t in itertools.product(("as_is", "fresh"), (True, False), temps)]
     out.append({"stm": "fresh", "replay": False, "temperature": 1.0, "repeats": ceiling_repeats})
     return out
 
@@ -56,5 +57,5 @@ def probe(model, x, y, temperature=4.0, ceiling_repeats=1024):
                 m.repeats = cond["repeats"]
             m.trace = []
             m._live(x, y)
-            records.append({**cond, **m.trace[0]})
+            records.append({**m.trace[0], **cond, "repeats_cap": cond["repeats"], "repeats": m.trace[0]["repeats"]})
     return records
