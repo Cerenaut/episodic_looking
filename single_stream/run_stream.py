@@ -120,6 +120,8 @@ def build_parser(description=__doc__):
                    help="STM replay source: the LTM's buffer (shared), or its own FIFO (ring) or priority buffer "
                         "(--alpha-evict / --alpha-replay as the LTM's), never wiped")
     p.add_argument("--stm-buffer-capacity", type=int, default=256)
+    p.add_argument("--stm-trace", action="store_true",
+                   help="diagnostic: log the STM's adaptive loop per live exposure to stm_trace.jsonl (run_tasks)")
     p.add_argument("--stm-delay", type=int, default=0,
                    help="cls: exposures before the STM comes online (until then the model is its LTM, sleeps as usual)")
     p.add_argument("--sleep-reset-stm", action="store_true",

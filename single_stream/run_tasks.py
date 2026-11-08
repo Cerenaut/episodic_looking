@@ -77,6 +77,10 @@ def main(argv=None):
     thresholds = np.array([int(v) for v in args.fewshot_thresholds.split(",") if v.strip()], dtype=np.int64)
     ckpt_file = open(os.path.join(args.out, "checkpoints.jsonl"), "w")
     fewshot_file = open(os.path.join(args.out, "fewshot.jsonl"), "w")
+    trace_file = None
+    if args.stm_trace and isinstance(model, CLSModel):
+        model.trace = []
+        trace_file = open(os.path.join(args.out, "stm_trace.jsonl"), "w")
     t = 0
     train_time = eval_time = 0.0
     summary = {"tasks": names, "per_task": []}
@@ -160,6 +164,13 @@ def main(argv=None):
                 seen[gi].append(k)
                 t += 1
                 tt += 1
+                if trace_file is not None and model.trace:
+                    rec = model.trace.pop()
+                    with rng_neutral():  # p(y) of the live sample as evaluated, after the LTM's step (and any sleep)
+                        p_eval = float(torch.softmax(model.predict(train.x[idx]), 1)[0, train.y[k]])
+                    rec.update(t=t, task=ti, t_task=tt, group=int(group_ids[gi]), n=int(n[gi]),
+                               slept_resets=model.resets, p_eval=p_eval)
+                    trace_file.write(json.dumps(rec) + "\n")
                 crossed = [int(v) for v in thresholds if n_before < v <= n[gi]]
                 if crossed:
                     t0 = time.perf_counter()
@@ -206,6 +217,8 @@ def main(argv=None):
 
     ckpt_file.close()
     fewshot_file.close()
+    if trace_file is not None:
+        trace_file.close()
     if hasattr(model, "updates"):
         summary["replay_updates"] = model.updates
     if isinstance(model, CLSModel):

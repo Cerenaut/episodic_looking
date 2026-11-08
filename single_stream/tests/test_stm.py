@@ -335,6 +335,25 @@ class TestCLSScheduling(unittest.TestCase):
             self.assertEqual(cls.replay_episodes, 9)
             self.assertGreater(cls.memory_values(), cls.ltm.memory_values() + cls.stm.num_values())
 
+    def test_trace_does_not_change_training(self):
+        xs = torch.rand(10, 49 * 8)
+        runs = []
+        for traced in (False, True):
+            torch.manual_seed(0)
+            cls, _ = self._cls(period=4, repeats=6, block=2, stop_p=1.1, interleave=1, reset_on_sleep=True)
+            if traced:
+                cls.trace = []
+            preds = [int(cls.observe(xs[i:i + 1], torch.tensor([i % 10]))) for i in range(10)]
+            runs.append((preds, cls.predict(xs), cls))
+        self.assertEqual(runs[0][0], runs[1][0])
+        torch.testing.assert_close(runs[0][1], runs[1][1])
+        trace = runs[1][2].trace
+        self.assertEqual(len(trace), 10)
+        self.assertEqual(trace[0]["stop"], "cap")
+        self.assertEqual(trace[0]["repeats"], 6)
+        self.assertEqual([b[0] for b in trace[0]["blocks"]], [2, 4])   # no probe after the last repeat
+        self.assertEqual(len(trace[-1]["blocks"][0]), 3)               # probe after the following replay
+
     def test_no_reset_by_default(self):
         cls, _ = self._cls(period=4, repeats=2)
         first = cls.stm

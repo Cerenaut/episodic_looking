@@ -440,6 +440,11 @@ class CLSModel(StreamModel):
     STM's error on it, 1 - p(y), before learning; replayed samples are rescored with the replay episode's error. It is
     never wiped (not at sleeps either): older samples age out as new ones arrive.
 
+    `trace` (diagnostic, Dave 8 Nov 2026): None, or a list to which each live exposure appends a record of the
+    adaptive loop: p(y) before learning (p0), per block the probe after the live episode and after the next
+    interleaved replay episode, the repeats used, why it stopped, and p(y) at the end (p_end). The extra probes run
+    under a forked RNG, so tracing does not change the training trajectory.
+
     `stm_delay` (Dave 5 Nov 2026): the STM comes online only after this many exposures since the model started (a
     biasing STM cannot help an untrained LTM; a one-off, not a reaction to the LTM's performance). Before then the
     STM neither learns nor biases: the model is its LTM (predictions unbiased), and the LTM's sleeps run as usual.
@@ -473,6 +478,7 @@ class CLSModel(StreamModel):
         self.live_episodes = 0
         self.resets = 0
         self.stm_episodes_before = 0  # learning episodes of STMs discarded by resets
+        self.trace = None
 
     @property
     def buffer(self):
@@ -498,14 +504,23 @@ class CLSModel(StreamModel):
         logits = self.stm.episode(x)["logits"][-1]
         return float(F.softmax(logits, dim=1).gather(1, y[:, None]).mean())
 
+    def _quiet_probe(self, x, y):
+        with torch.random.fork_rng(devices=[]):
+            return self._probe(x, y)
+
     def _live(self, x, y):
         pred = None
         first = None
         p_prev = self._probe(x, y) if self.block > 0 else None
         flat = 0
+        rec = None
+        if self.trace is not None:
+            rec = {"p0": p_prev if p_prev is not None else self._quiet_probe(x, y), "blocks": [], "stop": "cap"}
         for k in range(self.repeats):
             if k > 0:
                 self._replay(self.interleave)
+                if rec is not None and rec["blocks"] and len(rec["blocks"][-1]) == 2:
+                    rec["blocks"][-1].append(self._quiet_probe(x, y))  # after the replay that follows the probe
             res = self.stm.episode(x, y, learn=self.learn_live)
             self.live_episodes += 1
             if pred is None:
@@ -513,12 +528,19 @@ class CLSModel(StreamModel):
                 pred = first.argmax(1)
             if self.block > 0 and (k + 1) % self.block == 0 and k + 1 < self.repeats:
                 p_now = self._probe(x, y)
+                if rec is not None:
+                    rec["blocks"].append([k + 1, p_now])
                 flat = flat + 1 if p_now - p_prev < self.gain_eps else 0
                 if p_now >= self.stop_p or (self.patience and p_now >= 0.5 and flat >= self.patience):
+                    if rec is not None:
+                        rec["stop"] = "stop_p" if p_now >= self.stop_p else "patience"
                     break
                 p_prev = p_now
         if self.stm_buffer is not None:
             self.stm_buffer.write((x, y), self.ltm.novelty(first, y))
+        if rec is not None:
+            rec.update(repeats=k + 1, p_end=self._quiet_probe(x, y))
+            self.trace.append(rec)
         return pred
 
     @property
