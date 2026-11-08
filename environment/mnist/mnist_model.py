@@ -55,6 +55,7 @@ class MnistModelConfig:
     reward_type: str = "terminal-accuracy"
     log_p_floor: float = -9.210340371976184  # log-accuracy: log p(y) clipped below here (default log 1e-4)
     margin_clip: float = 10.0  # margin: clipped to +- this
+    log_weight: float = 1.0  # accuracy-log: weight of the scaled log p(y) term
 
     loss_actor_scale: float = 0.01
     loss_critic_scale: float = 1.0
@@ -101,9 +102,12 @@ class MnistModel:
     REWARD_TYPE_ENTROPY_IMPROVEMENT = "entropy-improvement"
     REWARD_TYPE_LOG_ACCURACY = "log-accuracy"  # per step: log p(y), clipped below at LOG_P_FLOOR
     REWARD_TYPE_MARGIN = "margin"  # per step: logit of y minus the largest other logit, clipped to +-MARGIN_CLIP
+    # per step (Dave 9 Nov 2026): p(y) + log_weight (log p(y) - floor) / |floor|, log p(y) clipped at the floor: the log
+    # term, in [0, 1], keeps a slope where p(y) is tiny; the p(y) term dominates once p(y) is ordinary
+    REWARD_TYPE_ACCURACY_LOG = "accuracy-log"
     REWARD_TYPES = [REWARD_TYPE_TERMINAL_ACCURACY, REWARD_TYPE_ACCURACY, REWARD_TYPE_ACCURACY_IMPROVEMENT,
                     REWARD_TYPE_ENTROPY, REWARD_TYPE_ENTROPY_IMPROVEMENT, REWARD_TYPE_LOG_ACCURACY,
-                    REWARD_TYPE_MARGIN]
+                    REWARD_TYPE_MARGIN, REWARD_TYPE_ACCURACY_LOG]
     LOG_P_FLOOR = math.log(1e-4)
     MARGIN_CLIP = 10.0
 
@@ -365,6 +369,10 @@ class MnistModel:
         if self.config.reward_type == MnistModel.REWARD_TYPE_LOG_ACCURACY:
             # log p(y) does not flatten where p(y) is small (its slope in the logits is 1 - p(y))
             return (-F.cross_entropy(logits, targets, reduction="none")).clamp(min=self.config.log_p_floor)
+        if self.config.reward_type == MnistModel.REWARD_TYPE_ACCURACY_LOG:
+            floor = self.config.log_p_floor
+            log_p = (-F.cross_entropy(logits, targets, reduction="none")).clamp(min=floor)
+            return log_p.exp() + self.config.log_weight * (log_p - floor) / abs(floor)
         if self.config.reward_type == MnistModel.REWARD_TYPE_MARGIN:
             # linear in the logits, never saturates: how far y is from being the argmax
             z_y = logits.gather(1, targets[:, None])[:, 0]

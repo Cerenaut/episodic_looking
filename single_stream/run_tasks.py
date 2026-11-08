@@ -43,6 +43,9 @@ def parse_args(argv=None):
                         "fresh STM per reward type (stm_probe.py)")
     p.add_argument("--stm-probe-log-p-floor", type=float, default=1e-8, help="reward probe: log-accuracy floor on p(y)")
     p.add_argument("--stm-probe-margin-clip", type=float, default=20.0, help="reward probe: margin clip")
+    p.add_argument("--stm-probe-rewards", default="accuracy,log-accuracy,margin",
+                   help="reward probe: comma-separated reward types (each from the same random state)")
+    p.add_argument("--stm-probe-log-weight", type=float, default=1.0, help="reward probe: accuracy-log weight")
     p.add_argument("--full-first-task", action="store_true",
                    help="--max-exposures applies to the tasks after the first only (the first runs in full)")
     return p.parse_args(argv)
@@ -171,7 +174,9 @@ def main(argv=None):
                     elif args.stm_probe_kind == "reward":
                         recs = stm_probe.rewards(model, train.x[idx], train.y[idx], repeats=args.stm_probe_ceiling,
                                                  log_p_floor=args.stm_probe_log_p_floor,
-                                                 margin_clip=args.stm_probe_margin_clip)
+                                                 margin_clip=args.stm_probe_margin_clip,
+                                                 types=tuple(args.stm_probe_rewards.split(",")),
+                                                 log_weight=args.stm_probe_log_weight)
                     else:
                         recs = stm_probe.probe(model, train.x[idx], train.y[idx], args.stm_probe_temperature,
                                                args.stm_probe_ceiling)

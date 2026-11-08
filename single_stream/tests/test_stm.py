@@ -428,6 +428,18 @@ class TestCLSScheduling(unittest.TestCase):
         stm.model.config = dataclasses.replace(stm.model.config, margin_clip=20.0)
         torch.testing.assert_close(stm.model.step_score(logits, y), torch.tensor([0.0, -20.0]))
 
+    def test_accuracy_log_reward(self):
+        import dataclasses
+        logits, y = torch.tensor([[2.0, 0.0, -1.0], [0.0, 30.0, 0.0]]), torch.tensor([0, 0])
+        _, stm = make_stm(reward_type="accuracy-log")
+        floor = math.log(1e-8)
+        stm.model.config = dataclasses.replace(stm.model.config, log_p_floor=floor, log_weight=0.5)
+        s = stm.model.step_score(logits, y)
+        lp = torch.log_softmax(logits[0], 0)[0]
+        torch.testing.assert_close(s[0], lp.exp() + 0.5 * (lp - floor) / abs(floor))
+        self.assertAlmostEqual(float(s[1]), 1e-8, places=6)   # clipped: the log term is 0, p(y) the floor
+        self.assertIn("accuracy-log", MnistModel.REWARD_TYPES)
+
     def test_no_reset_by_default(self):
         cls, _ = self._cls(period=4, repeats=2)
         first = cls.stm

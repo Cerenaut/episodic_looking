@@ -17,7 +17,7 @@ ranges (s times `scales`). If the oracle flips the sample at s, the range suffic
 speed; if not even the oracle can, no STM with this bias can.
 
 Reward probe (Dave 9 Nov 2026), `rewards`: a fresh STM, no replay, up to `repeats` repeats, once per reward type
-(the run's p(y) "accuracy", log p(y) clipped at a low floor, the logit margin), each from the same random state, so
+(the run's p(y) "accuracy", log p(y) clipped at a low floor, the logit margin, the p(y) + log p(y) composite), each from the same random state, so
 the conditions differ only in the reward. Tests whether a reward with a slope at tiny p(y) lets the STM find the bias
 the oracle finds.
 """
@@ -86,7 +86,7 @@ def oracle(model, x, y, scales=(1, 2, 4, 8), steps=500, lr=0.1, record=(0, 10, 2
 
 
 def rewards(model, x, y, types=("accuracy", "log-accuracy", "margin"), repeats=1024, log_p_floor=1e-8,
-            margin_clip=20.0):
+            margin_clip=20.0, log_weight=1.0):
     """One trace record per reward type: fresh STM, no replay, cap `repeats`, the live STM's settings otherwise."""
     records = []
     with torch.random.fork_rng(devices=[]):
@@ -96,13 +96,14 @@ def rewards(model, x, y, types=("accuracy", "log-accuracy", "margin"), repeats=1
             m = copy.deepcopy(model)
             m.stm = m.stm_factory()
             m.stm.model.config = dataclasses.replace(m.stm.model.config, reward_type=r,
-                                                     log_p_floor=math.log(log_p_floor), margin_clip=margin_clip)
+                                                     log_p_floor=math.log(log_p_floor), margin_clip=margin_clip,
+                                                     log_weight=log_weight)
             m.interleave = 0
             m.repeats = repeats
             m.trace = []
             m._live(x, y)
             records.append({**m.trace[0], "reward": r, "log_p_floor": log_p_floor, "margin_clip": margin_clip,
-                            "repeats_cap": repeats})
+                            "log_weight": log_weight, "repeats_cap": repeats})
     return records
 
 
