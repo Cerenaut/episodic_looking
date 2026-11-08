@@ -38,6 +38,8 @@ def parse_args(argv=None):
                         "to run the factorial STM probe (stm_probe.py) on the live sample; to stm_probe.jsonl")
     p.add_argument("--stm-probe-temperature", type=float, default=4.0)
     p.add_argument("--stm-probe-ceiling", type=int, default=1024, help="repeats of the probe's ceiling condition")
+    p.add_argument("--stm-probe-kind", default="factorial", choices=("factorial", "oracle"),
+                   help="factorial: the STM conditions; oracle: the gradient-optimal bias at several ranges (stm_probe.py)")
     p.add_argument("--full-first-task", action="store_true",
                    help="--max-exposures applies to the tasks after the first only (the first runs in full)")
     return p.parse_args(argv)
@@ -161,8 +163,12 @@ def main(argv=None):
                 if probe_file is not None and ti > 0 and tt + 1 in probe_at and isinstance(model, CLSModel) \
                         and model.online:
                     gi = group_index[train.groups[k]]
-                    for rec in stm_probe.probe(model, train.x[idx], train.y[idx], args.stm_probe_temperature,
-                                               args.stm_probe_ceiling):
+                    if args.stm_probe_kind == "oracle":
+                        recs = stm_probe.oracle(model, train.x[idx], train.y[idx])
+                    else:
+                        recs = stm_probe.probe(model, train.x[idx], train.y[idx], args.stm_probe_temperature,
+                                               args.stm_probe_ceiling)
+                    for rec in recs:
                         rec.update(task=ti, t_task=tt + 1, group=int(group_ids[gi]), n=int(n[gi]) + 1,
                                    exposures_since_reset=model.exposures - model.last_reset)
                         probe_file.write(json.dumps(rec) + "\n")

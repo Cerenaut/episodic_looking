@@ -376,6 +376,25 @@ class TestCLSScheduling(unittest.TestCase):
         self.assertEqual(runs[0][0], runs[1][0])
         torch.testing.assert_close(runs[0][1], runs[1][1])
 
+    def test_oracle_bias_raises_p_and_leaves_model_unchanged(self):
+        from single_stream import stm_probe
+        torch.manual_seed(0)
+        cls, _ = self._cls(period=100, repeats=2)
+        x, y = torch.rand(1, 49 * 8), torch.tensor([3])
+        cls.observe(x, y)
+        before = cls.predict(x)
+        params = [q.detach().clone() for q in cls.stm.ltm.parameters()]
+        recs = stm_probe.oracle(cls, x, y, scales=(1, 4), steps=50, record=(0, 50))
+        self.assertEqual([r["oracle_scale"] for r in recs], [1, 4])
+        self.assertAlmostEqual(recs[1]["bias_scale"], 4 * recs[0]["bias_scale"], places=5)
+        for r in recs:
+            self.assertGreater(r["p_end"], r["p"][0][1])
+        self.assertGreaterEqual(recs[1]["p_end"], recs[0]["p_end"] - 1e-6)
+        torch.testing.assert_close(cls.predict(x), before)
+        for q, q0 in zip(cls.stm.ltm.parameters(), params):
+            self.assertTrue(q.requires_grad)
+            torch.testing.assert_close(q, q0)
+
     def test_no_reset_by_default(self):
         cls, _ = self._cls(period=4, repeats=2)
         first = cls.stm

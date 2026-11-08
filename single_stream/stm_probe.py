@@ -10,11 +10,17 @@ loop on that sample under each condition, all from the same LTM weights:
 
 Each condition records the CLSModel trace (p(y) before, per block, at the end; repeats; stop reason). The live model
 is not touched, and the probe runs under a forked RNG, so the training trajectory is unchanged.
+
+Oracle bias test (Dave 9 Nov 2026), `oracle`: on the same sample and LTM weights, optimise the bias itself by gradient
+(Adam on the raw bias, cross-entropy on y, no RL) within the LTM's bias range (gain exp(s tanh(a))) and with wider
+ranges (s times `scales`). If the oracle flips the sample at s, the range suffices and the STM lacks a signal or
+speed; if not even the oracle can, no STM with this bias can.
 """
 import copy
 import itertools
 
 import torch
+import torch.nn.functional as F
 
 
 class SoftLogits:
@@ -39,6 +45,37 @@ def conditions(temperature, ceiling_repeats):
            for stm, replay, t in itertools.product(("as_is", "fresh"), (True, False), temps)]
     out.append({"stm": "fresh", "replay": False, "temperature": 1.0, "repeats": ceiling_repeats})
     return out
+
+
+def oracle(model, x, y, scales=(1, 2, 4, 8), steps=500, lr=0.1, record=(0, 10, 25, 50, 100, 200, 500)):
+    """Gradient-optimal bias on (x, y) for copies of the LTM with bias range s * scale; one record per scale: p(y)
+    at the `record` steps, the final top class, and the fraction of bias elements near the bound (|tanh(a)| > .95)."""
+    records = []
+    for k in scales:
+        net = copy.deepcopy(model.stm.ltm)
+        net.eval()
+        net.bias_scale = net.bias_scale * k
+        for q in net.parameters():
+            q.requires_grad_(False)
+        a = torch.zeros(len(y), net.bias_size, requires_grad=True)
+        opt = torch.optim.Adam([a], lr=lr)
+        rec = {"oracle_scale": k, "bias_scale": float(net.bias_scale), "p": []}
+        for t in range(steps + 1):
+            logits = net.run(x, a)["logits"]
+            if t in record:
+                with torch.no_grad():
+                    rec["p"].append([t, float(F.softmax(logits, 1).gather(1, y[:, None]).mean())])
+            if t == steps:
+                break
+            loss = F.cross_entropy(logits, y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        with torch.no_grad():
+            rec.update(p_end=rec["p"][-1][1], top=int(logits.argmax(1)[0]),
+                       saturated=float((torch.tanh(a).abs() > 0.95).float().mean()))
+        records.append(rec)
+    return records
 
 
 def probe(model, x, y, temperature=4.0, ceiling_repeats=1024):
