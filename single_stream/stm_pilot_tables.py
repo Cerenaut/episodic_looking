@@ -1,4 +1,4 @@
-"""Tables for the STM pilot report (8 Nov 2026): each STM run of batches 1-4 against the LTM alone with the same LTM
+"""Tables for the STM pilot report (8 Nov 2026): each STM run of batches 1-5 against the LTM alone with the same LTM
 settings, on task 2. Few-shot (Memorisation, Generalisation, Protection) at a class's n-th exposure, mean over the
 classes that reached n; held-out accuracy at the checkpoints both runs share; the STM's effect on identical LTM
 weights (stm_step_acc last - first, 1,000 held-out images), mean over task 2's checkpoints. Markdown to stdout.
@@ -28,6 +28,8 @@ for fam, c in (("lp", 512), ("dih", 512), ("lp", 128)):
               ("batch3", f"batch3/D_{fam}_c{c}", f"batch3/ltmfifo_{fam}_c{c}", f"{fam} c{c} P256", "D (FIFO 2048)", 2048),
               ("batch4", f"batch4/B500_{fam}_c{c}", f"batch4/ltmfifo500_{fam}_c{c}", f"{fam} c{c} P256",
                "B, LTM FIFO 500", 2048)]
+    PAIRS += [("batch5", f"batch5/{r}_{fam}_c{c}", base, f"{fam} c{c} P256", label, 2048)
+              for r, label in (("acc", "A what, p(y)"), ("cw1", "A what, composite w 1"), ("cw05", "A what, composite w .5"))]
 
 
 def load(run, d):
