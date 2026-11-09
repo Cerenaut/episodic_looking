@@ -3,7 +3,10 @@ the LTM alone with the same LTM buffer. A: STM replays from the LTM's priority b
 FIFO buffer (256), LTM priority 500; D: own STM FIFO (256), LTM FIFO 2,048. Cap 256 repeats. The priority-500 LTM
 baseline and the cap-16 STM are batch 2's runs (cut at 2,048 exposures).
 
-    python -m single_stream.plot_stm_batch3 --run runs_ss/mnist_clustered_single_stream/stm_pilot --out <dir>
+`--rewards`: the same panels for batch 5 (9 Nov 2026): A with the "what" bias under the p(y) reward and the composite
+(accuracy-log, w 1 and .5), against the LTM alone and batch 3's A ("where", p(y)).
+
+    python -m single_stream.plot_stm_batch3 --run runs_ss/mnist_clustered_single_stream/stm_pilot --out <dir> [--rewards]
 """
 import argparse
 import json
@@ -29,6 +32,13 @@ MODELS = [  # (directory pattern, label, colour, line style)
     ("batch3/ltmfifo_{f}_c{c}", "LTM alone, FIFO 2,048", SERIES[0], "--"),
     ("batch3/D_{f}_c{c}", "D: own STM FIFO 256, LTM FIFO 2,048", SERIES[2], "--"),
 ]
+REWARD_MODELS = [
+    ("batch2/ltm_{f}_c{c}_P256", "LTM alone, priority 500", SERIES[0], "-"),
+    ("batch3/A_{f}_c{c}", "A, \"where\" bias, p(y) reward (batch 3)", SERIES[1], ":"),
+    ("batch5/acc_{f}_c{c}", "A, \"what\" bias, p(y) reward", SERIES[1], "-"),
+    ("batch5/cw1_{f}_c{c}", "A, \"what\" bias, composite reward w 1", SERIES[2], "-"),
+    ("batch5/cw05_{f}_c{c}", "A, \"what\" bias, composite reward w .5", SERIES[2], "--"),
+]
 MAX_T = 2048
 
 
@@ -36,11 +46,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--rewards", action="store_true", help="batch 5: p(y) vs composite reward")
     args = ap.parse_args()
+    models = REWARD_MODELS if args.rewards else MODELS
     os.makedirs(args.out, exist_ok=True)
     fig, axes = plt.subplots(len(FS), len(CONFIGS), figsize=(16, 10.5), facecolor=SURFACE, sharex=True, sharey=True)
     for j, (fam, c) in enumerate(CONFIGS):
-        for pattern, label, colour, ls in MODELS:
+        for pattern, label, colour, ls in models:
             path = os.path.join(args.run, pattern.format(f=fam, c=c), "fewshot.jsonl")
             rows = [r for r in map(json.loads, open(path)) if r["task"] == 1 and r["t_task"] <= MAX_T]
             for i, (key, _) in enumerate(FS):
@@ -65,12 +77,13 @@ def main():
                 ax.set_ylabel(title.replace(" (", "\n("), fontsize=8.5, color=INK)
     h, l = axes[0, 0].get_legend_handles_labels()
     fig.legend(h, l, loc="lower center", frameon=False, fontsize=10, labelcolor=INK, ncol=3)
-    fig.suptitle("STM pilot batch 3 (seed 0): few-shot in task 2's first 2,048 exposures, mean over the classes seen. "
+    head = ("STM batch 5 (seed 0), the STM's reward" if args.rewards else "STM pilot batch 3 (seed 0)")
+    fig.suptitle(f"{head}: few-shot in task 2's first 2,048 exposures, mean over the classes seen. "
                  "Grey bands: a sleep (LTM update + STM reset)\nfalls between those exposures (sleeps at 16, 272, "
                  "528 ... exposures after the switch; clusters start at multiples of c).",
                  color=INK, x=0.01, ha="left", fontsize=11.5)
     fig.tight_layout(rect=(0, 0.06, 1, 0.95))
-    save(fig, args, "stm_batch3_fewshot.png")
+    save(fig, args, "stm_batch5_fewshot.png" if args.rewards else "stm_batch3_fewshot.png")
 
 
 if __name__ == "__main__":
