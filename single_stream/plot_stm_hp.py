@@ -1,7 +1,8 @@
 """STM hyperparameter search (10 Nov 2026): few-shot within task 2 (its first 2,048 exposures) for each setting,
 mean over seeds 0 and 1, against the LTM alone, laid out as the batch 3 figure (plot_stm_batch3). Stage 1: around
 batch 5's composite reward w 1 (log weight w 2, 4; cap 512). Stage 2: around stage 1's winner, w 1
-cap 512 (2a: stop threshold, exploration, STM learning rate; 2b: interleaved replay, w 2).
+cap 512 (2a: stop threshold, exploration, STM learning rate; 2b: interleaved replay, w 2). Stage 3: the four
+contenders (stage 1 best, interleave 0, stop .9, both) at seeds 0, 1 and 2.
 
     python -m single_stream.plot_stm_hp --run runs_ss/mnist_clustered_single_stream/stm_pilot --stage 1 --out <dir>
 """
@@ -37,6 +38,12 @@ STAGES["2a"] = [LTM, CAP512, HP2("stop09", "stop at p(y) .9", SERIES[1]), HP2("s
                 HP2("lr002", "STM lr .02", SERIES[5])]
 STAGES["2b"] = [LTM, CAP512, HP2("il0", "no interleaved replay", SERIES[1]),
                 HP2("il2", "2 interleaved replay episodes", SERIES[2]), HP2("w2", "log weight w 2", SERIES[3])]
+S3 = lambda arm, d, label, colour, ls="-": ({0: f"{d}/{arm}_{{f}}_c{{c}}_s0", 1: f"{d}/{arm}_{{f}}_c{{c}}_s1",
+                                              2: f"seed2/{arm}_{{f}}_c{{c}}_s2"}, label, colour, ls)
+STAGES[3] = [({**LTM[0], 2: "seed2/ltm_{f}_c{c}_s2"}, *LTM[1:]),
+             S3("cap512", "hp1", "STM, stage 1 best (w 1, cap 512)", INK2, "--"),
+             S3("il0", "hp2", "no interleaved replay", SERIES[1]), S3("stop09", "hp2", "stop at p(y) .9", SERIES[2]),
+             S3("stop09il0", "hp3", "stop at p(y) .9 + no interleaved replay", SERIES[3])]
 STAGES = {str(k): v for k, v in STAGES.items()}
 MAX_T = 2048
 
@@ -81,7 +88,9 @@ def main():
                 ax.set_ylabel(title.replace(" (", "\n("), fontsize=8.5, color=INK)
     h, l = axes[0, 0].get_legend_handles_labels()
     fig.legend(h, l, loc="lower center", frameon=False, fontsize=10, labelcolor=INK, ncol=3)
-    fig.suptitle(f"STM hyperparameter search, stage {args.stage} (\"what\" bias; mean of seeds 0 and 1): few-shot in "
+    seeds = [str(k) for k in max((p for p, *_ in STAGES[args.stage]), key=len)]
+    seeds = ", ".join(seeds[:-1]) + " and " + seeds[-1]
+    fig.suptitle(f"STM hyperparameter search, stage {args.stage} (\"what\" bias; mean of seeds {seeds}): few-shot in "
                  "task 2's first 2,048 exposures,\nmean over the classes seen. Grey bands: a sleep (LTM update + STM "
                  "reset) falls between those exposures.", color=INK, x=0.01, ha="left", fontsize=11.5)
     fig.tight_layout(rect=(0, 0.08, 1, 0.95))
