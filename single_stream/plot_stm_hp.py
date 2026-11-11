@@ -1,6 +1,7 @@
 """STM hyperparameter search (10 Nov 2026): few-shot within task 2 (its first 2,048 exposures) for each setting,
 mean over seeds 0 and 1, against the LTM alone, laid out as the batch 3 figure (plot_stm_batch3). Stage 1: around
-batch 5's composite reward w 1 (log weight w 2, 4; cap 512). Stage 2: around stage 1's winner, cap 512.
+batch 5's composite reward w 1 (log weight w 2, 4; cap 512). Stage 2: around stage 1's winner, w 1
+cap 512 (2a: stop threshold, exploration, STM learning rate; 2b: interleaved replay, w 2).
 
     python -m single_stream.plot_stm_hp --run runs_ss/mnist_clustered_single_stream/stm_pilot --stage 1 --out <dir>
 """
@@ -15,7 +16,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from single_stream.plot_stm_frozen import INK, SERIES, SURFACE
+from single_stream.plot_stm_frozen import INK, INK2, SERIES, SURFACE
 from single_stream.plot_stm_pilot import FAMNAME, FS, NS
 from single_stream.plot_wave8 import save, style
 
@@ -29,6 +30,14 @@ STAGES = {  # setting: ({seed: directory pattern}, label, colour, line style)
         ({s: f"hp1/w4_{{f}}_c{{c}}_s{s}" for s in (0, 1)}, "STM, composite w 4, cap 256", SERIES[4], "-"),
         ({s: f"hp1/cap512_{{f}}_c{{c}}_s{s}" for s in (0, 1)}, "STM, composite w 1, cap 512", SERIES[5], "-")],
 }
+CAP512 = ({s: f"hp1/cap512_{{f}}_c{{c}}_s{s}" for s in (0, 1)}, "STM, stage 1 best (w 1, cap 512)", INK2, "--")
+HP2 = lambda arm, label, colour: ({s: f"hp2/{arm}_{{f}}_c{{c}}_s{s}" for s in (0, 1)}, label, colour, "-")
+STAGES["2a"] = [LTM, CAP512, HP2("stop09", "stop at p(y) .9", SERIES[1]), HP2("std025", "policy std .25", SERIES[2]),
+                HP2("std1", "policy std 1", SERIES[3]), HP2("lr0005", "STM lr .005", SERIES[4]),
+                HP2("lr002", "STM lr .02", SERIES[5])]
+STAGES["2b"] = [LTM, CAP512, HP2("il0", "no interleaved replay", SERIES[1]),
+                HP2("il2", "2 interleaved replay episodes", SERIES[2]), HP2("w2", "log weight w 2", SERIES[3])]
+STAGES = {str(k): v for k, v in STAGES.items()}
 MAX_T = 2048
 
 
@@ -47,7 +56,7 @@ def curve(run, patterns, fam, c, key):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True)
-    ap.add_argument("--stage", type=int, required=True)
+    ap.add_argument("--stage", required=True, choices=list(STAGES))
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
@@ -71,11 +80,11 @@ def main():
             if j == 0:
                 ax.set_ylabel(title.replace(" (", "\n("), fontsize=8.5, color=INK)
     h, l = axes[0, 0].get_legend_handles_labels()
-    fig.legend(h, l, loc="lower center", frameon=False, fontsize=10, labelcolor=INK, ncol=2)
+    fig.legend(h, l, loc="lower center", frameon=False, fontsize=10, labelcolor=INK, ncol=3)
     fig.suptitle(f"STM hyperparameter search, stage {args.stage} (\"what\" bias; mean of seeds 0 and 1): few-shot in "
                  "task 2's first 2,048 exposures,\nmean over the classes seen. Grey bands: a sleep (LTM update + STM "
                  "reset) falls between those exposures.", color=INK, x=0.01, ha="left", fontsize=11.5)
-    fig.tight_layout(rect=(0, 0.07, 1, 0.95))
+    fig.tight_layout(rect=(0, 0.08, 1, 0.95))
     save(fig, args, f"stm_hp{args.stage}_fewshot.png")
 
 
