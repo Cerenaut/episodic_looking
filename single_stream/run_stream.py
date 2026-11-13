@@ -45,10 +45,11 @@ def build_parser(description=__doc__):
     p.add_argument("--cluster-size", type=int, default=1, help="c")
     p.add_argument("--batch-size", type=int, default=1, help="b")
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--model", default="ltm", choices=["ltm", "replay", "replayonly", "buffered", "cls"],
+    p.add_argument("--model", default="ltm", choices=["ltm", "replay", "replayonly", "buffered", "cls", "head"],
                    help="ltm: trained on the stream; replay: stream + reservoir replay mixed into each step; "
                         "replayonly: trained only from the replay buffer; buffered: replayonly with a pluggable, "
-                        "novelty-gated buffer (--buffer); cls: buffered LTM (--net transformer) + RL STM (--stm-*)")
+                        "novelty-gated buffer (--buffer); cls: buffered LTM (--net transformer) + RL STM (--stm-*); "
+                        "head: buffered LTM (--net transformer) + a comparison head on its features (--head-*)")
     p.add_argument("--net", default="mlp", choices=["mlp", "resmlp", "transformer"])
     p.add_argument("--preproc", default="",
                    help="frozen preprocessor checkpoint (single_stream.preprocessor): inputs become its tokens")
@@ -128,6 +129,22 @@ def build_parser(description=__doc__):
     p.add_argument("--stm-buffer-capacity", type=int, default=256)
     p.add_argument("--stm-trace", action="store_true",
                    help="diagnostic: log the STM's adaptive loop per live exposure to stm_trace.jsonl (run_tasks)")
+    p.add_argument("--head", default="knn", choices=["knn", "fly", "sdmlp"],
+                   help="--model head: the fast head replacing the LTM's output while awake (single_stream/heads.py)")
+    p.add_argument("--head-replay", type=float, default=1.0,
+                   help="head: buffer samples it is also fitted on per exposure (the STM's interleaved replay)")
+    p.add_argument("--head-no-reset", action="store_true", help="head: keep it across sleeps (default: reset)")
+    p.add_argument("--head-delay", type=int, default=0, help="head: online after this many exposures (as --stm-delay)")
+    p.add_argument("--knn-k", type=int, default=1, help="knn head: neighbours")
+    p.add_argument("--knn-capacity", type=int, default=4096, help="knn head: most recent samples kept")
+    p.add_argument("--fly-kc", type=int, default=2000, help="fly head: Kenyon cells")
+    p.add_argument("--fly-response", type=int, default=16, help="fly head: ones per row of the projection")
+    p.add_argument("--fly-k-frac", type=float, default=0.05, help="fly head: fraction of KCs kept by the WTA")
+    p.add_argument("--fly-lr", type=float, default=0.2, help="fly head: Hebbian rate")
+    p.add_argument("--sdmlp-neurons", type=int, default=1000, help="sdmlp head: hidden neurons")
+    p.add_argument("--sdmlp-k", type=int, default=32, help="sdmlp head: Top-K")
+    p.add_argument("--sdmlp-gaba", type=int, default=100, help="sdmlp head: activations per neuron to switch GABA")
+    p.add_argument("--sdmlp-lr", type=float, default=0.05, help="sdmlp head: SGD lr")
     p.add_argument("--stm-delay", type=int, default=0,
                    help="cls: exposures before the STM comes online (until then the model is its LTM, sleeps as usual)")
     p.add_argument("--sleep-reset-stm", action="store_true",
@@ -182,7 +199,7 @@ def build_model(args, train, token_shape=None):
         return ReplayOnlyLTM(net, capacity=args.replay_capacity, batch=args.replay_batch, period=args.replay_period,
                              steps=args.replay_steps, policy=args.replay_policy, store_uint8=not args.replay_float,
                              input_shape=train.x.shape[1:], seed=args.seed, **common)
-    if args.model in ("buffered", "cls"):
+    if args.model in ("buffered", "head", "cls"):
         if args.steps != 1:
             raise ValueError("buffered uses --replay-steps, not --steps")
         del common["steps"]
@@ -201,6 +218,8 @@ def build_model(args, train, token_shape=None):
                                 steps=args.replay_steps, optimizer=args.optimizer, live=args.replay_live, **common)
         if args.model == "buffered":
             return ltm
+        if args.model == "head":
+            return build_head_model(args, ltm, net, train.num_classes)
         if args.replay_live:
             raise ValueError("cls: the LTM learns only in sleep (no --replay-live)")
         stm = build_stm(args, net, train.num_classes)
@@ -223,6 +242,25 @@ def build_model(args, train, token_shape=None):
                         stm_buffer=stm_buffer)
     return ReplayLTM(net, capacity=args.replay_capacity, replay_batch=args.replay_batch,
                      input_shape=train.x.shape[1:], seed=args.seed, **common)
+
+
+def build_head_model(args, ltm, net, num_classes):
+    from single_stream.heads import FlyHead, HeadModel, KNNHead, SDMLPHead
+
+    if args.net != "transformer":
+        raise ValueError("--model head needs --net transformer (the LTM's features)")
+    if args.replay_live:
+        raise ValueError("head: the LTM learns only in sleep (no --replay-live)")
+    d = net.d_model
+    if args.head == "knn":
+        head = KNNHead(d, num_classes, k=args.knn_k, capacity=args.knn_capacity)
+    elif args.head == "fly":
+        head = FlyHead(d, num_classes, n_kc=args.fly_kc, n_response=args.fly_response, k_frac=args.fly_k_frac,
+                       lr=args.fly_lr, seed=args.seed)
+    else:
+        head = SDMLPHead(d, num_classes, nneurons=args.sdmlp_neurons, k=args.sdmlp_k, gaba_switch=args.sdmlp_gaba,
+                         lr=args.sdmlp_lr, seed=args.seed)
+    return HeadModel(ltm, head, replay=args.head_replay, reset_on_sleep=not args.head_no_reset, delay=args.head_delay)
 
 
 def build_stm(args, net, num_classes):
