@@ -11,6 +11,12 @@ Metrics (one name each; phase 1 = the stream up to the 64th nine; phase 2 = digi
   Protection-2    worst accuracy on the digits other than 7 and 9 over phase 2
 
     python -W ignore -m single_stream.plot_final --run runs_ss/stm_frozen_20261101/snap9 --out <dir>
+
+--set cmp (Dave 14 Nov 2026): the comparison models in place of the best of each architecture: the RL STM (sleep +
+reset), the LTM ladder and ER as they exist in snap9 (the snapshot is the pre-trained LTM: ladder 1 = the LTM trained
+on each sample, gentlest lr; + its sleep; ER = "balanced": live + 15 seen replay, 4 steps), and the kNN, FlyModel and
+SDMLP heads (stm_frozen head; w17 / w17b), reset at the sleep or kept. Same phase-1, phase-2 and summary figures
+(cmp_*.png, axes scaled to the data); no search figure.
 """
 import argparse
 import json
@@ -24,7 +30,7 @@ import matplotlib.ticker
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from single_stream.plot_stm_frozen import INK, SERIES, SURFACE
+from single_stream.plot_stm_frozen import INK, INK2, SERIES, SURFACE
 from single_stream.plot_wave8 import GREY, save, style
 
 RUN = None
@@ -78,6 +84,16 @@ BEST = [("STM only", "w16_stm_sweep64", "w16b_stm_none", INK, "-"),
         ("LTM only, gentlest + sleep", "w16_ltm_3e-5_sl16_1e-4_k25", "w16b_ltm_3e-5_gentle", SERIES[2], "-"),
         ("hybrid, balanced LTM", "w15_hyb_o1_rp15_lr1e-4_k4_base", "w16b_hyb_k4_none", SERIES[4], "-"),
         ("hybrid, gentlest LTM", "w15_hyb_o2_lr3e-5_base", "w16b_hyb_3e-5_none", SERIES[4], "--")]
+
+CMP = [("LTM + RL STM, sleep + reset", "w16_stm_sl16_1e-4_k100_reset", "w16b_stm_middle_reset", SERIES[1], "-"),
+       ("LTM, each sample (ladder 1)", "w16_ltm_3e-5_sweep64", "w16b_ltm_3e-5_none", INK2, ":"),
+       ("LTM, each sample + sleep", "w16_ltm_3e-5_sl16_1e-4_k25", "w16b_ltm_3e-5_gentle", SERIES[0], "-"),
+       ("ER (live + 15 seen replay)", "w16_ltm_k4_sweep64", "w16b_ltm_k4_none", INK, "-.")] + [
+       (f"{name} head, {'reset' if r == 'reset' else 'kept'}", f"w17_head_{h}_{r}", f"w17b_head_{h}_{r}", col,
+        "-" if r == "reset" else "--")
+       for h, name, col in (("knn", "kNN", SERIES[2]), ("fly", "FlyModel", SERIES[3]), ("sdmlp", "SDMLP", SERIES[4]))
+       for r in ("reset", "keep")]
+PREFIX = "final"  # output file prefix; "cmp" with --set cmp (axes then scaled to the data)
 
 
 def hists(cfg):
@@ -156,9 +172,18 @@ def fig_search(args):
     return rows
 
 
+def legend(fig, ax, loc):
+    """In the panel (the original figures), or below the panels (cmp: too many models to fit in one)."""
+    if PREFIX == "final":
+        ax.legend(loc=loc, frameon=False, fontsize=8.5, labelcolor=INK)
+        return
+    h, l = ax.get_legend_handles_labels()
+    fig.legend(h, l, loc="lower center", frameon=False, fontsize=9, labelcolor=INK, ncol=5)
+
+
 def fig_phase1(args):
     ns = list(range(1, P1 + 1))
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8), facecolor=SURFACE)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8 if PREFIX == "final" else 5.8), facecolor=SURFACE)
     p1 = lambda e: not e.get("new2_samples")
     for label, cfg, _, col, ls in BEST:
         H = hists(cfg)
@@ -174,19 +199,20 @@ def fig_phase1(args):
         ax.axvline(16, color=GREY, lw=1, ls=":", zorder=1)
     axes[0].set_ylim(0, 1.03)
     axes[1].set_ylim(0, 1.0)
-    axes[2].set_ylim(0.88, 0.975)
-    axes[1].legend(loc="upper left", frameon=False, fontsize=8.5, labelcolor=INK)
-    fig.suptitle("Phase 1: the best model of each architecture (mean of 5 seeds; sleeps at the 16th nine, dotted)",
+    if PREFIX == "final":
+        axes[2].set_ylim(0.88, 0.975)
+    legend(fig, axes[1], "upper left")
+    fig.suptitle(f"Phase 1: {TITLE} (mean of 5 seeds; sleeps at the 16th nine, dotted)",
                  color=INK, x=0.01, ha="left", fontsize=12)
-    fig.tight_layout(rect=(0, 0, 1, 0.92))
-    save(fig, args, "final_phase1.png")
+    fig.tight_layout(rect=(0, 0.16 if PREFIX == "cmp" else 0, 1, 0.92))
+    save(fig, args, f"{PREFIX}_phase1.png")
 
 
 def fig_phase2(args):
     """Phase 2 (experiment B): sleeps, if any, are between the phases. x: 7s presented, the end at END."""
     end = 153
     ns = list(range(0, 65))
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8), facecolor=SURFACE)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8 if PREFIX == "final" else 5.8), facecolor=SURFACE)
     for label, _, cfg, col, ls in BEST:
         H = hists(cfg)
         for ax, key in zip(axes, ("new2_recall", "new_recall", "others2_acc")):
@@ -201,14 +227,15 @@ def fig_phase2(args):
         t = [0, 1, 2, 4, 8, 16, 32, 64, end]
         ax.set_xticks(t)
         ax.set_xticklabels([str(v) for v in t[:-1]] + ["end"])
-    axes[0].set_ylim(0.78, 1.0)
-    axes[1].set_ylim(0.5, 1.0)
-    axes[2].set_ylim(0.9, 0.975)
-    axes[1].legend(loc="lower left", frameon=False, fontsize=8.5, labelcolor=INK)
+    if PREFIX == "final":
+        axes[0].set_ylim(0.78, 1.0)
+        axes[1].set_ylim(0.5, 1.0)
+        axes[2].set_ylim(0.9, 0.975)
+    legend(fig, axes[1], "lower left")
     fig.suptitle("Phase 2: digit 7 at 75%, no nines; the same models (mean of 5 seeds)", color=INK, x=0.01,
                  ha="left", fontsize=12)
-    fig.tight_layout(rect=(0, 0, 1, 0.92))
-    save(fig, args, "final_phase2.png")
+    fig.tight_layout(rect=(0, 0.16 if PREFIX == "cmp" else 0, 1, 0.92))
+    save(fig, args, f"{PREFIX}_phase2.png")
 
 
 SLEEP_AT = 16
@@ -228,11 +255,14 @@ def summary(args):
     S = []
     for label, c1, c2, col, ls in BEST:
         H1 = hists(c1)
-        S.append((label, col, ls, phase1(H1) + phase2(hists(c2)), None))
+        v = phase1(H1) + phase2(hists(c2))
+        S.append((label, col, ls, v + ((float(np.mean(v)),) if PREFIX == "cmp" else ()), None))  # cmp: + Overall
         if any(e.get("after_sleep") for e in H1[0]):
             pre, post = at_sleep(H1)
             S.append((f"  {SLEEP_AT} nines: pre \u2192 post sleep", col, ls, None, (pre, post)))
-    fig, axes = plt.subplots(1, 6, figsize=(16, 4.6), facecolor=SURFACE, sharey=True)
+    names = NAMES + (("Overall",) if PREFIX == "cmp" else ())
+    fig, axes = plt.subplots(1, len(names), figsize=(16 if PREFIX == "final" else 18, max(4.6, 0.36 * len(S) + 1.2)),
+                             facecolor=SURFACE, sharey=True)
     ys = np.arange(len(S))[::-1]
     fmt = lambda j, x: f"{x:.2f}" if j not in (2, 5) else f"{x:.3f}"
     for j, ax in enumerate(axes):
@@ -260,7 +290,7 @@ def summary(args):
         lo, hi = min(vals), max(vals)
         span = hi - lo
         ax.set_xlim(lo - 0.25 * span - 0.01, hi + 0.25 * span + 0.01)
-        style(ax, NAMES[j], xlabel="")
+        style(ax, names[j], xlabel="")
         ax.set_ylim(-0.6, len(S) - 0.3)
     axes[0].set_yticks(ys)
     axes[0].set_yticklabels([s[0] for s in S])
@@ -268,11 +298,11 @@ def summary(args):
         if v is None:
             t.set_fontsize(8.5)
             t.set_color(GREY)
-    fig.suptitle("The six metrics for the best model of each architecture (mean of 5 seeds; each axis zoomed to its "
+    fig.suptitle(f"The six metrics for {TITLE} (mean of 5 seeds; each axis zoomed to its "
                  "own range); open = just before the sleep, filled = just after", color=INK, x=0.01, ha="left",
                  fontsize=11.5)
-    fig.tight_layout(rect=(0, 0, 1, 0.9))
-    save(fig, args, "final_summary.png")
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.46 / fig.get_figheight()))  # 0.9 at the original height
+    save(fig, args, f"{PREFIX}_summary.png")
     return S
 
 
@@ -281,15 +311,16 @@ def table(args, rows, S):
          "| family | configuration | kind | Memorisation | Generalisation | Protection |", "|---|---|---|---|---|---|"]
     for fam, label, kind, m, g, p in rows:
         L.append(f"| {fam} | {label} | {kind} | {m:.2f} | {g:.2f} | {p:.3f} |")
-    L += ["", "## Best model of each architecture", "", "| model | " + " | ".join(NAMES) + " |",
-          "|---|" + "---|" * len(NAMES)]
+    names = NAMES + (("Overall",) if PREFIX == "cmp" else ())
+    L += ["", "## Best model of each architecture", "", "| model | " + " | ".join(names) + " |",
+          "|---|" + "---|" * len(names)]
     for label, _, _, v, pp in S:
         if v is not None:
             L.append(f"| {label} | " + " | ".join(f"{x:.3f}" for x in v) + " |")
         else:
             L.append(f"| {label.strip()} | " + " | ".join(f"{a:.3f} -> {b:.3f}" for a, b in zip(*pp))
-                     + " | - | - | - |")
-    path = os.path.join(args.out, "final_tables.md")
+                     + " | - | - | - |" + (" - |" if PREFIX == "cmp" else ""))
+    path = os.path.join(args.out, f"{PREFIX}_tables.md")
     open(path, "w").write("\n".join(L) + "\n")
     print(path)
 
@@ -333,16 +364,22 @@ def fig_recap(args, tables):
     save(fig, args, "final_recap.png")
 
 
+TITLE = "the best model of each architecture"
+
+
 def main():
-    global RUN
+    global RUN, BEST, PREFIX, TITLE
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--recap", default="", help="task 1 round 4 stage C tables (stage_c_tables.md)")
+    ap.add_argument("--set", default="final", choices=["final", "cmp"])
     args = ap.parse_args()
     RUN = args.run
     os.makedirs(args.out, exist_ok=True)
-    rows = fig_search(args)
+    if args.set == "cmp":
+        BEST, PREFIX, TITLE = CMP, "cmp", "the comparison models"
+    rows = fig_search(args) if args.set == "final" else []
     fig_phase1(args)
     fig_phase2(args)
     S = summary(args)
