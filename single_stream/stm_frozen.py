@@ -440,7 +440,9 @@ def cmd_head(args, xt, yt, xv, yv, log):
     evaluate(0)
     for n in range(1, len(order) + 1):
         i = order[n - 1:n]
-        head.fit(features(xt[i]), yt[i])
+        f = features(xt[i])
+        for _ in range(args.head_repeats):
+            head.fit(f, yt[i])
         pending[0] += args.head_replay
         while pending[0] >= 1:
             pending[0] -= 1
@@ -824,6 +826,7 @@ def main():
                    help="rl: the STM restarts from its initial state after each sleep (head: the head does)")
     p.add_argument("--head", default="knn", choices=["knn", "fly", "sdmlp"], help="head: the comparison head")
     p.add_argument("--head-replay", type=float, default=1.0, help="head: seen-replay samples per stream sample")
+    p.add_argument("--head-repeats", type=int, default=1, help="head: fits on each stream sample (free)")
     p.add_argument("--knn-k", type=int, default=1)
     p.add_argument("--knn-capacity", type=int, default=4096)
     p.add_argument("--fly-kc", type=int, default=2000)

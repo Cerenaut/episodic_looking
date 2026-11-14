@@ -194,14 +194,14 @@ def make_head(args, dim, num_classes):
 class HeadModel(StreamModel):
     """
     The LTM (BufferedReplayLTM) with a fast head replacing its output layer while awake. Per exposure, once online:
-    predict with the head (or the LTM if the head is empty), fit the head on the live sample and on `replay` samples
+    predict with the head (or the LTM if the head is empty), fit the head on the live sample (`repeats` times) and on `replay` samples
     drawn from the LTM's buffer (fractional rates accumulate), then the LTM's own step; after an LTM update (a sleep)
     the head restarts from its initial state if `reset_on_sleep`. Features are the LTM's (net.run(x)["features"]),
     computed afresh each time.
     """
 
-    def __init__(self, ltm, head, replay=1.0, reset_on_sleep=True, delay=0):
-        self.ltm, self.head, self.replay = ltm, head, replay
+    def __init__(self, ltm, head, replay=1.0, reset_on_sleep=True, delay=0, repeats=1):
+        self.ltm, self.head, self.replay, self.repeats = ltm, head, replay, repeats
         self.initial = copy.deepcopy(head)
         self.reset_on_sleep, self.delay = reset_on_sleep, delay
         self.exposures = 0
@@ -237,7 +237,9 @@ class HeadModel(StreamModel):
             return self.ltm.observe(x, y)
         self.exposures += len(x)
         pred = self.predict(x).argmax(1)
-        self.head.fit(self._features(x), y)
+        f = self._features(x)
+        for _ in range(self.repeats):
+            self.head.fit(f, y)
         self.replay_pending += self.replay
         if self.ltm.buffer.written == 0:
             self.replay_pending = 0.0

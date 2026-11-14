@@ -77,6 +77,11 @@ class TestHeadModel(unittest.TestCase):
         self.assertEqual(model.resets, 0)
         self.assertEqual(len(model.head.labels), 4)
 
+    def test_repeats_fit_live_sample(self):
+        model = HeadModel(make_ltm(period=100), KNNHead(16, 10), replay=0.0, repeats=3)
+        model.observe(torch.rand(1, 49 * 8), torch.tensor([3]))
+        self.assertEqual(model.head.labels.tolist(), [3, 3, 3])
+
     def test_ltm_trains_only_in_sleep(self):
         ltm = make_ltm(period=8)
         before = [p.clone() for p in ltm.net.parameters()]
@@ -89,10 +94,12 @@ class TestHeadModel(unittest.TestCase):
         train = types.SimpleNamespace(x=torch.rand(4, 49 * 8), y=torch.zeros(4, dtype=torch.long), num_classes=10)
         for head, cls in (("knn", KNNHead), ("fly", FlyHead), ("sdmlp", SDMLPHead)):
             args = build_parser().parse_args(["--model", "head", "--head", head, "--net", "transformer", "--d-model",
-                                              "16", "--heads", "2", "--bias-mode", "what", "--out", "unused"])
+                                              "16", "--heads", "2", "--bias-mode", "what", "--head-repeats", "2",
+                                              "--out", "unused"])
             model = build_model(args, train, token_shape=(49, 8))
             self.assertIsInstance(model, HeadModel)
             self.assertIsInstance(model.head, cls)
+            self.assertEqual(model.repeats, 2)
 
 
 if __name__ == "__main__":

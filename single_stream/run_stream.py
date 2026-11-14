@@ -133,6 +133,7 @@ def build_parser(description=__doc__):
                    help="--model head: the fast head replacing the LTM's output while awake (single_stream/heads.py)")
     p.add_argument("--head-replay", type=float, default=1.0,
                    help="head: buffer samples it is also fitted on per exposure (the STM's interleaved replay)")
+    p.add_argument("--head-repeats", type=int, default=1, help="head: fits on the live sample per exposure (free)")
     p.add_argument("--head-no-reset", action="store_true", help="head: keep it across sleeps (default: reset)")
     p.add_argument("--head-delay", type=int, default=0, help="head: online after this many exposures (as --stm-delay)")
     p.add_argument("--knn-k", type=int, default=1, help="knn head: neighbours")
@@ -252,7 +253,8 @@ def build_head_model(args, ltm, net, num_classes):
     if args.replay_live:
         raise ValueError("head: the LTM learns only in sleep (no --replay-live)")
     return HeadModel(ltm, make_head(args, net.d_model, num_classes), replay=args.head_replay,
-                     reset_on_sleep=not args.head_no_reset, delay=args.head_delay)
+                     reset_on_sleep=not args.head_no_reset, delay=args.head_delay,
+                     repeats=args.head_repeats)
 
 
 def build_stm(args, net, num_classes):
