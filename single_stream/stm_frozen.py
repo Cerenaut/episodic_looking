@@ -308,6 +308,28 @@ def eval_checkpoints(args, order=None, yt=None):
     return c
 
 
+def evaluate_logits(args, logits, xt, yt, xe, ye, order, n):
+    """The metrics of one checkpoint for a model given as a function x -> logits (ltm: the net; head: the head, or the
+    net while the head is empty): the summary on the evaluation images, the new digit's training images (memorised =
+    those shown so far, as in rl) and, with --phase2-digit, the phase-2 keys."""
+    shots = torch.nonzero(yt == args.new_digit).flatten()
+    with torch.no_grad():
+        s = summary(logits(xe).argmax(1), ye, args.new_digit)
+        hit = (logits(xt[shots]).argmax(1) == args.new_digit).float()
+    s["new_train_recall"] = float(hit.mean())
+    seen = torch.isin(shots, order[:n])  # training nines shown so far (memorised), as in rl
+    s["shots_seen"] = int(seen.sum())
+    s["mem_seen"] = float(hit[seen].mean()) if seen.any() else None
+    s["mem_unseen"] = float(hit[~seen].mean()) if (~seen).any() else None
+    s["samples"] = n
+    s["new_samples"] = int((yt[order[:n]] == args.new_digit).sum())
+    if args.phase2_digit >= 0:
+        with torch.no_grad():
+            s.update(phase2_keys(args, logits(xe).argmax(1), ye, logits(xt[phase2_shots(args, yt)]).argmax(1), order,
+                                 n, yt))
+    return s
+
+
 def cmd_ltm(args, xt, yt, xv, yv, log):
     """The LTM's own learning from the same sample stream as `rl`: the snapshot trained on (AdamW, its lr), one
     minibatch of the last `ltm_batch` samples every `ltm_batch` samples (one sample-gradient per sample, as the
@@ -326,21 +348,7 @@ def cmd_ltm(args, xt, yt, xv, yv, log):
 
     def evaluate(n):
         net.eval()
-        shots = torch.nonzero(yt == args.new_digit).flatten()
-        with torch.no_grad():
-            s = summary(net(xe).argmax(1), ye, args.new_digit)
-            hit = (net(xt[shots]).argmax(1) == args.new_digit).float()
-        s["new_train_recall"] = float(hit.mean())
-        seen = torch.isin(shots, order[:n])  # training nines shown so far (memorised), as in rl
-        s["shots_seen"] = int(seen.sum())
-        s["mem_seen"] = float(hit[seen].mean()) if seen.any() else None
-        s["mem_unseen"] = float(hit[~seen].mean()) if (~seen).any() else None
-        s["samples"] = n
-        s["new_samples"] = int((yt[order[:n]] == args.new_digit).sum())
-        if args.phase2_digit >= 0:
-            with torch.no_grad():
-                s.update(phase2_keys(args, net(xe).argmax(1), ye, net(xt[phase2_shots(args, yt)]).argmax(1), order, n,
-                                     yt))
+        s = evaluate_logits(args, net, xt, yt, xe, ye, order, n)
         history.append(s)
         log(f"{args.name} samples {n:>6d}  acc {s['acc']:.4f}  mem {s['new_train_recall']:.3f}  new {s['new_recall']:.3f}  "
             f"others {s['others_acc']:.4f}")
@@ -390,6 +398,63 @@ def ltm_update(args, net, opt, gr, order, xt, yt, n):
         opt.zero_grad()
         loss.backward()
         opt.step()
+
+
+def cmd_head(args, xt, yt, xv, yv, log):
+    """
+    Comparison heads (Dave 14 Nov 2026) on the snapshot's features, in place of the RL STM and with the same data and
+    sleeps as rl: the LTM is frozen while awake; per stream sample the head learns the sample and --head-replay
+    samples drawn uniformly from those presented so far (the seen replay); at --sleep-at-nines the LTM sleeps exactly
+    as in rl and ltm (sleep()), and the head restarts from its initial state with --sleep-reset-stm (else it is kept,
+    on the LTM's changed features). While the head is empty the model answers with the LTM. Same stream,
+    checkpoints and metrics as ltm (evaluate_logits).
+    """
+    net = load_snapshot(args, "where")  # no bias is applied: the mode does not matter
+    from single_stream.heads import make_head
+    head = make_head(args, net.d_model, 10)
+    initial = copy.deepcopy(head)
+    gr = torch.Generator().manual_seed(args.seed + 11)  # replay draws
+    order = stream_order(args, yt)
+    xe, ye = xv[:args.eval_images], yv[:args.eval_images]
+    checkpoints = eval_checkpoints(args, order, yt)
+    history = []
+    pending = [0.0]
+
+    def features(x):
+        net.eval()
+        with torch.no_grad():
+            return net.run(x)["features"]
+
+    def logits(x):
+        return net(x) if head.empty else head.logits(features(x))
+
+    def evaluate(n):
+        s = evaluate_logits(args, logits, xt, yt, xe, ye, order, n)
+        s["head_empty"] = bool(head.empty)
+        history.append(s)
+        log(f"{args.name} samples {n:>6d}  acc {s['acc']:.4f}  mem {s['new_train_recall']:.3f}  new {s['new_recall']:.3f}  "
+            f"others {s['others_acc']:.4f}")
+
+    sleeps = sleep_points(args, order, yt)
+    gs = torch.Generator().manual_seed(args.seed + 19)  # sleep draws, as ltm
+    evaluate(0)
+    for n in range(1, len(order) + 1):
+        i = order[n - 1:n]
+        head.fit(features(xt[i]), yt[i])
+        pending[0] += args.head_replay
+        while pending[0] >= 1:
+            pending[0] -= 1
+            j = order[torch.randint(n, (1,), generator=gr)]
+            head.fit(features(xt[j]), yt[j])
+        if n in checkpoints or n in sleeps:
+            evaluate(n)
+        if n in sleeps:
+            st = sleep(args, net, torch.unique(order[:n]), xt, yt, gs)
+            if args.sleep_reset_stm:
+                head = copy.deepcopy(initial)
+            evaluate(n)
+            history[-1].update({"after_sleep": True, "sleep": st})
+    return {"history": history}
 
 
 def fmt(x):
@@ -676,7 +741,7 @@ def cmd_rl(args, xt, yt, xv, yv, log):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("command", choices=["snapshot", "bound", "rl", "ltm"])
+    p.add_argument("command", choices=["snapshot", "bound", "rl", "ltm", "head"])
     p.add_argument("--out", required=True)
     p.add_argument("--name", default="rl")
     p.add_argument("--data-root", default=os.path.expanduser("~/dev/claude/mnist"))
@@ -755,7 +820,20 @@ def main():
     p.add_argument("--sleep-sweep", default="",
                    help="after the last sample, sleep with each of these settings from the same state (\"lr:steps:priority,...\"); "
                         "rl reads each with the STM kept and reset; the state is restored between settings")
-    p.add_argument("--sleep-reset-stm", action="store_true", help="rl: the STM restarts from its initial state after each sleep")
+    p.add_argument("--sleep-reset-stm", action="store_true",
+                   help="rl: the STM restarts from its initial state after each sleep (head: the head does)")
+    p.add_argument("--head", default="knn", choices=["knn", "fly", "sdmlp"], help="head: the comparison head")
+    p.add_argument("--head-replay", type=float, default=1.0, help="head: seen-replay samples per stream sample")
+    p.add_argument("--knn-k", type=int, default=1)
+    p.add_argument("--knn-capacity", type=int, default=4096)
+    p.add_argument("--fly-kc", type=int, default=2000)
+    p.add_argument("--fly-response", type=int, default=16)
+    p.add_argument("--fly-k-frac", type=float, default=0.05)
+    p.add_argument("--fly-lr", type=float, default=0.2)
+    p.add_argument("--sdmlp-neurons", type=int, default=1000)
+    p.add_argument("--sdmlp-k", type=int, default=32)
+    p.add_argument("--sdmlp-gaba", type=int, default=100)
+    p.add_argument("--sdmlp-lr", type=float, default=0.05)
     p.add_argument("--phase1-nines", type=int, default=0, help="end phase 1 right after the n-th new-digit sample (0: off)")
     p.add_argument("--phase2-digit", type=int, default=-1, help="second phase: this digit at --phase2-fraction (-1: off)")
     p.add_argument("--phase2-samples", type=int, default=200)
@@ -809,7 +887,8 @@ def main():
 
     log(f"== {args.command} {json.dumps(vars(args))}")
     data = load_data(args)
-    result = {"cmd_snapshot": cmd_snapshot, "cmd_bound": cmd_bound, "cmd_rl": cmd_rl, "cmd_ltm": cmd_ltm}[f"cmd_{args.command}"](
+    result = {"cmd_snapshot": cmd_snapshot, "cmd_bound": cmd_bound, "cmd_rl": cmd_rl, "cmd_ltm": cmd_ltm,
+              "cmd_head": cmd_head}[f"cmd_{args.command}"](
         args, *data, log)
     with open(result_path, "w") as f:
         json.dump({"args": vars(args), "result": result}, f, indent=1)

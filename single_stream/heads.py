@@ -178,6 +178,19 @@ class SDMLPHead(Head):
         return sum(p.numel() for p in self.params) + self.counters.numel()
 
 
+def make_head(args, dim, num_classes):
+    """The head named by args.head with the --knn-*, --fly-*, --sdmlp-* options (run_stream and stm_frozen)."""
+    if args.head == "knn":
+        return KNNHead(dim, num_classes, k=args.knn_k, capacity=args.knn_capacity)
+    if args.head == "fly":
+        return FlyHead(dim, num_classes, n_kc=args.fly_kc, n_response=args.fly_response, k_frac=args.fly_k_frac,
+                       lr=args.fly_lr, seed=args.seed)
+    if args.head == "sdmlp":
+        return SDMLPHead(dim, num_classes, nneurons=args.sdmlp_neurons, k=args.sdmlp_k, gaba_switch=args.sdmlp_gaba,
+                         lr=args.sdmlp_lr, seed=args.seed)
+    raise ValueError(f"unknown head {args.head}")
+
+
 class HeadModel(StreamModel):
     """
     The LTM (BufferedReplayLTM) with a fast head replacing its output layer while awake. Per exposure, once online:

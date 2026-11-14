@@ -245,22 +245,14 @@ def build_model(args, train, token_shape=None):
 
 
 def build_head_model(args, ltm, net, num_classes):
-    from single_stream.heads import FlyHead, HeadModel, KNNHead, SDMLPHead
+    from single_stream.heads import HeadModel, make_head
 
     if args.net != "transformer":
         raise ValueError("--model head needs --net transformer (the LTM's features)")
     if args.replay_live:
         raise ValueError("head: the LTM learns only in sleep (no --replay-live)")
-    d = net.d_model
-    if args.head == "knn":
-        head = KNNHead(d, num_classes, k=args.knn_k, capacity=args.knn_capacity)
-    elif args.head == "fly":
-        head = FlyHead(d, num_classes, n_kc=args.fly_kc, n_response=args.fly_response, k_frac=args.fly_k_frac,
-                       lr=args.fly_lr, seed=args.seed)
-    else:
-        head = SDMLPHead(d, num_classes, nneurons=args.sdmlp_neurons, k=args.sdmlp_k, gaba_switch=args.sdmlp_gaba,
-                         lr=args.sdmlp_lr, seed=args.seed)
-    return HeadModel(ltm, head, replay=args.head_replay, reset_on_sleep=not args.head_no_reset, delay=args.head_delay)
+    return HeadModel(ltm, make_head(args, net.d_model, num_classes), replay=args.head_replay,
+                     reset_on_sleep=not args.head_no_reset, delay=args.head_delay)
 
 
 def build_stm(args, net, num_classes):
