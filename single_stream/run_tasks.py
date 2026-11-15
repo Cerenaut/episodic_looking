@@ -223,6 +223,9 @@ def main(argv=None):
                             "recall": float(hits[gi] / tot[gi]),
                             "memorisation": float((mem_pred == train.y[mem_idx]).float().mean()),
                             "protection": float(hits[others].sum() / tot[others].sum()),
+                            # other classes' held-out samples labelled as this class (a bias towards the current class
+                            # raises recall without generalising; 15 Nov check of the heads' one-shot recall)
+                            "to_current": float(conf[others, group_label[gi]].sum() / tot[others].sum()),
                             "acc": float((p == cur.y.numpy()).mean())}) + "\n")
                     fewshot_file.flush()
                     eval_time += time.perf_counter() - t0
