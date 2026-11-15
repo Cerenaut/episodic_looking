@@ -61,7 +61,7 @@ SEEDS = (0, 1)
 WINDOW = {}
 # (summary title, curves title opening) when not the four-task defaults
 TITLES = {"tune": ("Head tuning, stage 2 winners: task 2's first 2,048 exposures (heads: seeds 0-2; LTM alone and RL STM: "
-                   "four1, seeds 0-1). Core metrics at a class's n-th exposure, n = 1-64, and Overall.",
+                   "four1, seeds 0-1). Core metrics at a class's n-th exposure, n = 1-64, Overall and Overall \u2013 worst.",
                    "Head tuning, stage 2 winners: the core metrics at a class's n-th exposure in task 2 (first 2,048 "
                    "exposures).")}
 
@@ -166,7 +166,8 @@ def main():
                                     for label, _, _, n, _ in rows])
         axes[i, 0].set_ylabel(title, fontsize=9.5, color=INK)
     fig.suptitle(TITLES.get(args.set, ("", ""))[0] or "Four tasks (tasks 2-4 cut to 5,120 exposures; mean of seeds): the core "
-                 "metrics at a class's n-th exposure, n = 1-64, and their mean (Overall). Each axis zoomed to its own range.",
+                 "metrics at a class's n-th exposure, n = 1-64, their mean (Overall) and minimum (Overall \u2013 worst). Each axis "
+                 "zoomed to its own range.",
                  color=INK,
                  x=0.01, ha="left", fontsize=11.5)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
