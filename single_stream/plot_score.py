@@ -25,7 +25,7 @@ from single_stream.plot_stm_frozen import INK, INK2, SERIES, SURFACE
 from single_stream.plot_wave8 import GREY, save, style
 from single_stream.score import FOUR_TASK, POINTS, four_task
 
-NAMES = [name for _, name in FOUR_TASK] + ["Overall"]
+NAMES = [name for _, name in FOUR_TASK] + ["Overall", "Overall \u2013 worst"]  # worst: min of the seed-mean metrics
 CONDITIONS = [("lp", 512, "label permutation, c 512"), ("lp", 128, "label permutation, c 128"),
               ("dih", 512, "dihedral, c 512"), ("dih", 128, "dihedral, c 128")]
 # (directory under --root, run prefix, label, colour, line style, sleeps)
@@ -85,9 +85,10 @@ def rows_for(root, fam, c, models=FOUR1, seeds=None):
         vals = []
         for d in run_dirs(root, model, fam, c, seeds):
             r = four_task(d, **WINDOW)
-            vals.append([r[n] for n in NAMES[:-1]] + [r["Score"]])
+            vals.append([r[n] for _, n in FOUR_TASK] + [r["Score"]])
         if vals:
-            out.append((model[2], model[3], np.mean(vals, 0), len(vals), model[4]))
+            m = np.mean(vals, 0)
+            out.append((model[2], model[3], np.append(m, m[:len(FOUR_TASK)].min()), len(vals), model[4]))
     return out
 
 

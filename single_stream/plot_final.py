@@ -94,6 +94,9 @@ CMP = [("LTM + RL STM, sleep + reset", "w16_stm_sl16_1e-4_k100_reset", "w16b_stm
        for h, name, col in (("knn", "kNN", SERIES[2]), ("fly", "FlyModel", SERIES[3]), ("sdmlp", "SDMLP", SERIES[4]))
        for r in ("reset", "keep")]
 PREFIX = "final"  # output file prefix; "cmp" with --set cmp (axes then scaled to the data)
+# cmp: the six metrics' mean (Overall) and their minimum (Dave 16 Nov 2026: Overall - worst, which favours a model robust
+# across the metrics over one making a hard trade-off); both from the seed-mean metrics
+SCORES = ("Overall", "Overall \u2013 worst")
 
 
 def hists(cfg):
@@ -256,11 +259,11 @@ def summary(args):
     for label, c1, c2, col, ls in BEST:
         H1 = hists(c1)
         v = phase1(H1) + phase2(hists(c2))
-        S.append((label, col, ls, v + ((float(np.mean(v)),) if PREFIX == "cmp" else ()), None))  # cmp: + Overall
+        S.append((label, col, ls, v + ((float(np.mean(v)), float(np.min(v))) if PREFIX == "cmp" else ()), None))
         if any(e.get("after_sleep") for e in H1[0]):
             pre, post = at_sleep(H1)
             S.append((f"  {SLEEP_AT} nines: pre \u2192 post sleep", col, ls, None, (pre, post)))
-    names = NAMES + (("Overall",) if PREFIX == "cmp" else ())
+    names = NAMES + (SCORES if PREFIX == "cmp" else ())
     fig, axes = plt.subplots(1, len(names), figsize=(16 if PREFIX == "final" else 18, max(4.6, 0.36 * len(S) + 1.2)),
                              facecolor=SURFACE, sharey=True)
     ys = np.arange(len(S))[::-1]
@@ -311,7 +314,7 @@ def table(args, rows, S):
          "| family | configuration | kind | Memorisation | Generalisation | Protection |", "|---|---|---|---|---|---|"]
     for fam, label, kind, m, g, p in rows:
         L.append(f"| {fam} | {label} | {kind} | {m:.2f} | {g:.2f} | {p:.3f} |")
-    names = NAMES + (("Overall",) if PREFIX == "cmp" else ())
+    names = NAMES + (SCORES if PREFIX == "cmp" else ())
     L += ["", "## Best model of each architecture", "", "| model | " + " | ".join(names) + " |",
           "|---|" + "---|" * len(names)]
     for label, _, _, v, pp in S:
@@ -319,7 +322,7 @@ def table(args, rows, S):
             L.append(f"| {label} | " + " | ".join(f"{x:.3f}" for x in v) + " |")
         else:
             L.append(f"| {label.strip()} | " + " | ".join(f"{a:.3f} -> {b:.3f}" for a, b in zip(*pp))
-                     + " | - | - | - |" + (" - |" if PREFIX == "cmp" else ""))
+                     + " | - | - | - |" + (" - |" * len(SCORES) if PREFIX == "cmp" else ""))
     path = os.path.join(args.out, f"{PREFIX}_tables.md")
     open(path, "w").write("\n".join(L) + "\n")
     print(path)
