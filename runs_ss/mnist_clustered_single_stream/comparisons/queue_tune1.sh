@@ -7,7 +7,10 @@
 # k 1, capacity 4096; replay 1, repeats 1). Not varied: fly repeats (W += lr KC with W <= 1, so repeats ~ lr) and knn
 # repeats (duplicates). Score: single_stream.score on task 2.
 # STAGE=1b (15 Nov, after stage 1): beyond stage 1's best ends (fly lr; sdmlp repeats) and their combinations with
-# the other helpful settings; no knn (defaults best); output comparisons/tune1b. Every run line ends in a flag (xargs -L continuation).
+# the other helpful settings; no knn (defaults best); output comparisons/tune1b.
+# STAGE=2 (Dave 15 Nov: "go ahead with stage 2"): each head's best reset and kept settings from stages 1 and 1b, both
+# arms, at seeds 0-2, lp and dih, c 512 and 128; sdmlp's best (repeats 64, lr .5) was still at the grid's edge, so two
+# more (repeats 256 lr .5; repeats 64 lr 1). A run finished in tune1 or tune1b (seed 0, c 512) is reused, not rerun. Every run line ends in a flag (xargs -L continuation).
 cd /home/incubator/dev/claude/episodic_looking
 export PY=/home/incubator/dev/claude/.venv/bin/python STAGE=${STAGE:-1} D=${D:-runs_ss/mnist_clustered_single_stream/comparisons/tune$STAGE}
 mkdir -p $D
@@ -47,24 +50,36 @@ settings_1b() {
   echo "sdmlp_rep16_gaba1000 --head sdmlp --head-repeats 16 --sdmlp-gaba 1000"
   echo "sdmlp_rep16_replay16 --head sdmlp --head-repeats 16 --head-replay 16"
 }
+settings_2() {
+  echo "knn_default --head knn"
+  echo "knn_replay0 --head knn --head-replay 0"
+  echo "fly_lr2 --head fly --fly-lr 2"
+  echo "sdmlp_rep64_lr0.5 --head sdmlp --head-repeats 64 --sdmlp-lr 0.5"
+  echo "sdmlp_rep256_lr0.5 --head sdmlp --head-repeats 256 --sdmlp-lr 0.5"
+  echo "sdmlp_rep64_lr1 --head sdmlp --head-repeats 64 --sdmlp-lr 1"
+}
+done_before() { for d in tune1 tune1b; do [ -e runs_ss/mnist_clustered_single_stream/comparisons/$d/$1/summary.json ] && return 0; done; return 1; }
 echo "$(date '+%F %T') tune$STAGE start" >> $D/queue.log
 {
+[ $STAGE = 2 ] && SEEDS=${SEEDS:-0 1 2} CS=${CS:-512 128}
 for s in ${SEEDS:-0}; do
-  for cfg in "lp 512 id,lperm1" "dih 512 id,rot90"; do
-    read fam c tasks <<< "$cfg"
+  for cfg in "lp id,lperm1" "dih id,rot90"; do
+   for c in ${CS:-512}; do
+    read fam tasks <<< "$cfg"
     [ -n "$FAMS" ] && [[ " $FAMS " != *" $fam "* ]] && continue
     T="--tasks $tasks --cluster-size $c --seed $s"
     [ $STAGE = 1 ] && S=settings || S=settings_$STAGE
     $S | while read name flags; do
       [ -n "$ONLY" ] && [[ " $ONLY " != *" $name "* ]] && continue
-      echo "run ${name}_reset_${fam}_c${c}_s$s $T $flags"
-      echo "run ${name}_keep_${fam}_c${c}_s$s $T $flags --head-no-reset"
+      done_before ${name}_reset_${fam}_c${c}_s$s || echo "run ${name}_reset_${fam}_c${c}_s$s $T $flags"
+      done_before ${name}_keep_${fam}_c${c}_s$s || echo "run ${name}_keep_${fam}_c${c}_s$s $T $flags --head-no-reset"
     done
     # knn kept: capacity bounds what a never-reset head holds
     [ $STAGE = 1 ] && for v in 1024 16384; do
       [ -n "$ONLY" ] && [[ " $ONLY " != *" knn_cap$v "* ]] && continue
-      echo "run knn_cap${v}_keep_${fam}_c${c}_s$s $T --head knn --knn-capacity $v --head-no-reset"
+      done_before knn_cap${v}_keep_${fam}_c${c}_s$s || echo "run knn_cap${v}_keep_${fam}_c${c}_s$s $T --head knn --knn-capacity $v --head-no-reset"
     done
+   done
   done
 done
 } | xargs -P ${PAR:-8} -L 1 bash -c 'eval "$@"' _
