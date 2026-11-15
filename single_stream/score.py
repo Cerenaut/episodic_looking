@@ -24,10 +24,13 @@ POINTS = (1, 2, 4, 8, 16, 32, 64)
 FOUR_TASK = (("memorisation", "Memorisation"), ("recall", "Generalisation"), ("protection", "Protection"))
 
 
-def four_task(run, points=POINTS, first_task=1):
-    """{metric: value, "Score": mean} for one run_tasks run; metrics averaged over (task, class, n) records."""
+def four_task(run, points=POINTS, first_task=1, last_task=None, max_t_task=None):
+    """{metric: value, "Score": mean} for one run_tasks run; metrics averaged over (task, class, n) records. last_task
+    and max_t_task restrict the window (e.g. task 2's first 2,048 exposures, to compare four-task runs with the
+    two-task tuning runs)."""
     rows = [json.loads(line) for line in open(os.path.join(run, "fewshot.jsonl"))]
-    rows = [r for r in rows if r["task"] >= first_task and r["threshold"] in points]
+    rows = [r for r in rows if r["task"] >= first_task and r["threshold"] in points
+            and (last_task is None or r["task"] <= last_task) and (max_t_task is None or r["t_task"] <= max_t_task)]
     if not rows:
         raise ValueError(f"{run}: no few-shot records in tasks >= {first_task} at {points}")
     out = {name: float(np.mean([r[key] for r in rows])) for key, name in FOUR_TASK}

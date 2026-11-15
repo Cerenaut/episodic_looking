@@ -42,24 +42,49 @@ CMP4 = [(CMP, "ladder1", "LTM, each sample (ladder 1)", INK2, ":", False),
         (CMP, f"{h}_{r}", f"{name} head, {'reset' if r == 'reset' else 'kept'}", col, "-" if r == "reset" else "--", True)
         for h, name, col in (("knn", "kNN", SERIES[2]), ("fly", "FlyModel", SERIES[3]), ("sdmlp", "SDMLP", SERIES[4]))
         for r in ("reset", "keep")]
-SETS = {"four1": FOUR1, "cmp": CMP4}
+# Head tuning (Dave 15 Nov 2026), stage 2 winners: runs in tune2, seed 0 at c 512 in tune1/tune1b (a tuple of
+# directories: the first holding the run is used). Scored on task 2's first 2,048 exposures (WINDOWS), so four1's RL
+# STM and LTM alone are scored on the same window as the two-task tuning runs.
+TUNE = ("comparisons/tune2", "comparisons/tune1", "comparisons/tune1b")
+TUNED = [("stm_pilot/four1", "ltm", "LTM + replay + sleep (LTM alone)", SERIES[0], "-", True),
+         ("stm_pilot/four1", "il0", "LTM + RL STM (no interleave)", SERIES[1], "-", True),
+         (TUNE, "knn_default_reset", "kNN head, reset (defaults)", SERIES[2], "-", True),
+         (TUNE, "knn_replay0_keep", "kNN head, kept (replay 0)", SERIES[2], "--", True),
+         (TUNE, "fly_lr2_reset", "FlyModel head, reset (lr 2)", SERIES[3], "-", True),
+         (TUNE, "fly_lr2_keep", "FlyModel head, kept (lr 2)", SERIES[3], "--", True),
+         (TUNE, "sdmlp_rep64_lr0.5_reset", "SDMLP head, reset (repeats 64, lr .5)", SERIES[4], "-", True),
+         (TUNE, "sdmlp_rep64_lr0.5_keep", "SDMLP head, kept (repeats 64, lr .5)", SERIES[4], "--", True)]
+SETS = {"four1": FOUR1, "cmp": CMP4, "tune": TUNED}
+SET_SEEDS = {"tune": (0, 1, 2)}
+WINDOWS = {"tune": {"last_task": 1, "max_t_task": 2048}}
 SEEDS = (0, 1)
+WINDOW = {}
+# (summary title, curves title opening) when not the four-task defaults
+TITLES = {"tune": ("Head tuning, stage 2 winners: task 2's first 2,048 exposures (heads: seeds 0-2; LTM alone and RL STM: "
+                   "four1, seeds 0-1). Core metrics at a class's n-th exposure, n = 1-64, and Overall.",
+                   "Head tuning, stage 2 winners: the core metrics at a class's n-th exposure in task 2 (first 2,048 "
+                   "exposures).")}
 
 
-def run_dirs(root, model, fam, c, seeds=SEEDS):
-    d, prefix = model[:2]
-    out = [os.path.join(root, d, f"{prefix}_{fam}_c{c}_s{s}") for s in seeds]
-    return [x for x in out if os.path.exists(os.path.join(x, "summary.json"))]
+def run_dirs(root, model, fam, c, seeds=None):
+    dirs, prefix = model[:2]
+    dirs = (dirs,) if isinstance(dirs, str) else dirs
+    out = []
+    for s in seeds or SEEDS:
+        found = [x for x in (os.path.join(root, d, f"{prefix}_{fam}_c{c}_s{s}") for d in dirs)
+                 if os.path.exists(os.path.join(x, "summary.json"))]
+        out += found[:1]
+    return out
 
 
-def rows_for(root, fam, c, models=FOUR1, seeds=SEEDS):
+def rows_for(root, fam, c, models=FOUR1, seeds=None):
     """[(label, colour, [M, G, P, Overall] seed mean, seeds used, line style)] for the models with at least one finished
     run."""
     out = []
     for model in models:
         vals = []
         for d in run_dirs(root, model, fam, c, seeds):
-            r = four_task(d)
+            r = four_task(d, **WINDOW)
             vals.append([r[n] for n in NAMES[:-1]] + [r["Score"]])
         if vals:
             out.append((model[2], model[3], np.mean(vals, 0), len(vals), model[4]))
@@ -67,7 +92,9 @@ def rows_for(root, fam, c, models=FOUR1, seeds=SEEDS):
 
 
 def records(d, first_task=1):
-    return [r for r in map(json.loads, open(os.path.join(d, "fewshot.jsonl"))) if r["task"] >= first_task]
+    last, max_t = WINDOW.get("last_task"), WINDOW.get("max_t_task")
+    return [r for r in map(json.loads, open(os.path.join(d, "fewshot.jsonl"))) if r["task"] >= first_task
+            and (last is None or r["task"] <= last) and (max_t is None or r["t_task"] <= max_t)]
 
 
 def fig_curves(args, models):
@@ -94,8 +121,9 @@ def fig_curves(args, models):
                 ax.set_ylabel(name, fontsize=10, color=INK)
     h, l = axes[0, 0].get_legend_handles_labels()
     fig.legend(h, l, loc="lower center", frameon=False, fontsize=9.5, labelcolor=INK, ncol=4)
-    fig.suptitle("Four tasks: the core metrics at a class's n-th exposure, tasks 2-4 pooled (mean of seeds 0 and 1). Grey "
-                 "band: a sleep falls between n = 8 and 16\n(every cluster at c 512, half of them at c 128); a reset head "
+    head = (TITLES.get(args.set, ("", ""))[1] or "Four tasks: the core metrics at a class's n-th exposure, tasks 2-4 pooled "
+            "(mean of seeds 0 and 1).")
+    fig.suptitle(head + " Grey band: a sleep falls between n = 8 and 16\n(every cluster at c 512, half of them at c 128); a reset head "
                  "is empty at n = 16 and the LTM answers.",
                  color=INK, x=0.01, ha="left", fontsize=11.5)
     fig.tight_layout(rect=(0, 0.09, 1, 0.96))
@@ -109,7 +137,9 @@ def main():
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
+    global SEEDS, WINDOW
     models = SETS[args.set]
+    SEEDS, WINDOW = SET_SEEDS.get(args.set, SEEDS), WINDOWS.get(args.set, {})
     blocks = [(title, rows_for(args.root, fam, c, models)) for fam, c, title in CONDITIONS]
     blocks = [(t, r) for t, r in blocks if r]
     full = max(r[3] for _, rows in blocks for r in rows)
@@ -134,8 +164,9 @@ def main():
         axes[i, 0].set_yticklabels([label + (f" ({n} seed{'s' if n > 1 else ''})" if n < full else "")
                                     for label, _, _, n, _ in rows])
         axes[i, 0].set_ylabel(title, fontsize=9.5, color=INK)
-    fig.suptitle("Four tasks (tasks 2-4 cut to 5,120 exposures; mean of seeds): the core metrics at a class's n-th "
-                 "exposure, n = 1-64, and their mean (Overall). Each axis zoomed to its own range.", color=INK,
+    fig.suptitle(TITLES.get(args.set, ("", ""))[0] or "Four tasks (tasks 2-4 cut to 5,120 exposures; mean of seeds): the core "
+                 "metrics at a class's n-th exposure, n = 1-64, and their mean (Overall). Each axis zoomed to its own range.",
+                 color=INK,
                  x=0.01, ha="left", fontsize=11.5)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     save(fig, args, "four_task_summary.png")
