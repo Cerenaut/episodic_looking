@@ -75,3 +75,28 @@ class TestLabelPermutation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPlasticitySequence(unittest.TestCase):
+
+    def test_every_label_changes(self):
+        maps = [tasks.plasticity_map(k).numpy() for k in range(120)]
+        np.testing.assert_array_equal(maps[0], np.arange(10))
+        for k in range(1, 120):
+            self.assertEqual(sorted(maps[k]), list(range(10)))
+            self.assertTrue((maps[k] != maps[k - 1]).all(), k)          # every digit relabelled from the last task
+            if k >= 8:
+                self.assertTrue((maps[k] != maps[k - 8]).all(), k)      # and from the last task with its transform
+
+    def test_expand_and_apply(self):
+        names = tasks.expand("plast:10")
+        self.assertEqual(names[:2], ["id", "plast1"])
+        self.assertEqual(len(names), 10)
+        self.assertTrue(all(tasks.valid(n) for n in names))
+        self.assertFalse(tasks.valid("plast0"))
+        self.assertEqual([tasks.image_transform(n) for n in names[1:9]], list(tasks.PLAST_ORDER[1:]) + ["id"])
+        d = one_pixel(2, 5)
+        out = tasks.apply("plast3", d)   # rot180, digit 3 relabelled by the map
+        self.assertEqual(where(out), (25, 22))
+        self.assertEqual(int(out.y[0]), int(tasks.plasticity_map(3)[3]))
+        self.assertEqual(int(out.groups[0]), int(out.y[0]))

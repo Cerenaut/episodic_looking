@@ -79,3 +79,19 @@ class TestQKVGains(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPlasticityDiagnostics(unittest.TestCase):
+
+    def test_ranges(self):
+        from single_stream import plasticity
+        torch.manual_seed(0)
+        net = BiasableTransformer(num_tokens=49, token_size=32, num_classes=10, blocks=2)
+        net.train()
+        out = plasticity.diagnostics(net, torch.randn(64, 49 * 32))
+        self.assertTrue(net.training)                                   # mode restored
+        self.assertEqual(set(out), {"plast_dormant_b0", "plast_dormant_b1", "plast_eff_rank", "plast_weight_norm"})
+        self.assertTrue(0 <= out["plast_dormant_b0"] <= 1)
+        self.assertTrue(1 <= out["plast_eff_rank"] <= net.d_model)
+        self.assertGreater(out["plast_weight_norm"], 0)
+        self.assertAlmostEqual(plasticity.effective_rank(torch.eye(8)), 8.0, places=5)

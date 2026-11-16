@@ -9,6 +9,11 @@ every task's evaluation set (the current one, earlier ones for retention, later 
 task, before its first sample (zero-shot). Few-shot triggers (as run_stream) count a group's exposures within the
 current task, and score it on the current task (Generalisation, Memorisation, Protection).
 
+--lifelong (Dave 16 Nov 2026, the plasticity experiment; --tasks plast:N, tasks.py): only the current task is evaluated,
+at its start and end; its end record adds acc_seen (accuracy on the classes presented in the task) and the LTM's
+plasticity diagnostics (plasticity.py); few-shot triggers only on the tasks in --fewshot-tasks. --snapshot-before saves
+the whole model (and the random states) just before the listed tasks, for runs of the reset models from that LTM.
+
 Outputs in --out: args.json, checkpoints.jsonl, fewshot.jsonl, summary.json, log.txt.
 
   python -m single_stream.run_tasks --tasks id,rot90,hflip,rot180 --cluster-size 128 --epochs 1 ... --out <dir>
@@ -21,7 +26,7 @@ import time
 import numpy as np
 import torch
 
-from single_stream import datasets, metrics, stm_probe, tasks
+from single_stream import datasets, metrics, plasticity, stm_probe, tasks
 from single_stream.models import CLSModel
 from single_stream.run_stream import Tee, buffer_diagnostics, build_model, build_parser, rng_neutral, stm_diagnostics
 from single_stream.stream import ClusteredStream
@@ -46,6 +51,14 @@ def parse_args(argv=None):
     p.add_argument("--stm-probe-rewards", default="accuracy,log-accuracy,margin",
                    help="reward probe: comma-separated reward types (each from the same random state)")
     p.add_argument("--stm-probe-log-weight", type=float, default=1.0, help="reward probe: accuracy-log weight")
+    p.add_argument("--lifelong", action="store_true",
+                   help="evaluate the current task only, at its start and end, with acc_seen and plasticity diagnostics")
+    p.add_argument("--fewshot-tasks", default="",
+                   help="task indices (0 = first) on which few-shot triggers run; empty = all (--lifelong: 1 and last)")
+    p.add_argument("--snapshot-before", default="",
+                   help="task indices before which the model and random states are saved (snapshot_task<k>.pt)")
+    p.add_argument("--plasticity-probe", type=int, default=1000,
+                   help="--lifelong: held-out samples of the task used for the plasticity diagnostics")
     p.add_argument("--full-first-task", action="store_true",
                    help="--max-exposures applies to the tasks after the first only (the first runs in full)")
     return p.parse_args(argv)
@@ -59,7 +72,7 @@ def evaluate_all(model, evals):
 
 def main(argv=None):
     args = parse_args(argv)
-    names = [t.strip() for t in args.tasks.split(",") if t.strip()]
+    names = tasks.expand(args.tasks)
     for name in names:
         if not tasks.valid(name):
             sys.exit(f"unknown task {name}")
@@ -80,11 +93,19 @@ def main(argv=None):
         pre = load_checkpoint(args.preproc)
         pre.tag = os.path.basename(os.path.dirname(os.path.abspath(args.preproc)))
     cache = args.feature_cache or None
-    evals = {name: tasks.featurized(name, eval_raw, pre, cache) for name in names}
+    if args.lifelong:  # built per task (100 tasks' evaluation sets would not fit)
+        evals = {}
+    else:
+        evals = {name: tasks.featurized(name, eval_raw, pre, cache) for name in names}
+    if args.fewshot_tasks:
+        fewshot_tasks = {int(v) for v in args.fewshot_tasks.split(",") if v.strip()}
+    else:
+        fewshot_tasks = {1, len(names) - 1} if args.lifelong else set(range(len(names)))
+    snapshot_before = {int(v) for v in args.snapshot_before.split(",") if v.strip()}
     token_shape = (49, pre.channels) if pre is not None else None
     train = tasks.featurized(names[0], train_raw, pre, cache)
     model = build_model(args, train, token_shape)
-    log(f"tasks {names}  train {len(train)}  eval {len(eval_raw)}  c={args.cluster_size}  epochs/task {args.epochs}  "
+    log(f"tasks {names if len(names) <= 8 else names[:3] + ['...'] + names[-2:]} ({len(names)})  train {len(train)}  eval {len(eval_raw)}  c={args.cluster_size}  epochs/task {args.epochs}  "
         f"memory {model.memory_values() / 1e6:.2f}M values")
 
     thresholds = np.array([int(v) for v in args.fewshot_thresholds.split(",") if v.strip()], dtype=np.int64)
@@ -103,7 +124,13 @@ def main(argv=None):
     for ti, name in enumerate(names):
         if ti > 0:
             train = tasks.featurized(name, train_raw, pre, cache)
+        if args.lifelong:
+            evals = {name: tasks.featurized(name, eval_raw, pre, cache)}
         cur = evals[name]
+        if ti in snapshot_before:
+            torch.save({"model": model, "np_rng": rng.bit_generator.state, "torch_rng": torch.get_rng_state(),
+                        "t": t, "task": ti, "task_name": name}, os.path.join(args.out, f"snapshot_task{ti}.pt"))
+            log(f"snapshot before task {ti} ({name})")
         stream = ClusteredStream(train.groups, args.cluster_size, rng)
         group_ids = stream.group_ids
         group_index = {g: i for i, g in enumerate(group_ids)}
@@ -115,6 +142,8 @@ def main(argv=None):
         checkpoints, grid = metrics.checkpoint_schedule(epoch_len, args.epochs, args.n_log_checkpoints,
                                                         args.grid_per_epoch)
         checkpoints = [c for c in checkpoints if c <= total]
+        if args.lifelong:
+            checkpoints = []
         if not checkpoints or checkpoints[-1] != total:
             checkpoints.append(total)
         n = np.zeros(len(group_ids), dtype=np.int64)
@@ -205,7 +234,7 @@ def main(argv=None):
                     rec.update(t=t, task=ti, t_task=tt, group=int(group_ids[gi]), n=int(n[gi]),
                                slept_resets=model.resets, p_eval=p_eval)
                     trace_file.write(json.dumps(rec) + "\n")
-                crossed = [int(v) for v in thresholds if n_before < v <= n[gi]]
+                crossed = [int(v) for v in thresholds if n_before < v <= n[gi]] if ti in fewshot_tasks else []
                 if crossed:
                     t0 = time.perf_counter()
                     with rng_neutral():
@@ -239,6 +268,17 @@ def main(argv=None):
                     while next_ckpt < len(checkpoints) and tt >= checkpoints[next_ckpt]:
                         next_ckpt += 1
         end = task_records[-1]
+        if args.lifelong:
+            presented = np.isin(cur.groups, [g for g, c in zip(group_ids, n) if c > 0])
+            p = evaluate_all(model, evals)[name]
+            end["acc_seen"] = float((p[presented] == cur.y.numpy()[presented]).mean())
+            end["classes_seen"] = int((n > 0).sum())
+            with rng_neutral():
+                end.update(plasticity.diagnostics(plasticity.ltm_net(model), cur.x[:args.plasticity_probe]))
+            ckpt_file.write(json.dumps({"t": t, "task": ti, "task_name": name, "end": True,
+                                        **{k: end[k] for k in ("acc", "acc_seen", "classes_seen")},
+                                        **{k: v for k, v in end.items() if k.startswith("plast_")}}) + "\n")
+            ckpt_file.flush()
         grid_recs = [r for r in task_records if r["grid"]]
         recovery = {}
         for x in RECOVERY_POINTS:  # accuracy on the task at (or just after) x exposures since the switch
@@ -249,7 +289,14 @@ def main(argv=None):
             "anytime": float(np.mean([r["acc"] for r in grid_recs])) if grid_recs else None,
             "worst_group_final": float(min(end["group_acc"])),
             "worst_group_anytime": float(np.mean([min(r["group_acc"]) for r in grid_recs])) if grid_recs else None,
-            "recovery": recovery, "task_acc_end": end["task_acc"], "exposures": tt})
+            "recovery": recovery, "task_acc_end": end["task_acc"], "exposures": tt,
+            **({k: end[k] for k in end if k in ("acc_seen", "classes_seen") or k.startswith("plast_")}
+               if args.lifelong else {})})
+        if args.lifelong:
+            log(f"task {ti} {name}: end  acc {end['acc']:.4f}  seen {end['acc_seen']:.4f} ({end['classes_seen']} classes)  "
+                + "  ".join(f"{k[6:]} {v:.3f}" for k, v in end.items() if k.startswith("plast_"))
+                + f"  train {train_time:.0f}s  eval {eval_time:.0f}s")
+            continue
         log(f"task {ti} {name}: end  acc {end['acc']:.4f}  tasks {json.dumps({k: round(v, 3) for k, v in end['task_acc'].items()})}")
 
     ckpt_file.close()
