@@ -275,6 +275,9 @@ def main(argv=None):
             end["classes_seen"] = int((n > 0).sum())
             with rng_neutral():
                 end.update(plasticity.diagnostics(plasticity.ltm_net(model), cur.x[:args.plasticity_probe]))
+            cbp = getattr(getattr(model, "ltm", model), "cbp", None)
+            if cbp is not None:
+                end["plast_cbp_replaced"] = cbp.replaced  # cumulative units replaced by continual backprop
             ckpt_file.write(json.dumps({"t": t, "task": ti, "task_name": name, "end": True,
                                         **{k: end[k] for k in ("acc", "acc_seen", "classes_seen")},
                                         **{k: v for k, v in end.items() if k.startswith("plast_")}}) + "\n")
@@ -294,7 +297,7 @@ def main(argv=None):
                if args.lifelong else {})})
         if args.lifelong:
             log(f"task {ti} {name}: end  acc {end['acc']:.4f}  seen {end['acc_seen']:.4f} ({end['classes_seen']} classes)  "
-                + "  ".join(f"{k[6:]} {v:.3f}" for k, v in end.items() if k.startswith("plast_"))
+                + "  ".join(f"{k[6:]} {v:.3f}" for k, v in end.items() if k.startswith("plast_") and k != "plast_cbp_replaced")
                 + f"  train {train_time:.0f}s  eval {eval_time:.0f}s")
             continue
         log(f"task {ti} {name}: end  acc {end['acc']:.4f}  tasks {json.dumps({k: round(v, 3) for k, v in end['task_acc'].items()})}")

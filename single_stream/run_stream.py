@@ -26,7 +26,7 @@ import torch
 from single_stream import datasets, metrics
 from single_stream.buffers import NeuralBuffer, NoveltyGate, PriorityBuffer, RingBuffer, part_specs
 from single_stream.models import (BufferedReplayLTM, CLSModel, ContinualBackprop, LTMOnly, ReplayLTM, ReplayOnlyLTM,
-                                  build_net)
+                                  TransformerContinualBackprop, build_net)
 from single_stream.stream import ClusteredStream, run_lengths
 
 
@@ -187,12 +187,18 @@ def build_model(args, train, token_shape=None):
     net = build_net(args.net, train.x.shape[1], train.num_classes, widths, args.blocks, transformer)
     cbp = None
     if args.cbp_rate > 0:
-        if args.net != "mlp":
-            raise ValueError("continual backprop is implemented for --net mlp only")
-        cbp = ContinualBackprop(net, args.cbp_rate, args.cbp_decay, args.cbp_maturity)
+        if args.net == "mlp":
+            cbp = ContinualBackprop(net, args.cbp_rate, args.cbp_decay, args.cbp_maturity)
+        elif args.net == "transformer":
+            cbp = TransformerContinualBackprop(net, args.cbp_rate, args.cbp_decay, args.cbp_maturity)
+        else:
+            raise ValueError("continual backprop is implemented for --net mlp and transformer only")
     common = dict(lr=args.lr, steps=args.steps, momentum=args.momentum, weight_decay=args.weight_decay, cbp=cbp)
     if args.model == "ltm":
-        return LTMOnly(net, optimizer=args.optimizer, **common)
+        model = LTMOnly(net, optimizer=args.optimizer, **common)
+        if cbp is not None:
+            cbp.opt = model.opt  # transformer: zero the replaced units' optimizer moments
+        return model
     if args.model == "replayonly":
         if args.steps != 1:
             raise ValueError("replayonly uses --replay-steps, not --steps")
@@ -217,6 +223,8 @@ def build_model(args, train, token_shape=None):
                                   seed=args.seed)
         ltm = BufferedReplayLTM(net, buffer=buffer, batch=args.replay_batch, period=args.replay_period,
                                 steps=args.replay_steps, optimizer=args.optimizer, live=args.replay_live, **common)
+        if cbp is not None:
+            cbp.opt = ltm.opt
         if args.model == "buffered":
             return ltm
         if args.model == "head":

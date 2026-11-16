@@ -119,6 +119,99 @@ class ContinualBackprop:
             self.replaced += k
 
 
+class TransformerContinualBackprop:
+    """
+    Continual backprop on the feed-forward hidden units of a BiasableTransformer (plasticity stage 2, Dave 17 Nov
+    2026), as ContinualBackprop for the MLP: after each optimizer step, each block's GELU units get a contribution
+    utility, a running average (decay `decay`) of mean |activation| over the batch and tokens x sum of |outgoing
+    weights| (block.mlp[2]); units older than `maturity` steps are eligible; a fractional count accumulates at
+    `rate` x (number eligible) per step, and when it reaches 1 the eligible units with the lowest bias-corrected
+    utility are replaced: incoming weights and bias re-initialised with nn.Linear's own initialiser (as the network
+    was built), the unit's mean contribution folded into mlp[2]'s bias, outgoing weights zeroed, utility and age
+    reset. With AdamW (`opt`, set after the model is built) the replaced weights' moments are zeroed too, so the new
+    unit starts without the old unit's gradient history. Activations come from a forward hook on each GELU that
+    records only in training mode (evaluation and diagnostics leave them alone). Phase-blind: runs every step.
+    """
+
+    def __init__(self, net, rate=1e-4, decay=0.99, maturity=100):
+        self.net = net
+        self.rate = rate
+        self.decay = decay
+        self.maturity = maturity
+        self.opt = None
+        n = [block.mlp[0].out_features for block in net.blocks]
+        self.util = [torch.zeros(k) for k in n]
+        self.mean_act = [torch.zeros(k) for k in n]
+        self.age = [torch.zeros(k, dtype=torch.long) for k in n]
+        self.pending = [0.0 for _ in n]
+        self.acts = [None for _ in n]
+        self.replaced = 0
+        for i, block in enumerate(net.blocks):
+            block.mlp[1].register_forward_hook(_ActRecorder(self, i))
+
+    def _zero_moments(self, param, index, dim=0):
+        state = self.opt.state.get(param) if self.opt is not None else None
+        if not state:
+            return
+        for key in ("exp_avg", "exp_avg_sq", "momentum_buffer"):
+            if key in state and state[key] is not None:
+                state[key].index_fill_(dim, index, 0.0)
+
+    @torch.no_grad()
+    def step(self):
+        d = self.decay
+        for i, block in enumerate(self.net.blocks):
+            if self.acts[i] is None:
+                continue
+            inc, out = block.mlp[0], block.mlp[2]
+            act = self.acts[i].reshape(-1, self.acts[i].shape[-1]).mean(0)
+            contribution = act.abs() * out.weight.abs().sum(0)
+            self.util[i].mul_(d).add_((1 - d) * contribution)
+            self.mean_act[i].mul_(d).add_((1 - d) * act)
+            self.age[i] += 1
+
+            eligible = self.age[i] > self.maturity
+            n_eligible = int(eligible.sum())
+            if n_eligible == 0:
+                continue
+            self.pending[i] += self.rate * n_eligible
+            if self.pending[i] < 1:
+                continue
+            k = min(int(self.pending[i]), n_eligible)
+            self.pending[i] -= k
+
+            correction = 1 - d ** self.age[i].double()
+            corrected = (self.util[i] / correction).float()
+            corrected[~eligible] = float("inf")
+            units = torch.topk(corrected, k, largest=False).indices
+
+            mean = self.mean_act[i][units] / correction[units].float()
+            out.bias += out.weight[:, units] @ mean
+            out.weight[:, units] = 0.0
+            fresh = nn.Linear(inc.in_features, k)
+            inc.weight[units] = fresh.weight
+            inc.bias[units] = fresh.bias
+            self._zero_moments(inc.weight, units)
+            self._zero_moments(inc.bias, units)
+            self._zero_moments(out.weight, units, dim=1)
+            self.util[i][units] = 0.0
+            self.mean_act[i][units] = 0.0
+            self.age[i][units] = 0
+            self.replaced += k
+
+
+class _ActRecorder:
+    """Forward hook for TransformerContinualBackprop (a class, not a closure, so the model still pickles)."""
+
+    def __init__(self, cbp, i):
+        self.cbp = cbp
+        self.i = i
+
+    def __call__(self, module, inputs, output):
+        if module.training:
+            self.cbp.acts[self.i] = output.detach()
+
+
 class ResidualMLP(nn.Module):
     """Pre-LayerNorm residual MLP: a ResNet without the convolutions. LayerNorm, not BatchNorm, because b = 1."""
 

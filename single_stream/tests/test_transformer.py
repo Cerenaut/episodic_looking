@@ -95,3 +95,69 @@ class TestPlasticityDiagnostics(unittest.TestCase):
         self.assertTrue(1 <= out["plast_eff_rank"] <= net.d_model)
         self.assertGreater(out["plast_weight_norm"], 0)
         self.assertAlmostEqual(plasticity.effective_rank(torch.eye(8)), 8.0, places=5)
+
+
+class TestTransformerContinualBackprop(unittest.TestCase):
+
+    def _setup(self, rate):
+        from single_stream.models import TransformerContinualBackprop
+        torch.manual_seed(0)
+        net = BiasableTransformer(num_tokens=49, token_size=32, num_classes=10, blocks=2)
+        opt = torch.optim.AdamW(net.parameters(), lr=1e-3)
+        cbp = TransformerContinualBackprop(net, rate=rate, maturity=5)
+        cbp.opt = opt
+        return net, opt, cbp
+
+    def _train(self, net, opt, cbp, steps):
+        x, y = torch.randn(8, 49 * 32), torch.randint(0, 10, (8,))
+        for _ in range(steps):
+            net.train()
+            loss = torch.nn.functional.cross_entropy(net(x), y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            cbp.step()
+        return x
+
+    def test_replaces_units_and_moments(self):
+        net, opt, cbp = self._setup(rate=0.05)
+        x = self._train(net, opt, cbp, 20)
+        self.assertGreater(cbp.replaced, 0)
+        out = net.blocks[0].mlp[2]
+        young = (cbp.age[0] < 20).nonzero().flatten()          # replaced at some step
+        self.assertGreater(len(young), 0)
+        just = (cbp.age[0] == 0).nonzero().flatten()
+        if len(just):                                           # replaced on the last step: outgoing zero, moments zero
+            self.assertTrue(torch.all(out.weight[:, just] == 0))
+            self.assertTrue(torch.all(opt.state[out.weight]["exp_avg"][:, just] == 0))
+            self.assertTrue(torch.all(opt.state[net.blocks[0].mlp[0].weight]["exp_avg_sq"][just] == 0))
+
+    def test_function_preserved_at_replacement(self):
+        net, opt, cbp = self._setup(rate=0.0)
+        self._train(net, opt, cbp, 10)
+        x = torch.randn(4, 49 * 32)
+        net.eval()
+        before = net(x).detach()
+        cbp.rate = 0.2                                          # force replacements on one more step, no update
+        n0 = cbp.replaced
+        cbp.step()
+        self.assertGreater(cbp.replaced, n0)
+        after = net(x).detach()
+        # outgoing weights zeroed and the mean contribution moved to the bias: outputs change only by the
+        # units' deviation from their running mean, so they stay close
+        self.assertLess((after - before).abs().max().item(), 1.0)
+
+    def test_eval_does_not_record_and_pickles(self):
+        import io
+        net, opt, cbp = self._setup(rate=0.0)
+        net.eval()
+        net(torch.randn(2, 49 * 32))
+        self.assertTrue(all(a is None for a in cbp.acts))
+        buf = io.BytesIO()
+        torch.save(net, buf)
+
+    def test_rate_zero_replaces_nothing(self):
+        net, opt, cbp = self._setup(rate=0.0)
+        torch.manual_seed(1)
+        self._train(net, opt, cbp, 5)
+        self.assertEqual(cbp.replaced, 0)
