@@ -93,6 +93,12 @@ CMP = [("LTM + RL STM, sleep + reset", "w16_stm_sl16_1e-4_k100_reset", "w16b_stm
         "-" if r == "reset" else "--")
        for h, name, col in (("knn", "kNN", SERIES[2]), ("fly", "FlyModel", SERIES[3]), ("sdmlp", "SDMLP", SERIES[4]))
        for r in ("reset", "keep")]
+# cmp_tuned (Dave 16 Nov 2026): the heads at their tuned settings (w18 / w18b; queue_hd.sh TUNED=1); output prefix cmp
+TUNED_AS = {"knn_reset": "defaults", "knn_keep": "replay 0", "fly_reset": "lr 2", "fly_keep": "lr 2",
+            "sdmlp_reset": "repeats 64, lr .5", "sdmlp_keep": "repeats 64, lr .5"}
+CMP_TUNED = [m for m in CMP if not m[1].startswith("w17_")] + [
+    (f"{label} ({TUNED_AS[c1[9:]]})", "w18" + c1[3:], "w18b" + c2[4:], col, ls) for label, c1, c2, col, ls in CMP
+    if c1.startswith("w17_")]
 PREFIX = "final"  # output file prefix; "cmp" with --set cmp (axes then scaled to the data)
 # cmp: the six metrics' mean (Overall) and their minimum (Dave 16 Nov 2026: Overall - worst, which favours a model robust
 # across the metrics over one making a hard trade-off); both from the seed-mean metrics
@@ -376,12 +382,14 @@ def main():
     ap.add_argument("--run", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--recap", default="", help="task 1 round 4 stage C tables (stage_c_tables.md)")
-    ap.add_argument("--set", default="final", choices=["final", "cmp"])
+    ap.add_argument("--set", default="final", choices=["final", "cmp", "cmp_tuned"])
     args = ap.parse_args()
     RUN = args.run
     os.makedirs(args.out, exist_ok=True)
     if args.set == "cmp":
         BEST, PREFIX, TITLE = CMP, "cmp", "the comparison models"
+    elif args.set == "cmp_tuned":
+        BEST, PREFIX, TITLE = CMP_TUNED, "cmp", "the comparison models, heads tuned"
     rows = fig_search(args) if args.set == "final" else []
     fig_phase1(args)
     fig_phase2(args)

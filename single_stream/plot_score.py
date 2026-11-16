@@ -54,13 +54,22 @@ TUNED = [("stm_pilot/four1", "ltm", "LTM + replay + sleep (LTM alone)", SERIES[0
          (TUNE, "fly_lr2_keep", "FlyModel head, kept (lr 2)", SERIES[3], "--", True),
          (TUNE, "sdmlp_rep64_lr0.5_reset", "SDMLP head, reset (repeats 64, lr .5)", SERIES[4], "-", True),
          (TUNE, "sdmlp_rep64_lr0.5_keep", "SDMLP head, kept (repeats 64, lr .5)", SERIES[4], "--", True)]
-SETS = {"four1": FOUR1, "cmp": CMP4, "tune": TUNED}
+# cmp_tuned (Dave 16 Nov 2026): cmp4 with the heads at their tuned settings (comparisons/cmp4_tuned; queue_cmp4.sh TUNED=1)
+TUNED_AS = {"knn_reset": "defaults", "knn_keep": "replay 0", "fly_reset": "lr 2", "fly_keep": "lr 2",
+            "sdmlp_reset": "repeats 64, lr .5", "sdmlp_keep": "repeats 64, lr .5"}
+CMP4_TUNED = [m for m in CMP4 if not m[5] or m[0] != CMP] + [
+    ("comparisons/cmp4_tuned", p, f"{label} ({TUNED_AS[p]})", col, ls, True) for d, p, label, col, ls, _ in CMP4
+    if p in TUNED_AS]
+SETS = {"four1": FOUR1, "cmp": CMP4, "cmp_tuned": CMP4_TUNED, "tune": TUNED}
 SET_SEEDS = {"tune": (0, 1, 2)}
 WINDOWS = {"tune": {"last_task": 1, "max_t_task": 2048}}
 SEEDS = (0, 1)
 WINDOW = {}
 # (summary title, curves title opening) when not the four-task defaults
-TITLES = {"tune": ("Head tuning, stage 2 winners: task 2's first 2,048 exposures (heads: seeds 0-2; LTM alone and RL STM: "
+TITLES = {"cmp_tuned": ("Four tasks, heads tuned (tasks 2-4 cut to 5,120 exposures; mean of seeds): the core metrics at a "
+                        "class's\nn-th exposure, n = 1-64, their mean (Overall) and minimum (Overall \u2013 worst). Each "
+                        "axis zoomed to its own range.", ""),
+          "tune": ("Head tuning, stage 2 winners: task 2's first 2,048 exposures (heads: seeds 0-2; LTM alone and RL STM: "
                    "four1, seeds 0-1). Core metrics at a class's n-th exposure, n = 1-64, Overall and Overall \u2013 worst.",
                    "Head tuning, stage 2 winners: the core metrics at a class's n-th exposure in task 2 (first 2,048 "
                    "exposures).")}
