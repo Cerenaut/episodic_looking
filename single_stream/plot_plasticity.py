@@ -4,6 +4,7 @@ Plasticity stage 1 figure (Dave 16 Nov 2026; plasticity/queue_plast1.sh): end-of
 cluster size, mean of seeds (rolling mean over 10 tasks for accuracy).
 
     python -m single_stream.plot_plasticity --root runs_ss/mnist_clustered_single_stream/plasticity/plast1 --out <dir>
+(writes <dir>/<root basename>.png)
 """
 import argparse
 import glob
@@ -37,6 +38,9 @@ def main():
     for row, c in enumerate((512, 128)):
         for m, label, col in MODELS:
             runs = [ends(r) for r in sorted(glob.glob(os.path.join(args.root, f"{m}_c{c}_s*", "")))]
+            if not runs:
+                continue
+            n = len(runs[0]["acc_seen"])
             for ax, (key, title) in zip(axes[row], PANELS):
                 y = np.mean([r[key] for r in runs], 0)
                 t = np.arange(1, len(y) + 1)
@@ -47,14 +51,15 @@ def main():
                 ax.set_title(f"{title}, c {c}", fontsize=9)
                 ax.grid(alpha=.3)
         for ax in axes[row]:
-            for k in (25, 50, 100):
-                ax.axvline(k, color="grey", lw=.8, ls=":")
+            for k in (25, 50, 100, 200, 400):
+                if k <= n:
+                        ax.axvline(k, color="grey", lw=.8, ls=":")
     for ax in axes[1]:
         ax.set_xlabel("task")
     axes[0][0].legend(fontsize=8)
-    fig.suptitle("Plasticity stage 1: 100 tasks (dihedral cycle + deranged label maps), mean of seeds 0-1")
+    fig.suptitle(f"Plasticity: {n} tasks (dihedral cycle + deranged label maps), mean of seeds 0-1")
     fig.tight_layout()
-    path = os.path.join(args.out, "plast1.png")
+    path = os.path.join(args.out, os.path.basename(os.path.normpath(args.root)) + ".png")
     fig.savefig(path, dpi=120)
     print(path)
 
