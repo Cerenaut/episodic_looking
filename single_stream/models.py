@@ -128,16 +128,18 @@ class TransformerContinualBackprop:
     `rate` x (number eligible) per step, and when it reaches 1 the eligible units with the lowest bias-corrected
     utility are replaced: incoming weights and bias re-initialised with nn.Linear's own initialiser (as the network
     was built), the unit's mean contribution folded into mlp[2]'s bias, outgoing weights zeroed, utility and age
-    reset. With AdamW (`opt`, set after the model is built) the replaced weights' moments are zeroed too, so the new
+    reset. fold=False skips the bias fold (Dave 17 Nov: the folded bias grows without bound at high rates). With AdamW
+    (`opt`, set after the model is built) the replaced weights' moments are zeroed too, so the new
     unit starts without the old unit's gradient history. Activations come from a forward hook on each GELU that
     records only in training mode (evaluation and diagnostics leave them alone). Phase-blind: runs every step.
     """
 
-    def __init__(self, net, rate=1e-4, decay=0.99, maturity=100):
+    def __init__(self, net, rate=1e-4, decay=0.99, maturity=100, fold=True):
         self.net = net
         self.rate = rate
         self.decay = decay
         self.maturity = maturity
+        self.fold = fold  # False: drop the replaced unit's mean contribution instead of folding it into mlp[2].bias
         self.opt = None
         n = [block.mlp[0].out_features for block in net.blocks]
         self.util = [torch.zeros(k) for k in n]
@@ -185,8 +187,9 @@ class TransformerContinualBackprop:
             corrected[~eligible] = float("inf")
             units = torch.topk(corrected, k, largest=False).indices
 
-            mean = self.mean_act[i][units] / correction[units].float()
-            out.bias += out.weight[:, units] @ mean
+            if self.fold:
+                mean = self.mean_act[i][units] / correction[units].float()
+                out.bias += out.weight[:, units] @ mean
             out.weight[:, units] = 0.0
             fresh = nn.Linear(inc.in_features, k)
             inc.weight[units] = fresh.weight

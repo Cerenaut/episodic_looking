@@ -161,3 +161,17 @@ class TestTransformerContinualBackprop(unittest.TestCase):
         torch.manual_seed(1)
         self._train(net, opt, cbp, 5)
         self.assertEqual(cbp.replaced, 0)
+
+    def test_no_fold_leaves_bias(self):
+        from single_stream.models import TransformerContinualBackprop
+        torch.manual_seed(0)
+        net = BiasableTransformer(num_tokens=49, token_size=32, num_classes=10, blocks=1)
+        cbp = TransformerContinualBackprop(net, rate=0.0, maturity=5, fold=False)
+        opt = torch.optim.SGD(net.parameters(), lr=0.0)          # lr 0: only continual backprop changes weights
+        cbp.opt = opt
+        self._train(net, opt, cbp, 10)
+        bias = net.blocks[0].mlp[2].bias.clone()
+        cbp.rate = 0.2
+        cbp.step()
+        self.assertGreater(cbp.replaced, 0)
+        self.assertTrue(torch.equal(net.blocks[0].mlp[2].bias, bias))

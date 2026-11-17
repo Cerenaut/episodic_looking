@@ -69,6 +69,8 @@ def build_parser(description=__doc__):
     p.add_argument("--cbp-rate", type=float, default=0.0, help="continual backprop replacement rate; 0 = off")
     p.add_argument("--cbp-decay", type=float, default=0.99)
     p.add_argument("--cbp-maturity", type=int, default=100)
+    p.add_argument("--cbp-no-fold", action="store_true",
+                   help="transformer continual backprop: do not fold a replaced unit's mean contribution into the bias")
     p.add_argument("--replay-capacity", type=int, default=1000)
     p.add_argument("--replay-batch", type=int, default=10)
     p.add_argument("--replay-period", type=int, default=16, help="replayonly: exposures between replay updates")
@@ -190,7 +192,8 @@ def build_model(args, train, token_shape=None):
         if args.net == "mlp":
             cbp = ContinualBackprop(net, args.cbp_rate, args.cbp_decay, args.cbp_maturity)
         elif args.net == "transformer":
-            cbp = TransformerContinualBackprop(net, args.cbp_rate, args.cbp_decay, args.cbp_maturity)
+            cbp = TransformerContinualBackprop(net, args.cbp_rate, args.cbp_decay, args.cbp_maturity,
+                                               fold=not args.cbp_no_fold)
         else:
             raise ValueError("continual backprop is implemented for --net mlp and transformer only")
     common = dict(lr=args.lr, steps=args.steps, momentum=args.momentum, weight_decay=args.weight_decay, cbp=cbp)
