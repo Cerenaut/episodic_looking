@@ -3,7 +3,7 @@ Plasticity stage 1 figure (Dave 16 Nov 2026; plasticity/queue_plast1.sh): end-of
 (acc_seen) and the LTM diagnostics (single_stream/plasticity.py) against the task index, one line per model and
 cluster size, mean of seeds (rolling mean over 10 tasks for accuracy).
 
-    python -m single_stream.plot_plasticity --root runs_ss/mnist_clustered_single_stream/plasticity/plast1 --out <dir> [--sweep]
+    python -m single_stream.plot_plasticity --root runs_ss/mnist_clustered_single_stream/plasticity/plast1 --out <dir> [--sweep | --run label=dir ... --name f.png]
 (writes <dir>/<root basename>.png)
 """
 import argparse
@@ -65,13 +65,52 @@ def sweep(args):
     print(path)
 
 
+def compare(args):
+    """Chosen settings against each other: --run label=dir (repeatable), one row per model (dir name prefix)."""
+    runs = [(l.replace("_", " "), d) for l, d in (r.split("=", 1) for r in args.run)]  # label: _ for space
+    models = [m for m, _, _ in MODELS if any(os.path.basename(d).startswith(m + "_") for _, d in runs)]
+    fig, axes = plt.subplots(len(models), len(PANELS), figsize=(16, 3.6 * len(models)), sharex=True, squeeze=False)
+    for row, m in enumerate(models):
+        label_m = next(l for k, l, _ in MODELS if k == m)
+        mine = [(l, d) for l, d in runs if os.path.basename(os.path.normpath(d)).startswith(m + "_")]
+        for j, (label, d) in enumerate(mine):
+            r = ends(d)
+            n = len(r["acc_seen"])
+            for ax, (key, title) in zip(axes[row], PANELS):
+                y, t = r[key], np.arange(1, n + 1)
+                if key == "acc_seen":
+                    y = np.convolve(y[1:], np.ones(10) / 10, "valid")
+                    t = np.arange(11, len(y) + 11)
+                ax.plot(t, y, color=f"C{j}" if j else "0.2", lw=1.5, label=label)
+                ax.set_title(f"{title}, {label_m}", fontsize=9)
+                ax.grid(alpha=.3)
+                if key == "plast_weight_norm":
+                    ax.set_yscale("log")
+        for ax in axes[row]:
+            for k in range(100, n + 1, 100):
+                ax.axvline(k, color="grey", lw=.8, ls=":")
+        axes[row][0].legend(fontsize=7)
+    for ax in axes[-1]:
+        ax.set_xlabel("task")
+    fig.suptitle(args.title or "")
+    fig.tight_layout()
+    path = os.path.join(args.out, args.name)
+    fig.savefig(path, dpi=120)
+    print(path)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", required=True)
+    ap.add_argument("--root")
     ap.add_argument("--out", required=True)
     ap.add_argument("--sweep", action="store_true", help="stage 2: continual-backprop rates at c 128, seed 0")
+    ap.add_argument("--run", action="append", help="label=dir: compare these runs (one row per model)")
+    ap.add_argument("--name", default="compare.png")
+    ap.add_argument("--title")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
+    if args.run:
+        return compare(args)
     if args.sweep:
         return sweep(args)
     fig, axes = plt.subplots(2, len(PANELS), figsize=(16, 7), sharex=True)
