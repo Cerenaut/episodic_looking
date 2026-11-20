@@ -57,6 +57,11 @@ def parse_args(argv=None):
                    help="task indices (0 = first) on which few-shot triggers run; empty = all (--lifelong: 1 and last)")
     p.add_argument("--snapshot-before", default="",
                    help="task indices before which the model and random states are saved (snapshot_task<k>.pt)")
+    p.add_argument("--resume-from", default="",
+                   help="a --snapshot-before file: continue that run from its task, with its model (LTM) and random "
+                        "states. --model buffered: the snapshot's model as it is; --model cls: a fresh STM (this run's "
+                        "--stm-* flags) on the snapshot's LTM (Dave 21 Nov 2026: the RL STM on the fixed and unfixed LTM)")
+    p.add_argument("--stop-after-task", type=int, default=-1, help="last task index to run (-1: all)")
     p.add_argument("--plasticity-probe", type=int, default=1000,
                    help="--lifelong: held-out samples of the task used for the plasticity diagnostics")
     p.add_argument("--full-first-task", action="store_true",
@@ -104,7 +109,22 @@ def main(argv=None):
     snapshot_before = {int(v) for v in args.snapshot_before.split(",") if v.strip()}
     token_shape = (49, pre.channels) if pre is not None else None
     train = tasks.featurized(names[0], train_raw, pre, cache)
-    model = build_model(args, train, token_shape)
+    start_task = 0
+    if args.resume_from:
+        snap = torch.load(args.resume_from, weights_only=False)
+        if args.model == "cls":
+            model = build_model(args, train, token_shape, ltm=snap["model"])
+        elif args.model == "buffered":
+            model = snap["model"]
+        else:
+            sys.exit("--resume-from: --model buffered or cls")
+        rng.bit_generator.state = snap["np_rng"]
+        torch.set_rng_state(snap["torch_rng"])
+        start_task = snap["task"]
+        if names[start_task] != snap["task_name"]:
+            sys.exit(f"--resume-from: task {start_task} is {names[start_task]} here, {snap['task_name']} in the snapshot")
+    else:
+        model = build_model(args, train, token_shape)
     log(f"tasks {names if len(names) <= 8 else names[:3] + ['...'] + names[-2:]} ({len(names)})  train {len(train)}  eval {len(eval_raw)}  c={args.cluster_size}  epochs/task {args.epochs}  "
         f"memory {model.memory_values() / 1e6:.2f}M values")
 
@@ -117,11 +137,15 @@ def main(argv=None):
     if args.stm_trace and isinstance(model, CLSModel):
         model.trace = []
         trace_file = open(os.path.join(args.out, "stm_trace.jsonl"), "w")
-    t = 0
+    t = snap["t"] if args.resume_from else 0
     train_time = eval_time = 0.0
     summary = {"tasks": names, "per_task": []}
 
     for ti, name in enumerate(names):
+        if ti < start_task:
+            continue
+        if 0 <= args.stop_after_task < ti:
+            break
         if ti > 0:
             train = tasks.featurized(name, train_raw, pre, cache)
         if args.lifelong:

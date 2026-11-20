@@ -177,7 +177,12 @@ def build_parser(description=__doc__):
     return p
 
 
-def build_model(args, train, token_shape=None):
+def build_model(args, train, token_shape=None, ltm=None):
+    """`ltm`: an existing BufferedReplayLTM (a resumed snapshot's) to build a --model cls around, in place of a new one."""
+    if ltm is not None:
+        if args.model != "cls":
+            raise ValueError("an existing LTM is used only with --model cls")
+        return build_cls(args, ltm, ltm.net, train)
     widths = [int(w) for w in args.widths.split(",")]
     transformer = None
     if args.net == "transformer":
@@ -232,28 +237,34 @@ def build_model(args, train, token_shape=None):
             return ltm
         if args.model == "head":
             return build_head_model(args, ltm, net, train.num_classes)
-        if args.replay_live:
-            raise ValueError("cls: the LTM learns only in sleep (no --replay-live)")
-        stm = build_stm(args, net, train.num_classes)
-        initial = copy.deepcopy(stm.model)  # --sleep-reset-stm restarts from here
-        stm_buffer = None
-        if args.stm_buffer == "ring":
-            stm_buffer = RingBuffer(args.stm_buffer_capacity, parts, seed=args.seed + 1)
-        elif args.stm_buffer == "priority":
-            stm_buffer = PriorityBuffer(args.stm_buffer_capacity, parts, alpha_evict=args.alpha_evict,
-                                        alpha_replay=args.alpha_replay, seed=args.seed + 1)
-
-        def stm_factory():
-            from single_stream.stm import RLSTM
-            return RLSTM(net, copy.deepcopy(initial), steps=args.stm_steps, lr=args.stm_lr, momentum=args.stm_momentum,
-                         incremental=args.stm_incremental)
-        return CLSModel(ltm, stm, repeats=args.stm_repeats, replay_ratio=args.stm_replay_ratio,
-                        learn_live=not args.stm_no_live, block=args.stm_block, stop_p=args.stm_stop_p,
-                        patience=args.stm_patience, gain_eps=args.stm_gain_eps, interleave=args.stm_interleave,
-                        reset_on_sleep=args.sleep_reset_stm, stm_factory=stm_factory, stm_delay=args.stm_delay,
-                        stm_buffer=stm_buffer)
+        return build_cls(args, ltm, net, train)
     return ReplayLTM(net, capacity=args.replay_capacity, replay_batch=args.replay_batch,
                      input_shape=train.x.shape[1:], seed=args.seed, **common)
+
+
+def build_cls(args, ltm, net, train):
+    """--model cls: an RL STM (--stm-* flags) on the LTM `ltm` (its network `net`)."""
+    parts = part_specs(train.x[:1], train.y[:1])
+    if args.replay_live:
+        raise ValueError("cls: the LTM learns only in sleep (no --replay-live)")
+    stm = build_stm(args, net, train.num_classes)
+    initial = copy.deepcopy(stm.model)  # --sleep-reset-stm restarts from here
+    stm_buffer = None
+    if args.stm_buffer == "ring":
+        stm_buffer = RingBuffer(args.stm_buffer_capacity, parts, seed=args.seed + 1)
+    elif args.stm_buffer == "priority":
+        stm_buffer = PriorityBuffer(args.stm_buffer_capacity, parts, alpha_evict=args.alpha_evict,
+                                    alpha_replay=args.alpha_replay, seed=args.seed + 1)
+
+    def stm_factory():
+        from single_stream.stm import RLSTM
+        return RLSTM(net, copy.deepcopy(initial), steps=args.stm_steps, lr=args.stm_lr, momentum=args.stm_momentum,
+                     incremental=args.stm_incremental)
+    return CLSModel(ltm, stm, repeats=args.stm_repeats, replay_ratio=args.stm_replay_ratio,
+                    learn_live=not args.stm_no_live, block=args.stm_block, stop_p=args.stm_stop_p,
+                    patience=args.stm_patience, gain_eps=args.stm_gain_eps, interleave=args.stm_interleave,
+                    reset_on_sleep=args.sleep_reset_stm, stm_factory=stm_factory, stm_delay=args.stm_delay,
+                    stm_buffer=stm_buffer)
 
 
 def build_head_model(args, ltm, net, num_classes):
