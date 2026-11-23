@@ -59,7 +59,7 @@ def parse_args(argv=None):
                    help="task indices before which the model and random states are saved (snapshot_task<k>.pt)")
     p.add_argument("--resume-from", default="",
                    help="a --snapshot-before file: continue that run from its task, with its model (LTM) and random "
-                        "states. --model buffered: the snapshot's model as it is; --model cls: a fresh STM (this run's "
+                        "states. --model buffered or head: the snapshot's model (LTM and head) as it is; --model cls: a fresh STM (this run's "
                         "--stm-* flags) on the snapshot's LTM (Dave 21 Nov 2026: the RL STM on the fixed and unfixed LTM)")
     p.add_argument("--stop-after-task", type=int, default=-1, help="last task index to run (-1: all)")
     p.add_argument("--plasticity-probe", type=int, default=1000,
@@ -114,10 +114,10 @@ def main(argv=None):
         snap = torch.load(args.resume_from, weights_only=False)
         if args.model == "cls":
             model = build_model(args, train, token_shape, ltm=snap["model"])
-        elif args.model == "buffered":
+        elif args.model in ("buffered", "head"):
             model = snap["model"]
         else:
-            sys.exit("--resume-from: --model buffered or cls")
+            sys.exit("--resume-from: --model buffered, head or cls")
         rng.bit_generator.state = snap["np_rng"]
         torch.set_rng_state(snap["torch_rng"])
         start_task = snap["task"]
