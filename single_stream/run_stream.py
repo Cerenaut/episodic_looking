@@ -259,7 +259,7 @@ def build_cls(args, ltm, net, train):
     def stm_factory():
         from single_stream.stm import RLSTM
         return RLSTM(net, copy.deepcopy(initial), steps=args.stm_steps, lr=args.stm_lr, momentum=args.stm_momentum,
-                     incremental=args.stm_incremental)
+                     incremental=args.stm_incremental, grad_stats=False)
     return CLSModel(ltm, stm, repeats=args.stm_repeats, replay_ratio=args.stm_replay_ratio,
                     learn_live=not args.stm_no_live, block=args.stm_block, stop_p=args.stm_stop_p,
                     patience=args.stm_patience, gain_eps=args.stm_gain_eps, interleave=args.stm_interleave,
@@ -297,7 +297,7 @@ def build_stm(args, net, num_classes):
         stm_actor_sparse_init=args.stm_sparse_init in ("actor", "both"), step_input=args.stm_step_input, class_bonus=args.stm_class_bonus, seed=args.seed)
     model = MnistModel(config, encoded_size=net.d_model, bias_size=net.bias_size)
     return RLSTM(net, model, steps=args.stm_steps, lr=args.stm_lr, momentum=args.stm_momentum,
-                 incremental=args.stm_incremental)
+                 incremental=args.stm_incremental, grad_stats=False)
 
 
 @torch.no_grad()

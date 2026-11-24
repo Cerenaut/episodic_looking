@@ -107,7 +107,12 @@ class SparseDistributedEncoder(nn.Module):
         ).view(B, E, Z)  # faster because uses standard GEMM format
 
         # Scores shape: [B, E, Z]
-        
+
+        # One ensemble: the per-ensemble top-k is already the final set (the re-scoring below selects the same
+        # cells), so skip the second pass (Dave 25 Nov 2026: exact, ~2% of RL STM time)
+        if E == 1:
+            return torch.topk(scores[:, 0], k, dim=1).indices
+
         # Top-k per ensemble, only these considered as potential winners
         _, ensemble_topk_indices = torch.topk(scores, k, dim=2) # [B, E, k]
 

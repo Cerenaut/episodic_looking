@@ -42,14 +42,21 @@ class RLSTM:
     incremental: each action is a change to the bias, which accumulates over the episode (from 0); the LTM receives
     the cumulative bias, and the observation's bias part is the cumulative bias, so the actor can see and cancel
     earlier moves. Otherwise each action is the bias itself.
+    grad_stats: record the gradient norm of each parameter group in last_update (diagnostics, ~8% of the time;
+    Dave 25 Nov 2026: off in the stream harness, which never reads them).
+
+    With the "first" mask key the key is the episode's first observation, fixed for the whole episode (the
+    first-observation conditioner only updates at step 0, recruitment runs after the episode), so the actor's and
+    critic's cliques are encoded once at step 0 and reused at the later steps and in the update (exact).
     """
 
     def __init__(self, ltm_net, model: MnistModel, steps=4, lr=0.01, momentum=0.5, bias_basis=None,
-                 incremental=False):
+                 incremental=False, grad_stats=True):
         self.ltm = ltm_net          # BiasableTransformer (shared with the LTM model; read-only here)
         self.model = model
         self.bias_basis = bias_basis
         self.incremental = incremental
+        self.grad_stats = grad_stats
         self.steps = steps
         self.opt = torch.optim.SGD(model.get_trainable_parameters(), lr=lr, momentum=momentum)
         self.episodes = 0
@@ -114,13 +121,15 @@ class RLSTM:
         logits = [out["logits"]]
         inputs, windows, contexts, samples, log_p_old, values = [], [], [], [], [], []
         keys_a, active_a, keys_c, active_c, biases = [], [], [], [], []
+        fixed_key = self.model.is_first_observation_input()
         with torch.set_grad_enabled(learn):
             for t in range(T):
                 inp = self._input(history)
                 ctx = torch.full((B, 1), (T - t) / T) if cfg.step_input else None
-                v, kc, ac = self.model.do_critic(inp, ctx)
+                cached = fixed_key and t > 0
+                v, kc, ac = self.model.do_critic(inp, ctx, active=active_c[0] if cached else None)
                 value_window = torch.cat([value_window[:, 1:], v.detach()[:, None]], dim=1)
-                policy, ka, aa = self.model.do_actor(inp, value_window, ctx)
+                policy, ka, aa = self.model.do_actor(inp, value_window, ctx, active=active_a[0] if cached else None)
                 a = policy.sample if sample else policy.mean.detach()
                 a = a.detach()
                 bias = bias + a if self.incremental else a   # bias applied (cumulative if incremental)
@@ -154,13 +163,14 @@ class RLSTM:
                 self.recruited += self.model.recruit(keys_a, active_a, keys_c, active_c)
             self.episodes += 1
         elif learn:
-            self._update(inputs, windows, contexts, samples, log_p_old, values, returns)
+            active = active_a[0].repeat(T, 1) if fixed_key and active_a[0] is not None else None  # step-major rows
+            self._update(inputs, windows, contexts, samples, log_p_old, values, returns, active)
             if active_a[0] is not None:
                 self.recruited += self.model.recruit(keys_a, active_a, keys_c, active_c)
             self.episodes += 1
         return result
 
-    def _update(self, inputs, windows, contexts, samples, log_p_old, values, returns):
+    def _update(self, inputs, windows, contexts, samples, log_p_old, values, returns, active=None):
         cfg = self.model.config
         v = torch.stack(values)                       # [T, B], with grads
         advantage = (returns - v.detach())            # [T, B]
@@ -170,7 +180,7 @@ class RLSTM:
         stats = {"advantage": float(advantage.mean()), "advantage_abs": float(advantage.abs().mean()),
                  "return_0": float(returns[0].mean()), "value_0": float(v[0].detach().mean())}
         for k in range(cfg.actor_updates):
-            log_p = self.model.actor_log_p(inp, win, smp, ctx)
+            log_p = self.model.actor_log_p(inp, win, smp, ctx, active=active)
             loss = self.model.actor_loss(log_p, log_p_old.flatten(), advantage.flatten())
             if k == 0:
                 critic_loss = self.model.critic_loss(v.flatten(), returns.flatten())
@@ -178,7 +188,7 @@ class RLSTM:
                 loss = loss + critic_loss
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
-            if k == 0:
+            if k == 0 and self.grad_stats:
                 for name, params in self.param_groups.items():
                     stats[f"grad_{name}"] = float(torch.sqrt(sum((p.grad ** 2).sum() for p in params
                                                                  if p.grad is not None)))
@@ -213,7 +223,7 @@ class RLSTM:
                 loss = loss + critic_loss
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
-            if k == 0:
+            if k == 0 and self.grad_stats:
                 for name, params in self.param_groups.items():
                     stats[f"grad_{name}"] = float(torch.sqrt(sum((p.grad ** 2).sum() for p in params
                                                                  if p.grad is not None)))

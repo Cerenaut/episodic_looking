@@ -75,7 +75,7 @@ class TestEpisode(unittest.TestCase):
         net, stm = make_stm(steps=4, history=2)
         seen = []
         orig = stm.model.do_critic
-        stm.model.do_critic = lambda inp, ctx=None: (seen.append(inp.clone()), orig(inp, ctx))[1]
+        stm.model.do_critic = lambda inp, ctx=None, active=None: (seen.append(inp.clone()), orig(inp, ctx, active))[1]
         x = torch.rand(1, 49 * 8)
         res = stm.episode(x)
         O = stm.model.observation_size
@@ -540,6 +540,32 @@ class TestWave8(unittest.TestCase):
         self.assertFalse(torch.equal(stream_order(args, yt), o))
         args.seed, args.stream_seed = 3, 0                  # the stream depends on the stream seed only
         self.assertTrue(torch.equal(stream_order(args, yt), o))
+
+
+class TestExactSpeedups(unittest.TestCase):
+    """Dave 25 Nov 2026: the RL STM speed-ups must not change results."""
+
+    def test_single_ensemble_fast_path_selects_the_two_pass_cells(self):
+        torch.manual_seed(0)
+        enc = SparseDistributedEncoder(input_key_size=30, memory_size=400, sparsity=16, device=torch.device("cpu"))
+        x = torch.randn(64, 30)
+        scores = (x @ enc.input_projection.T).view(64, 1, 400)
+        first = torch.topk(scores, 16, dim=2).indices.reshape(64, -1)     # the two-pass algorithm, written out
+        mask = torch.zeros(64, 400, dtype=torch.bool).scatter_(1, first, True)
+        combined = scores.masked_fill(~mask.unsqueeze(1), float("-inf")).max(dim=1).values
+        two_pass = torch.topk(combined, 16, dim=1).indices
+        self.assertTrue(torch.equal(enc.encode(x), two_pass))
+
+    def test_cached_cliques_equal_a_fresh_encode_of_every_step_key(self):
+        _, stm = make_stm(steps=4, history=4)
+        captured = {}
+        stm.model.recruit = lambda ka, aa, kc, ac: captured.update(ka=ka, aa=aa, kc=kc, ac=ac) or 0
+        stm.episode(torch.randn(3, 49, 8), torch.tensor([1, 2, 3]), learn=True)
+        for keys, active, model in (("ka", "aa", stm.model.model_actor), ("kc", "ac", stm.model.model_critic)):
+            self.assertEqual(len(captured[keys]), 4)
+            for k, a in zip(captured[keys], captured[active]):
+                self.assertTrue(torch.equal(captured[keys][0], k))   # the key is fixed for the episode
+                self.assertTrue(torch.equal(model.encode(k), a))     # and the cached clique is its encoding
 
 
 if __name__ == "__main__":

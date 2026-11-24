@@ -286,17 +286,20 @@ class MnistModel:
 
     # Forward passes ---------------------------------------------------------------------------------------------
 
-    def do_model(self, model, input: torch.Tensor, extra: torch.Tensor | None = None):
+    def do_model(self, model, input: torch.Tensor, extra: torch.Tensor | None = None,
+                 active: torch.Tensor | None = None):
         """
         input: critic input (history vector, + first observation). extra: [B, n] appended to the model input only
-        (not to the mask key), e.g. the actor's value inputs. Returns (output, key, active indices or None).
+        (not to the mask key), e.g. the actor's value inputs. active: [B, sparsity] clique indices already encoded
+        from this input's key (skips the encode; the caller guarantees the key is the same). Returns (output, key,
+        active indices or None).
         """
         key, model_input = self.prepare_input(input)
         if extra is not None:
             model_input = torch.cat([model_input, extra], dim=1)
         if self.config.encoder_sparsity <= 0:
             return model(model_input), key, None
-        active_indices = model.encode(key)
+        active_indices = model.encode(key) if active is None else active
         active_mask = model.get_model(0).create_active_mask(model_input, active_indices=active_indices)
         output, _ = model.do_model(key_input=key, model_input=model_input, active_mask=active_mask)
         return output, key, active_indices
@@ -305,11 +308,12 @@ class MnistModel:
         parts = [p for p in parts if p is not None]
         return torch.cat(parts, dim=1) if parts else None
 
-    def do_actor(self, input: torch.Tensor, values: torch.Tensor | None, context: torch.Tensor | None = None):
-        """context: [B, context_size] per-step inputs (the step input), or None."""
+    def do_actor(self, input: torch.Tensor, values: torch.Tensor | None, context: torch.Tensor | None = None,
+                 active: torch.Tensor | None = None):
+        """context: [B, context_size] per-step inputs (the step input), or None. active: see do_model."""
         logits, key, active = self.do_model(
             self.model_actor, input,
-            extra=self._extra(values if self.config.actor_value_input else None, context))
+            extra=self._extra(values if self.config.actor_value_input else None, context), active=active)
         distribution, sample = PolicyUtil.sample_policy(logits=logits, config=self.policy_config)
         mean = PolicyUtil.get_policy_mean_continuous(
             logits=PolicyUtil.clamp_logits(logits, max_logit_magnitude=self.policy_config.max_logit_magnitude),
@@ -319,13 +323,13 @@ class MnistModel:
         return output, key, active
 
     def actor_log_p(self, input: torch.Tensor, values: torch.Tensor | None, sample: torch.Tensor,
-                    context: torch.Tensor | None = None):
-        """Joint log-probability of `sample` under the current actor (with grads)."""
-        output, _, _ = self.do_actor(input, values, context)
+                    context: torch.Tensor | None = None, active: torch.Tensor | None = None):
+        """Joint log-probability of `sample` under the current actor (with grads). active: see do_model."""
+        output, _, _ = self.do_actor(input, values, context, active=active)
         return output.distribution.log_prob(sample).sum(dim=-1)
 
-    def do_critic(self, input: torch.Tensor, context: torch.Tensor | None = None):
-        output, key, active = self.do_model(self.model_critic, input, extra=context)
+    def do_critic(self, input: torch.Tensor, context: torch.Tensor | None = None, active: torch.Tensor | None = None):
+        output, key, active = self.do_model(self.model_critic, input, extra=context, active=active)
         return output.squeeze(1), key, active
 
     @torch.no_grad()
