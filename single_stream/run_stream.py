@@ -98,6 +98,9 @@ def build_parser(description=__doc__):
     p.add_argument("--stm-layers", type=int, default=3)
     p.add_argument("--stm-lr", type=float, default=0.01)
     p.add_argument("--stm-momentum", type=float, default=0.5)
+    p.add_argument("--stm-momentum-active", action="store_true",
+                   help="SGD momentum only on the episode's active cells: other cells keep their weights and momentum "
+                        "buffers until selected again (Dave 25 Nov 2026; RLSTM momentum_active)")
     p.add_argument("--stm-reward", default="terminal-accuracy",
                    choices=["terminal-accuracy", "accuracy", "accuracy-improvement", "entropy", "entropy-improvement",
                             "log-accuracy", "margin", "accuracy-log"])
@@ -259,7 +262,8 @@ def build_cls(args, ltm, net, train):
     def stm_factory():
         from single_stream.stm import RLSTM
         return RLSTM(net, copy.deepcopy(initial), steps=args.stm_steps, lr=args.stm_lr, momentum=args.stm_momentum,
-                     incremental=args.stm_incremental, grad_stats=False)
+                     incremental=args.stm_incremental, grad_stats=False,
+                     momentum_active=args.stm_momentum_active)
     return CLSModel(ltm, stm, repeats=args.stm_repeats, replay_ratio=args.stm_replay_ratio,
                     learn_live=not args.stm_no_live, block=args.stm_block, stop_p=args.stm_stop_p,
                     patience=args.stm_patience, gain_eps=args.stm_gain_eps, interleave=args.stm_interleave,
@@ -297,7 +301,8 @@ def build_stm(args, net, num_classes):
         stm_actor_sparse_init=args.stm_sparse_init in ("actor", "both"), step_input=args.stm_step_input, class_bonus=args.stm_class_bonus, seed=args.seed)
     model = MnistModel(config, encoded_size=net.d_model, bias_size=net.bias_size)
     return RLSTM(net, model, steps=args.stm_steps, lr=args.stm_lr, momentum=args.stm_momentum,
-                 incremental=args.stm_incremental, grad_stats=False)
+                 incremental=args.stm_incremental, grad_stats=False,
+                     momentum_active=args.stm_momentum_active)
 
 
 @torch.no_grad()

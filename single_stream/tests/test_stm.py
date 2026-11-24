@@ -568,5 +568,44 @@ class TestExactSpeedups(unittest.TestCase):
                 self.assertTrue(torch.equal(model.encode(k), a))     # and the cached clique is its encoding
 
 
+class TestMomentumActive(unittest.TestCase):
+    """Dave 25 Nov 2026: SGD momentum only on the episode's active cells (RLSTM momentum_active)."""
+
+    def test_all_cells_active_is_plain_sgd_bitwise(self):
+        _, a = make_stm()
+        b = copy.deepcopy(a)
+        H = a.model.config.model_hidden_size
+        params_a, params_b = a.model.get_trainable_parameters(), b.model.get_trainable_parameters()
+        for step in range(3):
+            torch.manual_seed(step)
+            for pa, pb in zip(params_a, params_b):
+                pa.grad = torch.randn_like(pa)
+                pb.grad = pa.grad.clone()
+            a.opt.step()
+            b._step_active(torch.arange(H), torch.arange(H))
+        for pa, pb in zip(params_a, params_b):
+            self.assertTrue(torch.equal(pa, pb))
+
+    def test_inactive_cells_keep_their_weights(self):
+        x1, x2 = torch.randn(1, 49 * 8), torch.randn(1, 49 * 8)
+        y = torch.tensor([3])
+        moved = {}
+        for flag in (False, True):
+            _, stm = make_stm()
+            stm.momentum_active = flag
+            enc = stm.model.model_actor
+            stm.episode(x1, y, learn=True)
+            r1 = stm.episode(x1, y)["active_actor"][0][0]
+            r2 = stm.episode(x2, y)["active_actor"][0][0]
+            old = sorted(set(r1.tolist()) - set(r2.tolist()))
+            self.assertTrue(old)
+            w = enc.get_model(0).layers[0].weight
+            before = w[old].clone()
+            stm.episode(x2, y, learn=True)     # x2's clique learns; x1's other cells carry only momentum
+            moved[flag] = not torch.equal(w[old], before)
+        self.assertTrue(moved[False])           # plain momentum keeps moving them
+        self.assertFalse(moved[True])           # momentum_active freezes them
+
+
 if __name__ == "__main__":
     unittest.main()

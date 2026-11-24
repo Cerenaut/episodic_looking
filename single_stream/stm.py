@@ -48,15 +48,26 @@ class RLSTM:
     With the "first" mask key the key is the episode's first observation, fixed for the whole episode (the
     first-observation conditioner only updates at step 0, recruitment runs after the episode), so the actor's and
     critic's cliques are encoded once at step 0 and reused at the later steps and in the update (exact).
+
+    momentum_active (Dave 25 Nov 2026): SGD momentum only on the episode's active cells. Plain SGD momentum keeps
+    moving the cells of earlier samples after their last loss (the buffer decays by `momentum` per update); here a
+    cell's weights and momentum buffer are frozen while it is outside the episode's cliques and resume when it is
+    selected again. A cell's parameters: its row of each hidden layer (weight and bias), its column of the next
+    layer (so the middle layer moves only between two active cells), its column of the output layer. Shared
+    parameters (input layer norm, output bias) update every step as before. With every cell active it is plain SGD.
     """
 
     def __init__(self, ltm_net, model: MnistModel, steps=4, lr=0.01, momentum=0.5, bias_basis=None,
-                 incremental=False, grad_stats=True):
+                 incremental=False, grad_stats=True, momentum_active=False):
         self.ltm = ltm_net          # BiasableTransformer (shared with the LTM model; read-only here)
         self.model = model
         self.bias_basis = bias_basis
         self.incremental = incremental
         self.grad_stats = grad_stats
+        self.momentum_active = momentum_active
+        self.momentum = momentum
+        self.lr = lr
+        self.buffers = {}    # momentum buffers of the momentum_active step
         self.steps = steps
         self.opt = torch.optim.SGD(model.get_trainable_parameters(), lr=lr, momentum=momentum)
         self.episodes = 0
@@ -164,13 +175,15 @@ class RLSTM:
             self.episodes += 1
         elif learn:
             active = active_a[0].repeat(T, 1) if fixed_key and active_a[0] is not None else None  # step-major rows
-            self._update(inputs, windows, contexts, samples, log_p_old, values, returns, active)
+            cells = (torch.cat(active_a).unique(), torch.cat(active_c).unique()) if self.momentum_active else None
+            self._update(inputs, windows, contexts, samples, log_p_old, values, returns, active, cells)
             if active_a[0] is not None:
                 self.recruited += self.model.recruit(keys_a, active_a, keys_c, active_c)
             self.episodes += 1
         return result
 
-    def _update(self, inputs, windows, contexts, samples, log_p_old, values, returns, active=None):
+    def _update(self, inputs, windows, contexts, samples, log_p_old, values, returns, active=None, cells=None):
+        """cells: (actor cells, critic cells) active in the episode, for momentum_active."""
         cfg = self.model.config
         v = torch.stack(values)                       # [T, B], with grads
         advantage = (returns - v.detach())            # [T, B]
@@ -192,12 +205,17 @@ class RLSTM:
                 for name, params in self.param_groups.items():
                     stats[f"grad_{name}"] = float(torch.sqrt(sum((p.grad ** 2).sum() for p in params
                                                                  if p.grad is not None)))
-            self.opt.step()
+            if cells is None:
+                self.opt.step()
+            else:
+                self._step_active(*cells)
         self.last_update = stats
 
     def group_update(self, deferred, std_floor=1e-3):
         """One update on a group of deferred episodes (see the module docstring). The critic values are recomputed
         from the stored inputs (the parameters may have changed since the episodes ran)."""
+        if self.momentum_active:
+            raise NotImplementedError("momentum_active with group updates")
         cfg = self.model.config
         T = len(deferred[0][0])
 
@@ -229,6 +247,46 @@ class RLSTM:
                                                                  if p.grad is not None)))
             self.opt.step()
         self.last_update = stats
+
+    def _cell_masks(self, sparse_model, cells):
+        """{parameter: bool mask (broadcastable)} of a sparse model's per-cell parameters for `cells` (see class doc)."""
+        dense = sparse_model.get_model(0)
+        F, L = dense.config.hidden_size_factor, dense.config.layers
+        unit = torch.zeros(dense.config.hidden_size, dtype=torch.bool)
+        unit[(cells[:, None] * F + torch.arange(F)).flatten()] = True    # hidden units of the cells
+        masks = {}
+        for l, fc in enumerate(dense.layers):
+            hidden = l < L - 1
+            rows = unit[:, None] if hidden else torch.ones(fc.out_features, 1, dtype=torch.bool)
+            cols = unit[None, :] if l > 0 else torch.ones(1, fc.in_features, dtype=torch.bool)
+            masks[fc.weight] = rows & cols
+            if fc.bias is not None and hidden:
+                masks[fc.bias] = unit
+        return masks
+
+    @torch.no_grad()
+    def _step_active(self, actor_cells, critic_cells):
+        """SGD with momentum on the active cells only (momentum_active). Same arithmetic as torch.optim.SGD (no
+        dampening, nesterov or weight decay) on the parameters it updates; the others keep weights and buffers."""
+        masks = {**self._cell_masks(self.model.model_actor, actor_cells),
+                 **self._cell_masks(self.model.model_critic, critic_cells)}
+        for group in self.opt.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                buf = self.buffers.get(p)
+                mask = masks.get(p)
+                if mask is None:   # shared parameter: plain SGD step
+                    if buf is None:
+                        buf = self.buffers[p] = p.grad.detach().clone()
+                    else:
+                        buf.mul_(self.momentum).add_(p.grad)
+                    p.add_(buf, alpha=-self.lr)
+                    continue
+                if buf is None:
+                    buf = self.buffers[p] = torch.zeros_like(p)
+                buf.copy_(torch.where(mask, buf * self.momentum + p.grad, buf))
+                p.add_(torch.where(mask, buf, torch.zeros_like(buf)), alpha=-self.lr)
 
     def param_vector(self, group):
         """A detached flat copy of a parameter group (diagnostics: weight change between two points)."""
