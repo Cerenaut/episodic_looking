@@ -156,6 +156,36 @@ class TestTransformerContinualBackprop(unittest.TestCase):
         buf = io.BytesIO()
         torch.save(net, buf)
 
+    def test_resumed_recorder_survives_diagnostics(self):
+        """A snapshot loaded in a new process (hook counter back at 0): the diagnostics' hook must not displace the
+        CBP recorder (plast12 resume bug, 26 Nov 2026); run_tasks.advance_hook_ids prevents it."""
+        import io
+        from torch.utils.hooks import RemovableHandle
+        from single_stream import plasticity
+        from single_stream.models import _ActRecorder
+        from single_stream.run_tasks import advance_hook_ids
+        net, opt, cbp = self._setup(rate=0.0)
+        buf = io.BytesIO()
+        torch.save({"net": net, "cbp": cbp}, buf)
+        saved = RemovableHandle.next_id
+        x = torch.randn(3, 49 * 32)
+        try:
+            for fix in (False, True):
+                buf.seek(0)
+                snap = torch.load(buf, weights_only=False)
+                RemovableHandle.next_id = min(snap["net"].blocks[0].mlp[1]._forward_hooks)  # as in a new process
+                if fix:
+                    advance_hook_ids()
+                plasticity.diagnostics(snap["net"], x)
+                recorders = [h for b in snap["net"].blocks for h in b.mlp[1]._forward_hooks.values()
+                             if isinstance(h, _ActRecorder)]
+                self.assertEqual(len(recorders) == 2, fix)  # without the fix the diagnostics take the recorders' ids
+                snap["net"].train()
+                snap["net"](x)
+                self.assertEqual(all(a is not None for a in snap["cbp"].acts), fix)
+        finally:
+            RemovableHandle.next_id = max(RemovableHandle.next_id, saved)
+
     def test_rate_zero_replaces_nothing(self):
         net, opt, cbp = self._setup(rate=0.0)
         torch.manual_seed(1)

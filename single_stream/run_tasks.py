@@ -31,6 +31,22 @@ from single_stream.models import CLSModel
 from single_stream.run_stream import Tee, buffer_diagnostics, build_model, build_parser, rng_neutral, stm_diagnostics
 from single_stream.stream import ClusteredStream
 
+
+def advance_hook_ids():
+    """
+    After unpickling modules: move torch's hook-handle counter past every hook id they carry. The counter is
+    process-wide and starts at 0 in a new process, while the loaded modules keep their saved ids, so the next hook
+    registered (plasticity.diagnostics') could take a saved hook's id, overwrite it and delete it on removal: on
+    resume the LTM's continual-backprop activation recorder was lost at the first task end, and CBP then replaced
+    units on stale activations (Dave 26 Nov 2026, plast12). Runs that do not resume are unaffected.
+    """
+    import gc
+    from torch.utils.hooks import RemovableHandle
+    ids = [k for m in gc.get_objects() if issubclass(type(m), torch.nn.Module)
+           for name, d in vars(m).items() if name.endswith("hooks") and isinstance(d, dict)
+           for k in d if isinstance(k, int)]
+    RemovableHandle.next_id = max([RemovableHandle.next_id] + [k + 1 for k in ids])
+
 RECOVERY_POINTS = (0, 16, 64, 256, 1024, 4096, 16384)  # exposures since the switch, for the summary
 
 
@@ -112,6 +128,7 @@ def main(argv=None):
     start_task = 0
     if args.resume_from:
         snap = torch.load(args.resume_from, weights_only=False)
+        advance_hook_ids()
         if args.model == "cls":
             model = build_model(args, train, token_shape, ltm=snap["model"])
         elif args.model in ("buffered", "head"):
