@@ -7,7 +7,9 @@ cls, head) come online when the pre-training ends (--stm-delay and --head-delay 
 Evaluation (no learning, random state untouched) per phase: at n = 0 (before the new class's first exposure), at
 its n-th exposure for n in --points, every --check-every exposures and at the phase's end: accuracy on the
 evaluation images of each of the pair's 10 fine classes, and on the new class's training images shown so far
-(mem). One JSON line per checkpoint in evals.jsonl; metrics (cifar.score) in summary.json.
+(mem); for the STM variants also the LTM's own accuracy per fine class (acc_ltm: its output without the STM or
+head; Dave 26 Nov 2026: does the LTM come to separate look-alike fine classes of the two sides after sleep?). One
+JSON line per checkpoint in evals.jsonl; metrics (cifar.score) in summary.json.
 
     python -m single_stream.run_cifar --pair 0,1 --cluster-size 64 --preproc runs_ss/preproc/tinyimagenet_conv_c32_s0/preproc.pt \
         --net transformer --model buffered ... --out <dir>
@@ -114,10 +116,14 @@ def main(argv=None):
                 if shown:
                     rows = torch.tensor(shown)
                     mem = float((model.predict(x_tr[rows]).argmax(1) == y_tr[rows]).float().mean())
+                # the LTM's own answer (no STM or head): does the LTM itself come to separate look-alike classes?
+                p_ltm = metrics.evaluate(model.ltm, evals) if hasattr(model, "ltm") else None
             correct = p == evals.y.numpy()
             rec = {"t": t, "phase": i, "kind": ph["kind"], "new": new, "n": n, "t_phase": t_phase,
                    "seen": list(seen), "mem": mem,
                    "acc": {str(f): float(correct[f_ev == f].mean()) for f in classes},
+                   "acc_ltm": None if p_ltm is None else
+                   {str(f): float((p_ltm == evals.y.numpy())[f_ev == f].mean()) for f in classes},
                    "online_acc": online_correct / t_phase if t_phase else None}
             eval_time += time.perf_counter() - t0
             records.append(rec)
