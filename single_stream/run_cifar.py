@@ -33,6 +33,8 @@ def parse_args(argv=None):
     p.add_argument("--pair", required=True, help="two coarse class indices, a,b (label 0 = a, 1 = b)")
     p.add_argument("--cifar-root", default=os.path.expanduser("~/dev/claude/cifar-100-python"))
     p.add_argument("--pretrain-epochs", type=int, default=10, help="epochs of the pre-training classes' stream")
+    p.add_argument("--paired", action="store_true",
+                   help="introduce the fine classes in pairs (one per side), alternating clusters, no other classes")
     p.add_argument("--share", type=float, default=0.75, help="the new fine class's share of an introduction")
     p.add_argument("--val-per-class", type=int, default=100, help="validation images cut from each fine class")
     p.add_argument("--eval-split", default="val", choices=("val", "test"),
@@ -59,7 +61,7 @@ def main(argv=None):
     x_file, fine, coarse = data["train"]
     train_idx, val_idx = cifar.validation_split(fine, args.val_per_class, args.split_seed)
     sched = cifar.make_schedule(pair, fine, coarse, train_idx, args.seed, args.cluster_size, args.pretrain_epochs,
-                                args.share)
+                                args.share, args.paired)
     pretrain_len = sched["phases"][0]["length"]
     args.stm_delay = args.head_delay = pretrain_len  # the STM variants come online when the pre-training ends
     stream = sched.pop("stream")
@@ -103,8 +105,9 @@ def main(argv=None):
             if len(seg) == 0:
                 break
         new = ph["new"]
-        shown = []  # rows of the new class's images shown so far in this phase
-        n = 0
+        news = new if isinstance(new, list) else [] if new is None else [new]
+        shown = {f: [] for f in news}  # rows of each new class's images shown so far in this phase
+        ns = {f: 0 for f in news}
         online_correct = 0
 
         def checkpoint(t_phase):
@@ -112,13 +115,20 @@ def main(argv=None):
             t0 = time.perf_counter()
             with rng_neutral():
                 p = metrics.evaluate_variants(model, evals)["main"]
-                mem = None
-                if shown:
-                    rows = torch.tensor(shown)
-                    mem = float((model.predict(x_tr[rows]).argmax(1) == y_tr[rows]).float().mean())
+                mems = {}
+                for f in news:
+                    if shown[f]:
+                        rows = torch.tensor(shown[f])
+                        mems[f] = float((model.predict(x_tr[rows]).argmax(1) == y_tr[rows]).float().mean())
+                    else:
+                        mems[f] = None
                 # the LTM's own answer (no STM or head): does the LTM itself come to separate look-alike classes?
                 p_ltm = metrics.evaluate(model.ltm, evals) if hasattr(model, "ltm") else None
             correct = p == evals.y.numpy()
+            if isinstance(new, list):
+                n, mem = {str(f): ns[f] for f in news}, {str(f): mems[f] for f in news}
+            else:
+                n, mem = (ns[new], mems[new]) if news else (0, None)
             rec = {"t": t, "phase": i, "kind": ph["kind"], "new": new, "n": n, "t_phase": t_phase,
                    "seen": list(seen), "mem": mem,
                    "acc": {str(f): float(correct[f_ev == f].mean()) for f in classes},
@@ -141,23 +151,24 @@ def main(argv=None):
             online_correct += int(pred[0] == y_tr[r])
             t += 1
             hit = False
-            if new is not None and fine[idx] == new:
-                n += 1
-                shown.append(r)
-                hit = n in points
+            f = int(fine[idx])
+            if f in ns:
+                ns[f] += 1
+                shown[f].append(r)
+                hit = ns[f] in points
             if hit or (j + 1) % args.check_every == 0 or j + 1 == len(seg):
                 if ph["kind"] == "pretrain" and j + 1 < len(seg) and (j + 1) % (args.check_every * 8):
                     continue  # pre-training: sparser checkpoints
                 rec = checkpoint(j + 1)
-        shown_classes = sched["pretrain"] if new is None else seen + ([new] if new not in seen else [])
+        shown_classes = sched["pretrain"] if new is None else seen + [f for f in news if f not in seen]
         acc_seen = np.mean([rec["acc"][str(f)] for f in shown_classes])
-        log(f"phase {i} {ph['kind']} new {new} ({data['fine_names'][new] if new is not None else '-'}): "
+        log(f"phase {i} {ph['kind']} new {new} ({', '.join(data['fine_names'][f] for f in news) or '-'}): "
             f"end acc on seen classes {acc_seen:.3f}  online {online_correct / len(seg):.3f}  "
             f"train {train_time:.0f}s eval {eval_time:.0f}s")
         if ph["kind"] == "pretrain":
             seen.extend(sched["pretrain"])
-        elif new not in seen:
-            seen.append(new)
+        else:
+            seen.extend(f for f in news if f not in seen)
 
     ev_file.close()
     summary = {"metrics": cifar.score(records, sched["phases"], points), "stream_sha256": sched["stream_sha256"],

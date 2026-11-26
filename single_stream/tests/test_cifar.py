@@ -76,6 +76,30 @@ class TestSchedule(unittest.TestCase):
         # the validation split depends on split_seed only
         self.assertTrue(np.array_equal(cifar.validation_split(self.fine, 100)[1], self.val))
 
+    def test_paired(self):
+        from single_stream.stream import run_lengths
+        for c in (32, 64, 256):
+            s = cifar.make_schedule((3, 7), self.fine, self.coarse, self.train, 0, c, 2, paired=True)
+            a, b = s["order"]["a"], s["order"]["b"]
+            self.assertEqual(s["pairs"], [[a[k], b[k]] for k in range(1, 5)])
+            self.assertEqual([p["kind"] for p in s["phases"]], ["pretrain"] + ["intro"] * 4 + ["resilience"])
+            self.assertEqual(s["phases"][-1]["new"], s["pairs"][0])
+            self.assertEqual(sum(p["length"] for p in s["phases"]), len(s["stream"]))
+            for ph in s["phases"][1:]:
+                seg = s["stream"][ph["start"]:ph["start"] + ph["length"]]
+                self.assertFalse(np.isin(seg, self.val).any())
+                self.assertEqual(len(set(seg)), len(seg))
+                self.assertEqual(len(seg), 800)                      # both classes' 400 images, nothing else
+                self.assertEqual(set(self.fine[seg]), set(ph["new"]))
+                # alternating clusters of c: a, b, a, b, ...
+                runs = run_lengths(self.fine[seg])
+                self.assertTrue(all(r == c for r in runs[:2 * (400 // c)]))
+                starts = self.fine[seg][np.concatenate([[0], np.cumsum(runs)[:-1]])]
+                self.assertTrue((starts[1:] != starts[:-1]).all())
+        # the single-class mode is unchanged by the option
+        self.assertTrue(np.array_equal(self.make()["stream"], cifar.make_schedule(
+            (3, 7), self.fine, self.coarse, self.train, 0, 64, 2, paired=False)["stream"]))
+
 
 class TestScore(unittest.TestCase):
 
@@ -105,6 +129,28 @@ class TestScore(unittest.TestCase):
         self.assertAlmostEqual(m["Overall"], np.mean(core))
         self.assertAlmostEqual(m["Overall - worst"], .1)
         self.assertAlmostEqual(m["rescaled"]["Overall - worst"], -.8)
+
+    def test_paired_constant_predictor_scores_half(self):
+        # pair (5, 6) on opposite sides; seen 1 (side of 5), 2 (side of 6). A model answering the current cluster's
+        # label: right on the current class and its side, wrong on the other
+        phases = [{"kind": "pretrain", "new": None}, {"kind": "intro", "new": [5, 6]},
+                  {"kind": "resilience", "new": [5, 6]}]
+        side = {1: 0, 5: 0, 2: 1, 6: 1}
+
+        def rec(phase, n5, n6, current, seen=(1, 2)):
+            acc = {str(f): float(side[f] == side[current]) for f in side}
+            mem = {"5": 1.0 if current == 5 and n5 else (0.0 if n5 else None),
+                   "6": 1.0 if current == 6 and n6 else (0.0 if n6 else None)}
+            return {"phase": phase, "n": {"5": n5, "6": n6}, "mem": mem, "seen": list(seen), "acc": acc}
+
+        recs = [rec(1, 0, 0, 1), rec(1, 1, 0, 5), rec(1, 2, 0, 5), rec(1, 2, 1, 6), rec(1, 2, 2, 6),
+                rec(2, 0, 0, 6, seen=(1, 2, 5, 6)), rec(2, 1, 0, 5, seen=(1, 2, 5, 6)),
+                rec(2, 2, 0, 5, seen=(1, 2, 5, 6)), rec(2, 2, 1, 6, seen=(1, 2, 5, 6)),
+                rec(2, 2, 2, 6, seen=(1, 2, 5, 6))]
+        m = cifar.score(recs, phases, points=(1, 2))
+        for k in ("Memorisation", "Generalisation", "Protection", "Retention", "Resilience"):
+            self.assertAlmostEqual(m[k], .5, msg=k)
+        self.assertAlmostEqual(m["Overall"], .5)
 
 
 if __name__ == "__main__":

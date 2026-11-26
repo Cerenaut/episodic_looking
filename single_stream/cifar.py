@@ -13,6 +13,10 @@ Every fine class's order within its side is drawn from the seed; the validation 
 class's 500 training images) is fixed by `split_seed`, the same for every seed and model. The schedule (classes and
 the exact sample order, as indices into CIFAR-100's training file) is saved with each run, and its hash goes into the
 run's summary, so every model of a seed sees the same samples.
+Paired (`paired=True`, Dave 27 Nov 2026; run_cifar --paired, from probe2): the 8 classes arrive as 4 pairs, one fine class
+of each side (a_k, b_k), each phase only the pair's images, every one once, in alternating clusters of c (a, b, a,
+...): the labels are 50/50 within a phase and the classes seen so far are always balanced across the sides, so
+always answering one label scores 0.5 everywhere. The resilience extension re-presents the first pair.
 Clustering: within a phase, the new class's images and the others' are cut into clusters of c samples of one fine
 class and interleaved as ClusteredStream does (a group is not picked twice in a row while another remains). The
 others' clusters come from seen fine classes in a random cyclic order, c samples each (the last cut to fit).
@@ -78,9 +82,10 @@ def _phase(new_idx, by_class, seen, groups_of, c, share, rng):
     return idx[epoch.order]
 
 
-def make_schedule(pair, fine, coarse, train_idx, seed, cluster_size, pretrain_epochs, share=0.75):
+def make_schedule(pair, fine, coarse, train_idx, seed, cluster_size, pretrain_epochs, share=0.75, paired=False):
     """The run's classes and sample order. fine, coarse: labels of the training file; train_idx: its training split.
-    Returns a dict (JSON-able) with 'stream' (np.int64 indices into the training file) and 'phases'."""
+    Returns a dict (JSON-able) with 'stream' (np.int64 indices into the training file) and 'phases'. Paired: a phase's
+    'new' is the pair [a_k, b_k] and share is not used."""
     rng = np.random.default_rng(seed)
     a, b = pair
     order = {side: [int(f) for f in rng.permutation(fine_of(coarse, fine, c))] for side, c in (("a", a), ("b", b))}
@@ -95,6 +100,17 @@ def make_schedule(pair, fine, coarse, train_idx, seed, cluster_size, pretrain_ep
         stream.append(pre[cs.epoch().order])
     phases.append({"kind": "pretrain", "new": None, "start": 0, "length": int(sum(len(s) for s in stream))})
     seen = list(pretrain)
+    if paired:
+        pairs = [[order["a"][k], order["b"][k]] for k in range(1, FINE_PER_COARSE)]
+        for kind, pr in [("intro", pr) for pr in pairs] + [("resilience", pairs[0])]:
+            idx = np.concatenate([by_class[f] for f in pr])
+            start = int(sum(len(s) for s in stream))
+            stream.append(idx[ClusteredStream(fine[idx], cluster_size, rng).epoch().order])
+            phases.append({"kind": kind, "new": [int(f) for f in pr], "start": start, "length": len(stream[-1])})
+        stream = np.concatenate(stream).astype(np.int64)
+        return {"pair": [int(a), int(b)], "seed": int(seed), "cluster_size": int(cluster_size),
+                "pretrain_epochs": int(pretrain_epochs), "paired": True, "order": order, "pretrain": pretrain,
+                "introductions": intros, "pairs": pairs, "phases": phases, "stream": stream}
     for kind, f in [("intro", f) for f in intros] + [("resilience", intros[0])]:
         others = [g for g in seen if g != f]
         start = int(sum(len(s) for s in stream))
@@ -118,6 +134,55 @@ def label(coarse, pair):
 
 
 def score(records, phases, points=POINTS):
+    if phases and any(isinstance(ph["new"], list) for ph in phases):
+        return score_paired(records, phases, points)
+    return score_single(records, phases, points)
+
+
+def score_paired(records, phases, points=POINTS):
+    """
+    Paired introductions (records: n and mem are {fine: value} over the pair). For each class f of a pair, at its
+    n-th exposure (the first checkpoint there) for n in points, with its partner g as the control (Dave 27 Nov 2026:
+    a cluster is all one label, so a class scored alone mid-cluster rewards answering the current label):
+      Memorisation    mean(mem[f], acc[g]);  Generalisation  mean(acc[f], acc[g]);  zero_shot: acc[f] at n = 0
+      Protection      worst pooled accuracy on the classes seen before the phase over its checkpoints
+      Retention       pooled accuracy on the seen classes and the pair at the phase's end
+      Resilience      Generalisation in the resilience phase
+    Each averaged over n, the pair's two classes and the phases; Overall, Overall - worst, rescaled as score_single.
+    """
+    def pooled(r, classes):
+        return float(np.mean([r["acc"][str(f)] for f in classes])) if classes else float("nan")
+
+    per = {"Memorisation": [], "Generalisation": [], "zero_shot": [], "Protection": [], "Retention": []}
+    res = []
+    for i, ph in enumerate(phases):
+        rs = [r for r in records if r["phase"] == i]
+        if ph["kind"] == "pretrain" or not rs:
+            continue
+        mem, gen, zero = [], [], []
+        for f, g in (ph["new"], ph["new"][::-1]):
+            f, g = str(f), str(g)
+            at = {}
+            for r in rs:
+                at.setdefault(r["n"][f], r)
+            for n in points:
+                if n in at:
+                    mem.append(0.5 * (at[n]["mem"][f] + at[n]["acc"][g]))
+                    gen.append(0.5 * (at[n]["acc"][f] + at[n]["acc"][g]))
+            zero.append(rs[0]["acc"][f])
+        if ph["kind"] == "resilience":
+            res.append(np.mean(gen))
+            continue
+        others = [c for c in rs[0]["seen"] if c not in ph["new"]]
+        per["Memorisation"].append(np.mean(mem))
+        per["Generalisation"].append(np.mean(gen))
+        per["zero_shot"].append(np.mean(zero))
+        per["Protection"].append(min(pooled(r, others) for r in rs))
+        per["Retention"].append(pooled(rs[-1], others + list(ph["new"])))
+    return _summarise(per, res)
+
+
+def score_single(records, phases, points=POINTS):
     """
     The metrics from a run's eval records (run_cifar.py, one per checkpoint: phase index, kind, new class, n = the new
     class's exposures so far in the phase, acc = {fine: accuracy on its evaluation images}, mem = accuracy on the new
@@ -154,6 +219,10 @@ def score(records, phases, points=POINTS):
         others = [g for g in rs[0]["seen"] if g != ph["new"]]
         per["Protection"].append(min(pooled(r, others) for r in rs))
         per["Retention"].append(pooled(rs[-1], others + [ph["new"]]))
+    return _summarise(per, res)
+
+
+def _summarise(per, res):
     out = {k: float(np.mean(v)) if v else float("nan") for k, v in per.items()}
     out["gain"] = out["Generalisation"] - out["zero_shot"]
     out["Resilience"] = float(np.mean(res)) if res else float("nan")
