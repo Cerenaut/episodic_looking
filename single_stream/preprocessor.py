@@ -10,6 +10,10 @@ Pre-training (classification of the 964 background characters; the linear head i
 
 Omniglot images (105x105, black strokes on white) are inverted and resized to 28x28 so they look like MNIST
 (bright strokes on black, values in [0, 1]).
+
+CIFAR (Dave, 26 Nov 2026): pre-trained on Tiny ImageNet (200 classes, 64x64 downsampled to 32x32; never CIFAR),
+classification of the 200 classes with crop and flip augmentation, validated on Tiny ImageNet's labelled val split:
+  python -m single_stream.preprocessor --dataset tiny_imagenet --out runs_ss/preproc/tinyimagenet_conv_c32_s0
 """
 import argparse
 import json
@@ -23,24 +27,33 @@ import torch.nn.functional as F
 
 
 class ConvPreprocessor(nn.Module):
-    """(N, 1, 28, 28) -> (N, 49, channels) tokens: three 3x3 convs, two with stride 2, each followed by GroupNorm
-    and ReLU, then a 1x1 conv to `channels` (ReLU). GroupNorm normalises each image on its own, so the frozen map is
-    still a fixed function of the single image (no batch statistics)."""
+    """
+    MNIST (the defaults): (N, 1, 28, 28) -> (N, 49, channels) tokens: three 3x3 convs, two with stride 2, each
+    followed by GroupNorm and ReLU, then a 1x1 conv to `channels` (ReLU). GroupNorm normalises each image on its own,
+    so the frozen map is still a fixed function of the single image (no batch statistics).
+    CIFAR (in_channels 3, size 32, stem False; Dave 26 Nov 2026: "a conv layer or two"): (N, 3, 32, 32) ->
+    (N, 64, channels): the two stride-2 convs only (no full-resolution stem), then the 1x1 conv.
+    """
 
-    def __init__(self, channels=32, width=64):
+    def __init__(self, channels=32, width=64, in_channels=1, size=28, stem=True):
         super().__init__()
         self.channels = channels
         self.width = width
+        self.in_channels, self.size = in_channels, size
+        self.num_tokens = ((size + 3) // 4) ** 2         # 28 -> 7 x 7, 32 -> 8 x 8
+        first = [nn.Conv2d(in_channels, width // 2, 3, padding=1), nn.GroupNorm(8, width // 2), nn.ReLU()] \
+            if stem else []
+        c_in, c_mid = (width // 2, width) if stem else (in_channels, width // 2)
         self.body = nn.Sequential(
-            nn.Conv2d(1, width // 2, 3, padding=1), nn.GroupNorm(8, width // 2), nn.ReLU(),
-            nn.Conv2d(width // 2, width, 3, stride=2, padding=1), nn.GroupNorm(8, width), nn.ReLU(),   # 14x14
-            nn.Conv2d(width, width, 3, stride=2, padding=1), nn.GroupNorm(8, width), nn.ReLU(),        # 7x7
+            *first,
+            nn.Conv2d(c_in, c_mid, 3, stride=2, padding=1), nn.GroupNorm(8, c_mid), nn.ReLU(),         # size / 2
+            nn.Conv2d(c_mid, width, 3, stride=2, padding=1), nn.GroupNorm(8, width), nn.ReLU(),        # size / 4
             nn.Conv2d(width, channels, 1), nn.ReLU())
 
     def forward(self, x):
-        x = x.reshape(len(x), 1, 28, 28)
-        f = self.body(x)                                # (N, C, 7, 7)
-        return f.flatten(2).transpose(1, 2)             # (N, 49, C)
+        x = x.reshape(len(x), self.in_channels, self.size, self.size)
+        f = self.body(x)                                # (N, C, size / 4, size / 4)
+        return f.flatten(2).transpose(1, 2)             # (N, num_tokens, C)
 
 
 class PretrainNet(nn.Module):
@@ -50,7 +63,7 @@ class PretrainNet(nn.Module):
     def __init__(self, pre, num_classes):
         super().__init__()
         self.pre = pre
-        self.head = nn.Linear(49 * pre.channels, num_classes)
+        self.head = nn.Linear(pre.num_tokens * pre.channels, num_classes)
 
     def forward(self, x):
         return self.head(self.pre(x).flatten(1))
@@ -69,6 +82,38 @@ def load_omniglot(root, background=True):
     x = torch.stack(xs)[:, None]                                          # (N, 1, 105, 105)
     x = F.interpolate(x, size=(28, 28), mode="area").clamp(0, 1)
     return x.reshape(len(x), -1), torch.tensor(ys)
+
+
+def load_tiny_imagenet(root, split="train"):
+    """Tiny ImageNet (200 classes, 64x64 RGB) downsampled to 32x32 (area) as CIFAR: (N, 3072) float in [0, 1],
+    channel-major, and class labels (N,) indexed by wnids.txt. split "train" (500 per class) or "val" (50 per class,
+    labelled)."""
+    from PIL import Image
+
+    wnids = open(os.path.join(root, "wnids.txt")).read().split()
+    index = {w: i for i, w in enumerate(wnids)}
+    if split == "train":
+        files = [(os.path.join(root, "train", w, "images", f), index[w]) for w in wnids
+                 for f in sorted(os.listdir(os.path.join(root, "train", w, "images")))]
+    else:
+        rows = [line.split("\t")[:2] for line in open(os.path.join(root, "val", "val_annotations.txt"))]
+        files = [(os.path.join(root, "val", "images", f), index[w]) for f, w in rows]
+    x = torch.empty(len(files), 3, 64, 64, dtype=torch.uint8)
+    for i, (f, _) in enumerate(files):
+        x[i] = torch.from_numpy(np.asarray(Image.open(f).convert("RGB"))).permute(2, 0, 1)
+    x = F.interpolate(x.float() / 255.0, size=(32, 32), mode="area").clamp(0, 1)
+    return x.reshape(len(x), -1), torch.tensor([y for _, y in files])
+
+
+def augment_rgb(x, gen, pad=4):
+    """Random crop (pad 4, reflect) and horizontal flip of (N, 3072) 32x32 RGB images (the usual CIFAR augmentation)."""
+    n = len(x)
+    img = F.pad(x.reshape(n, 3, 32, 32), (pad,) * 4, mode="reflect")
+    dx, dy = torch.randint(2 * pad + 1, (2, n), generator=gen)
+    flip = torch.rand(n, generator=gen) < 0.5
+    out = torch.stack([img[i, :, dy[i]:dy[i] + 32, dx[i]:dx[i] + 32] for i in range(n)])
+    out[flip] = out[flip].flip(3)
+    return out.reshape(n, -1)
 
 
 def augment(x, gen, max_shift=2, max_rot=10.0, max_scale=0.1):
@@ -100,14 +145,16 @@ def load_checkpoint(path):
 
 @torch.no_grad()
 def featurize(pre, x, batch=2000):
-    """Frozen tokens for (N, 784) images: (N, 49 * C) float32, flattened row-major (token, channel)."""
+    """Frozen tokens for (N, pixels) images: (N, num_tokens * C) float32, flattened row-major (token, channel)."""
     out = [pre(x[i:i + batch]).reshape(min(batch, len(x) - i), -1) for i in range(0, len(x), batch)]
     return torch.cat(out)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--root", default=os.path.expanduser("~/dev/claude/omniglot"))
+    p.add_argument("--dataset", default="omniglot", choices=["omniglot", "tiny_imagenet"],
+                   help="omniglot: the MNIST preprocessor; tiny_imagenet: the CIFAR one (32x32 RGB, no stem)")
+    p.add_argument("--root", default=None, help="default ~/dev/claude/omniglot or ~/dev/claude/tiny_imagenet/tiny-imagenet-200")
     p.add_argument("--channels", type=int, default=32)
     p.add_argument("--width", type=int, default=64)
     p.add_argument("--epochs", type=int, default=40)
@@ -127,15 +174,24 @@ def main():
     torch.manual_seed(args.seed)
     gen = torch.Generator().manual_seed(args.seed)
 
-    x, y = load_omniglot(args.root, background=True)
-    num_classes = int(y.max()) + 1
-    rng = np.random.default_rng(args.seed)
-    val = np.concatenate([rng.choice(np.flatnonzero(y.numpy() == c), args.val_per_class, replace=False)
-                          for c in range(num_classes)])
-    tr = np.setdiff1d(np.arange(len(y)), val)
-    xtr, ytr, xva, yva = x[tr], y[tr], x[val], y[val]
+    if args.dataset == "omniglot":
+        x, y = load_omniglot(args.root or os.path.expanduser("~/dev/claude/omniglot"), background=True)
+        num_classes = int(y.max()) + 1
+        rng = np.random.default_rng(args.seed)
+        val = np.concatenate([rng.choice(np.flatnonzero(y.numpy() == c), args.val_per_class, replace=False)
+                              for c in range(num_classes)])
+        tr = np.setdiff1d(np.arange(len(y)), val)
+        xtr, ytr, xva, yva = x[tr], y[tr], x[val], y[val]
+        config, aug = {"channels": args.channels, "width": args.width}, augment
+    else:  # Tiny ImageNet: the official labelled val split (50 per class) is the validation set
+        root = args.root or os.path.expanduser("~/dev/claude/tiny_imagenet/tiny-imagenet-200")
+        xtr, ytr = load_tiny_imagenet(root, "train")
+        xva, yva = load_tiny_imagenet(root, "val")
+        num_classes = int(ytr.max()) + 1
+        config = {"channels": args.channels, "width": args.width, "in_channels": 3, "size": 32, "stem": False}
+        aug = augment_rgb
 
-    pre = ConvPreprocessor(args.channels, args.width)
+    pre = ConvPreprocessor(**config)
     net = PretrainNet(pre, num_classes)
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
@@ -148,7 +204,7 @@ def main():
         tot = 0.0
         for i in range(0, len(perm), args.batch):
             idx = perm[i:i + args.batch]
-            loss = F.cross_entropy(net(augment(xtr[idx], gen)), ytr[idx])
+            loss = F.cross_entropy(net(aug(xtr[idx], gen)), ytr[idx])
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -163,7 +219,7 @@ def main():
         log.write(msg + "\n")
         log.flush()
 
-    torch.save({"config": {"channels": args.channels, "width": args.width}, "state_dict": pre.state_dict()},
+    torch.save({"config": config, "state_dict": pre.state_dict()},
                os.path.join(args.out, "preproc.pt"))
     with open(os.path.join(args.out, "summary.json"), "w") as f:
         json.dump({"history": history, "values": sum(p.numel() for p in pre.parameters())}, f, indent=1)
