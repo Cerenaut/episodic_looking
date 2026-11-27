@@ -101,6 +101,51 @@ class TestHeadModel(unittest.TestCase):
             self.assertIsInstance(model.head, cls)
             self.assertEqual(model.repeats, 2)
 
+class TestSideRNG(unittest.TestCase):
+    """--stm-rng separate (Dave 27 Nov 2026): the fast learner's random numbers leave the LTM's trajectory as the LTM
+    alone's at the same seed (replay draws and continual-backprop re-initialisation included)."""
+
+    BASE = ["--net", "transformer", "--d-model", "16", "--heads", "2", "--bias-mode", "what", "--optimizer", "adamw",
+            "--lr", "0.003", "--cbp-rate", "0.2", "--cbp-maturity", "2", "--cbp-no-fold", "--buffer", "priority",
+            "--replay-capacity", "40", "--alpha-evict", "3", "--alpha-replay", "1", "--replay-batch", "4",
+            "--replay-period", "8", "--replay-steps", "4", "--out", "unused"]
+    STM = ["--model", "cls", "--stm-hidden", "64", "--stm-sparsity", "8", "--stm-repeats", "4", "--stm-block", "2",
+           "--stm-interleave", "1", "--stm-reward", "accuracy-log", "--sleep-reset-stm", "--stm-delay", "6"]
+
+    def ltm_after(self, extra, steps=40):
+        train = types.SimpleNamespace(x=torch.rand(4, 49 * 8), y=torch.zeros(4, dtype=torch.long), num_classes=10)
+        torch.manual_seed(0)
+        model = build_model(build_parser().parse_args(self.BASE + extra), train, token_shape=(49, 8))
+        g = torch.Generator().manual_seed(1)
+        for i in range(steps):
+            model.observe(torch.rand(1, 49 * 8, generator=g), torch.tensor([(i // 4) % 3]))
+        net = model.ltm.net if hasattr(model, "ltm") else model.net
+        return [p.detach().clone() for p in net.parameters()]
+
+    def same(self, a, b):
+        return all(torch.equal(u, v) for u, v in zip(a, b))
+
+    def test_fast_learners_leave_the_ltm_alone(self):
+        alone = self.ltm_after(["--model", "buffered"])
+        heads = [["--model", "head", "--head", "knn", "--head-delay", "6"],
+                 ["--model", "head", "--head", "fly", "--head-delay", "6", "--head-replay", "2"],
+                 ["--model", "head", "--head", "sdmlp", "--head-delay", "6", "--head-no-reset"],
+                 self.STM]
+        for extra in heads:
+            self.assertTrue(self.same(alone, self.ltm_after(extra + ["--stm-rng", "separate"])), extra)
+            self.assertTrue(self.same(alone, self.ltm_after(extra + ["--stm-rng", "separate", "--stm-seed", "5"])))
+        # shared (the default, as before): the head's replay draws and the STM's draws move the LTM's
+        self.assertFalse(self.same(alone, self.ltm_after(heads[0])))
+        self.assertFalse(self.same(alone, self.ltm_after(self.STM)))
+
+    def test_stm_seed_varies_the_fast_learner(self):
+        train = types.SimpleNamespace(x=torch.rand(4, 49 * 8), y=torch.zeros(4, dtype=torch.long), num_classes=10)
+        args = [build_parser().parse_args(self.BASE + ["--model", "head", "--head", "fly", "--fly-response", "4",
+                                                       "--stm-seed", str(s)]) for s in (0, 0, 1)]
+        heads = [build_model(a, train, token_shape=(49, 8)).head for a in args]
+        self.assertTrue(torch.equal(heads[0].R, heads[1].R))
+        self.assertFalse(torch.equal(heads[0].R, heads[2].R))
+
 
 if __name__ == "__main__":
     unittest.main()

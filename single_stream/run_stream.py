@@ -26,7 +26,7 @@ import torch
 from single_stream import datasets, metrics
 from single_stream.buffers import NeuralBuffer, NoveltyGate, PriorityBuffer, RingBuffer, part_specs
 from single_stream.models import (BufferedReplayLTM, CLSModel, ContinualBackprop, LTMOnly, ReplayLTM, ReplayOnlyLTM,
-                                  TransformerContinualBackprop, build_net)
+                                  SideRNG, TransformerContinualBackprop, build_net, side_context)
 from single_stream.stream import ClusteredStream, run_lengths
 
 
@@ -151,6 +151,12 @@ def build_parser(description=__doc__):
     p.add_argument("--sdmlp-k", type=int, default=32, help="sdmlp head: Top-K")
     p.add_argument("--sdmlp-gaba", type=int, default=100, help="sdmlp head: activations per neuron to switch GABA")
     p.add_argument("--sdmlp-lr", type=float, default=0.05, help="sdmlp head: SGD lr")
+    p.add_argument("--stm-rng", default="shared", choices=["shared", "separate"],
+                   help="cls, head: separate = the STM or head draws its own random numbers (SideRNG), so the LTM "
+                        "follows the same trajectory as the LTM alone (buffered, same sleeps) at the same seed")
+    p.add_argument("--stm-seed", type=int, default=None,
+                   help="cls, head: seed of the STM's or head's own randomness (default --seed); with --stm-rng "
+                        "separate it varies the fast learner alone, on the same stream and LTM")
     p.add_argument("--stm-delay", type=int, default=0,
                    help="cls: exposures before the STM comes online (until then the model is its LTM, sleeps as usual)")
     p.add_argument("--sleep-reset-stm", action="store_true",
@@ -250,7 +256,9 @@ def build_cls(args, ltm, net, train):
     parts = part_specs(train.x[:1], train.y[:1])
     if args.replay_live:
         raise ValueError("cls: the LTM learns only in sleep (no --replay-live)")
-    stm = build_stm(args, net, train.num_classes)
+    side = make_side(args)
+    with side_context(side):
+        stm = build_stm(args, net, train.num_classes)
     initial = copy.deepcopy(stm.model)  # --sleep-reset-stm restarts from here
     stm_buffer = None
     if args.stm_buffer == "ring":
@@ -268,7 +276,18 @@ def build_cls(args, ltm, net, train):
                     learn_live=not args.stm_no_live, block=args.stm_block, stop_p=args.stm_stop_p,
                     patience=args.stm_patience, gain_eps=args.stm_gain_eps, interleave=args.stm_interleave,
                     reset_on_sleep=args.sleep_reset_stm, stm_factory=stm_factory, stm_delay=args.stm_delay,
-                    stm_buffer=stm_buffer)
+                    stm_buffer=stm_buffer, side=side)
+
+
+def stm_seed(args):
+    """The seed of the fast learner's own randomness: --stm-seed, else --seed."""
+    s = getattr(args, "stm_seed", None)
+    return args.seed if s is None else s
+
+
+def make_side(args):
+    """--stm-rng separate: the STM's or head's own random numbers (SideRNG); shared: None."""
+    return SideRNG(stm_seed(args)) if getattr(args, "stm_rng", "shared") == "separate" else None
 
 
 def build_head_model(args, ltm, net, num_classes):
@@ -280,7 +299,7 @@ def build_head_model(args, ltm, net, num_classes):
         raise ValueError("head: the LTM learns only in sleep (no --replay-live)")
     return HeadModel(ltm, make_head(args, net.d_model, num_classes), replay=args.head_replay,
                      reset_on_sleep=not args.head_no_reset, delay=args.head_delay,
-                     repeats=args.head_repeats)
+                     repeats=args.head_repeats, side=make_side(args))
 
 
 def build_stm(args, net, num_classes):

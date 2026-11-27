@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from single_stream.models import StreamModel
+from single_stream.models import StreamModel, side_context
 
 
 class Head:
@@ -179,15 +179,17 @@ class SDMLPHead(Head):
 
 
 def make_head(args, dim, num_classes):
-    """The head named by args.head with the --knn-*, --fly-*, --sdmlp-* options (run_stream and stm_frozen)."""
+    """The head named by args.head with the --knn-*, --fly-*, --sdmlp-* options (run_stream and stm_frozen); its
+    random initialisation from --stm-seed if given, else --seed."""
+    seed = args.seed if getattr(args, "stm_seed", None) is None else args.stm_seed
     if args.head == "knn":
         return KNNHead(dim, num_classes, k=args.knn_k, capacity=args.knn_capacity)
     if args.head == "fly":
         return FlyHead(dim, num_classes, n_kc=args.fly_kc, n_response=args.fly_response, k_frac=args.fly_k_frac,
-                       lr=args.fly_lr, seed=args.seed)
+                       lr=args.fly_lr, seed=seed)
     if args.head == "sdmlp":
         return SDMLPHead(dim, num_classes, nneurons=args.sdmlp_neurons, k=args.sdmlp_k, gaba_switch=args.sdmlp_gaba,
-                         lr=args.sdmlp_lr, seed=args.seed)
+                         lr=args.sdmlp_lr, seed=seed)
     raise ValueError(f"unknown head {args.head}")
 
 
@@ -197,11 +199,12 @@ class HeadModel(StreamModel):
     predict with the head (or the LTM if the head is empty), fit the head on the live sample (`repeats` times) and on `replay` samples
     drawn from the LTM's buffer (fractional rates accumulate), then the LTM's own step; after an LTM update (a sleep)
     the head restarts from its initial state if `reset_on_sleep`. Features are the LTM's (net.run(x)["features"]),
-    computed afresh each time.
+    computed afresh each time. `side`: a SideRNG for the head's random numbers (None: shared with the LTM).
     """
 
-    def __init__(self, ltm, head, replay=1.0, reset_on_sleep=True, delay=0, repeats=1):
+    def __init__(self, ltm, head, replay=1.0, reset_on_sleep=True, delay=0, repeats=1, side=None):
         self.ltm, self.head, self.replay, self.repeats = ltm, head, replay, repeats
+        self.side = side
         self.initial = copy.deepcopy(head)
         self.reset_on_sleep, self.delay = reset_on_sleep, delay
         self.exposures = 0
@@ -236,17 +239,18 @@ class HeadModel(StreamModel):
             self.exposures += len(x)
             return self.ltm.observe(x, y)
         self.exposures += len(x)
-        pred = self.predict(x).argmax(1)
-        f = self._features(x)
-        for _ in range(self.repeats):
-            self.head.fit(f, y)
-        self.replay_pending += self.replay
-        if self.ltm.buffer.written == 0:
-            self.replay_pending = 0.0
-        while self.replay_pending >= 1:
-            self.replay_pending -= 1
-            (bx, by), _ = self.ltm.buffer.sample(1)
-            self.head.fit(self._features(bx), by)
+        with side_context(self.side):
+            pred = self.predict(x).argmax(1)
+            f = self._features(x)
+            for _ in range(self.repeats):
+                self.head.fit(f, y)
+            self.replay_pending += self.replay
+            if self.ltm.buffer.written == 0:
+                self.replay_pending = 0.0
+            while self.replay_pending >= 1:
+                self.replay_pending -= 1
+                (bx, by), _ = self.ltm.buffer.sample(1, generator=self.side and self.side.gen)
+                self.head.fit(self._features(bx), by)
         before = self.ltm.updates
         self.ltm.observe(x, y)
         if self.reset_on_sleep and self.ltm.updates > before:

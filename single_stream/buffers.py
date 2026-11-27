@@ -78,9 +78,17 @@ class Buffer:
             self.offered += 1
             self._offer(z[i], bool(keep[i]), float(novelty[i]))
 
-    def sample(self, n):
-        """n stored samples drawn for replay: (parts, each (n, *shape); cell indices (n,), for `rescore`)."""
-        z, idx = self.sample_vectors(n)
+    def sample(self, n, generator=None):
+        """n stored samples drawn for replay: (parts, each (n, *shape); cell indices (n,), for `rescore`).
+        `generator`: draw with it instead of the buffer's own (a fast learner's draws then leave the LTM's untouched)."""
+        if generator is None:
+            z, idx = self.sample_vectors(n)
+        else:
+            own, self.gen = self.gen, generator
+            try:
+                z, idx = self.sample_vectors(n)
+            finally:
+                self.gen = own
         return self.unpack(z), idx
 
     def rescore(self, idx, novelty):

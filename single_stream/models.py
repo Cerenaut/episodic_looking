@@ -3,9 +3,39 @@ Stream models. The task harness treats every model as a black box: it calls obse
 and predict(x) for evaluation. Gradient steps per exposure, replay and any other memory mechanism are internal.
 Models never receive group, cluster or task-switch information.
 """
+import contextlib
+
 import torch
 from torch import nn
 import torch.nn.functional as F
+
+
+class SideRNG:
+    """
+    The fast learner's own random numbers (--stm-rng separate; Dave 27 Nov 2026: comparable runs per seed). Used as a
+    context manager around the STM's or head's work: the global torch RNG is swapped for the side's state on entry
+    and back on exit, and `gen` replaces the buffer's generator for the fast learner's replay draws. The LTM's random
+    numbers (replay draws, continual-backprop re-initialisation) are then those of the LTM alone at the same seed, so
+    every STM variant runs on the same LTM trajectory as the LTM + sleep run, provided it does not change what the LTM
+    sees (true for the heads and the RL STM with the LTM's buffer: replays are drawn, not rescored).
+    """
+
+    def __init__(self, seed):
+        seed = 10_000 + seed  # not the LTM's own streams (torch.manual_seed(seed), the buffer's generator)
+        self.gen = torch.Generator().manual_seed(seed)
+        self.state = torch.Generator().manual_seed(seed + 1).get_state()
+
+    def __enter__(self):
+        self.outer = torch.get_rng_state()
+        torch.set_rng_state(self.state)
+
+    def __exit__(self, *exc):
+        self.state = torch.get_rng_state()
+        torch.set_rng_state(self.outer)
+
+
+def side_context(side):
+    return contextlib.nullcontext() if side is None else side
 
 
 class StreamModel:
@@ -548,10 +578,13 @@ class CLSModel(StreamModel):
     Evaluation (`predict`): one STM episode per image, no learning, the policy mean as bias (eval_bias), output =
     the LTM logits after the last bias. `predict_variants` also returns the unbiased LTM logits from the same pass
     (step 0), so the STM's contribution is measured on identical LTM weights.
+
+    `side`: a SideRNG for the STM's random numbers (None: shared with the LTM).
     """
 
     def __init__(self, ltm, stm, repeats=1, replay_ratio=0.0, learn_live=True, block=0, stop_p=1.0, patience=0,
-                 gain_eps=0.02, interleave=0, reset_on_sleep=False, stm_factory=None, stm_delay=0, stm_buffer=None):
+                 gain_eps=0.02, interleave=0, reset_on_sleep=False, stm_factory=None, stm_delay=0, stm_buffer=None,
+                 side=None):
         if reset_on_sleep and stm_factory is None:
             raise ValueError("reset_on_sleep needs stm_factory")
         self.ltm = ltm
@@ -568,6 +601,7 @@ class CLSModel(StreamModel):
         self.stm_factory = stm_factory
         self.stm_delay = stm_delay
         self.stm_buffer = stm_buffer
+        self.side = side
         self.exposures = 0
         self.replay_pending = 0.0
         self.replay_episodes = 0
@@ -590,7 +624,8 @@ class CLSModel(StreamModel):
         for _ in range(n):
             if buffer.written == 0:
                 return
-            (bx, by), idx = buffer.sample(1)
+            gen = self.side.gen if self.side is not None and self.stm_buffer is None else None
+            (bx, by), idx = buffer.sample(1, generator=gen)
             res = self.stm.episode(bx, by, learn=True)
             if self.stm_buffer is not None:
                 buffer.rescore(idx, self.ltm.novelty(res["logits"][-1].detach(), by))
@@ -650,16 +685,18 @@ class CLSModel(StreamModel):
             self.exposures += len(x)
             return self.ltm.observe(x, y)
         self.exposures += len(x)
-        pred = self._live(x, y)
-        self.replay_pending += self.replay_ratio
-        while self.replay_pending >= 1:
-            self.replay_pending -= 1
-            self._replay(1)
+        with side_context(self.side):
+            pred = self._live(x, y)
+            self.replay_pending += self.replay_ratio
+            while self.replay_pending >= 1:
+                self.replay_pending -= 1
+                self._replay(1)
         before = self.ltm.updates
         self.ltm.observe(x, y)
         if self.reset_on_sleep and self.ltm.updates > before:
             self.stm_episodes_before += self.stm.episodes
-            self.stm = self.stm_factory()
+            with side_context(self.side):
+                self.stm = self.stm_factory()
             self.resets += 1
             self.last_reset = self.exposures
         return pred

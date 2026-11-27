@@ -188,13 +188,14 @@ def score_single(records, phases, points=POINTS):
     class's exposures so far in the phase, acc = {fine: accuracy on its evaluation images}, mem = accuracy on the new
     class's training images shown so far, seen = the fine classes seen before the phase).
       Memorisation    mean over the introductions of the mean over n in points of mem
-      Generalisation  ... of acc[new]; zero_shot: acc[new] at n = 0; gain = Generalisation - zero_shot
+      Generalisation  ... of acc[new]; zero_shot: acc[new] at n = 0 (logged; Dave 27 Nov 2026: no gain)
       Protection      mean over the introductions of the worst pooled accuracy on the seen classes (excluding the
                       new one) over the introduction's checkpoints
       Retention       mean over the introductions of the pooled accuracy on the seen classes and the new one at the
                       introduction's end
       Resilience      mean over n in points of acc[new] in the resilience phase
-    Overall = the mean of the five; Overall - worst = their minimum. Pooled = equal weight per class.
+    Overall = the mean of the five (of those present: _summarise); Overall - worst = their minimum. Pooled =
+    equal weight per class.
     """
     def pooled(r, classes):
         return float(np.mean([r["acc"][str(f)] for f in classes])) if classes else float("nan")
@@ -223,12 +224,17 @@ def score_single(records, phases, points=POINTS):
 
 
 def _summarise(per, res):
+    """Overall and Overall - worst over the core metrics the run has: a stream cut before the resilience phase
+    (--max-exposures; Dave 27 Nov 2026: the RL STM's tuning probes skip it) has no Resilience, and its Overall is the
+    mean of the other four ("core" lists the metrics used)."""
     out = {k: float(np.mean(v)) if v else float("nan") for k, v in per.items()}
-    out["gain"] = out["Generalisation"] - out["zero_shot"]
     out["Resilience"] = float(np.mean(res)) if res else float("nan")
-    core = [out[k] for k in ("Memorisation", "Generalisation", "Protection", "Retention", "Resilience")]
-    out["Overall"] = float(np.mean(core))
-    out["Overall - worst"] = float(np.min(core))
+    names = [k for k in ("Memorisation", "Generalisation", "Protection", "Retention", "Resilience")
+             if not np.isnan(out[k])]
+    core = [out[k] for k in names]
+    out["core"] = names
+    out["Overall"] = float(np.mean(core)) if core else float("nan")
+    out["Overall - worst"] = float(np.min(core)) if core else float("nan")
     out["rescaled"] = {k: 2 * out[k] - 1 for k in ("Memorisation", "Generalisation", "Protection", "Retention",
                                                     "Resilience", "Overall", "Overall - worst")}
     return out

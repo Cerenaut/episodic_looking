@@ -121,7 +121,7 @@ class TestScore(unittest.TestCase):
         self.assertAlmostEqual(m["Memorisation"], .75)
         self.assertAlmostEqual(m["Generalisation"], .5)        # the first record at n = 1, 2: .4, .6
         self.assertAlmostEqual(m["zero_shot"], .2)
-        self.assertAlmostEqual(m["gain"], .3)
+        self.assertNotIn("gain", m)
         self.assertAlmostEqual(m["Protection"], .1)            # worst pooled accuracy on classes 1, 2
         self.assertAlmostEqual(m["Retention"], (.1 + .1 + .9) / 3)  # the phase's last checkpoint, seen + new
         self.assertAlmostEqual(m["Resilience"], .8)
@@ -129,6 +129,15 @@ class TestScore(unittest.TestCase):
         self.assertAlmostEqual(m["Overall"], np.mean(core))
         self.assertAlmostEqual(m["Overall - worst"], .1)
         self.assertAlmostEqual(m["rescaled"]["Overall - worst"], -.8)
+
+    def test_cut_stream_scores_without_resilience(self):
+        phases = [{"kind": "pretrain", "new": None}, {"kind": "intro", "new": 5}, {"kind": "resilience", "new": 5}]
+        recs = [{"phase": 1, "n": n, "mem": m, "seen": [1, 2], "acc": {"1": .9, "2": .8, "5": a}}
+                for n, m, a in ((0, None, .2), (1, 1.0, .4), (2, .5, .6))]
+        m = cifar.score(recs, phases, points=(1, 2))
+        self.assertTrue(np.isnan(m["Resilience"]))
+        self.assertEqual(m["core"], ["Memorisation", "Generalisation", "Protection", "Retention"])
+        self.assertAlmostEqual(m["Overall"], np.mean([.75, .5, .85, (.9 + .8 + .6) / 3]))
 
     def test_paired_constant_predictor_scores_half(self):
         # pair (5, 6) on opposite sides; seen 1 (side of 5), 2 (side of 6). A model answering the current cluster's
