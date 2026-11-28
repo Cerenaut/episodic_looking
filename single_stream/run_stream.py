@@ -56,7 +56,9 @@ def build_parser(description=__doc__):
     p.add_argument("--d-model", type=int, default=64, help="transformer")
     p.add_argument("--heads", type=int, default=4, help="transformer")
     p.add_argument("--mlp-ratio", type=int, default=2, help="transformer")
-    p.add_argument("--bias-mode", default="where", choices=["where", "what"], help="transformer bias hook")
+    p.add_argument("--bias-mode", default="where", choices=["where", "what", "what+where"], help="transformer bias hook")
+    p.add_argument("--bias-grid", type=int, default=0,
+                   help="cls: the where part of the STM's action on a coarse g x g grid, upsampled to the tokens (0 = full)")
     p.add_argument("--bias-scale", type=float, default=1.3863, help="transformer bias bound s (default ln 4)")
     p.add_argument("--bias-block", type=int, default=0, help="transformer block the bias acts on")
     p.add_argument("--optimizer", default="sgd", choices=["sgd", "adamw"], help="LTM optimizer")
@@ -272,7 +274,7 @@ def build_cls(args, ltm, net, train):
     def stm_factory():
         from single_stream.stm import RLSTM
         return RLSTM(net, copy.deepcopy(initial), steps=args.stm_steps, lr=args.stm_lr, momentum=args.stm_momentum,
-                     incremental=args.stm_incremental, grad_stats=False,
+                     bias_basis=stm.bias_basis, incremental=args.stm_incremental, grad_stats=False,
                      momentum_active=args.stm_momentum_active)
     return CLSModel(ltm, stm, repeats=args.stm_repeats, replay_ratio=args.stm_replay_ratio,
                     learn_live=not args.stm_no_live, block=args.stm_block, stop_p=args.stm_stop_p,
@@ -306,7 +308,7 @@ def build_head_model(args, ltm, net, num_classes):
 
 def build_stm(args, net, num_classes):
     from environment.mnist.mnist_model import MnistModel, MnistModelConfig
-    from single_stream.stm import RLSTM
+    from single_stream.stm import RLSTM, coarse_basis
 
     if args.net != "transformer":
         raise ValueError("--model cls needs --net transformer (the biasable LTM)")
@@ -320,8 +322,9 @@ def build_stm(args, net, num_classes):
         mask_key=args.stm_mask_key, recruit_rate=args.stm_recruit_rate, recruit_idle_steps=args.stm_recruit_idle,
         recruit_prob=args.stm_recruit_prob, stm_critic_sparse_init=args.stm_sparse_init in ("critic", "both"),
         stm_actor_sparse_init=args.stm_sparse_init in ("actor", "both"), step_input=args.stm_step_input, class_bonus=args.stm_class_bonus, seed=args.seed)
-    model = MnistModel(config, encoded_size=net.d_model, bias_size=net.bias_size)
-    return RLSTM(net, model, steps=args.stm_steps, lr=args.stm_lr, momentum=args.stm_momentum,
+    basis = coarse_basis(net, getattr(args, "bias_grid", 0))
+    model = MnistModel(config, encoded_size=net.d_model, bias_size=net.bias_size if basis is None else basis.shape[0])
+    return RLSTM(net, model, steps=args.stm_steps, lr=args.stm_lr, momentum=args.stm_momentum, bias_basis=basis,
                  incremental=args.stm_incremental, grad_stats=False,
                      momentum_active=args.stm_momentum_active)
 

@@ -77,6 +77,61 @@ class TestQKVGains(unittest.TestCase):
         torch.testing.assert_close(self.make("q")(x, a), self.make("k")(x, a))
 
 
+class TestWhatWhere(unittest.TestCase):
+    """The what+where bias (Dave 28 Nov 2026) and its coarse where grid."""
+
+    def nets(self):
+        torch.manual_seed(0)
+        nets = {m: BiasableTransformer(num_tokens=64, token_size=8, num_classes=2, d_model=16, heads=2, bias_mode=m)
+                for m in ("what", "where", "what+where")}
+        state = nets["what"].state_dict()
+        for n in nets.values():
+            n.load_state_dict(state)
+        return nets
+
+    def test_parts_match_the_single_modes(self):
+        nets = self.nets()
+        x = torch.rand(3, 64 * 8)
+        self.assertEqual(nets["what+where"].bias_size, 16 + 64)
+        a_what, a_where = torch.randn(3, 16), torch.randn(3, 64)
+        both = nets["what+where"]
+        self.assertTrue(torch.equal(both(x, torch.zeros(3, 80)), both(x)))           # a = 0: exactly unbiased
+        self.assertTrue(torch.allclose(both(x, torch.cat([a_what, torch.zeros(3, 64)], 1)), nets["what"](x, a_what)))
+        self.assertTrue(torch.allclose(both(x, torch.cat([torch.zeros(3, 16), a_where], 1)), nets["where"](x, a_where)))
+        combined = both(x, torch.cat([a_what, a_where], 1))
+        self.assertFalse(torch.allclose(combined, nets["what"](x, a_what)))
+
+    def test_coarse_basis(self):
+        from single_stream.stm import coarse_basis
+        nets = self.nets()
+        self.assertIsNone(coarse_basis(nets["what+where"], 0))
+        b = coarse_basis(nets["what+where"], 4)
+        self.assertEqual(tuple(b.shape), (16 + 16, 16 + 64))
+        self.assertTrue(torch.equal(b[:16, :16], torch.eye(16)))
+        self.assertTrue(torch.equal(b[16:, 16:].sum(0), torch.ones(64)))          # each token in one coarse cell
+        self.assertTrue(torch.equal(b[16:, 16:].sum(1), torch.full((16,), 4.0)))  # each cell covers 2 x 2 tokens
+        self.assertEqual(tuple(coarse_basis(nets["where"], 2).shape), (4, 64))
+        with self.assertRaises(ValueError):
+            coarse_basis(nets["what"], 4)
+
+    def test_rl_stm_with_coarse_what_where(self):
+        import types
+        from single_stream.run_stream import build_model, build_parser
+        train = types.SimpleNamespace(x=torch.rand(4, 64 * 8), y=torch.zeros(4, dtype=torch.long), num_classes=2)
+        args = build_parser().parse_args(["--model", "cls", "--net", "transformer", "--d-model", "16", "--heads", "2",
+                                          "--bias-mode", "what+where", "--bias-grid", "4", "--stm-hidden", "64",
+                                          "--stm-sparsity", "8", "--sleep-reset-stm", "--replay-period", "2",
+                                          "--out", "unused"])
+        model = build_model(args, train, token_shape=(64, 8))
+        self.assertEqual(model.stm.model.bias_size, 32)             # the actor emits 16 what + 16 coarse where
+        for i in range(3):                                           # through a sleep and an STM reset
+            model.observe(torch.rand(1, 64 * 8), torch.tensor([i % 2]))
+        self.assertGreater(model.resets, 0)
+        self.assertEqual(tuple(model.stm.bias_basis.shape), (32, 80))
+        res = model.stm.episode(torch.rand(2, 64 * 8))
+        self.assertEqual(tuple(res["bias"].shape[1:]), (2, 32))
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -11,6 +11,8 @@ bounded by `bias_scale`, so a bias can reweight what the block computes but neve
   never biased). Same mechanism as padding masks and ALiBi; applied to every head and every query.
 - "what": a per-feature gain exp(s tanh(a)) in [e^-s, e^s] on the block's LayerNorm output, before the Q/K/V
   projections (not on the residual stream, where the next LayerNorm would normalise it away). bias_size = d_model.
+- "what+where" (Dave 28 Nov 2026: CIFAR images have far more distraction than MNIST; the what gain cannot point at a
+  place): both at once, a = [a_what (d_model), a_where (number of input tokens)]; bias_size = d_model + tokens.
 - "q", "k", "v" and their combinations ("qk", "qv", "kv", "qkv"; Dave 2 Nov 2026): per-channel gains exp(s tanh(a))
   on the projected queries, keys and/or values (after the Q/K/V projections, before the split into heads), one
   d_model block of the bias per part in q, k, v order. bias_size = d_model x number of parts.
@@ -64,12 +66,13 @@ class BiasableTransformer(nn.Module):
 
     BIAS_WHERE = "where"
     BIAS_WHAT = "what"
+    BIAS_WHAT_WHERE = "what+where"
     BIAS_QKV = ("q", "k", "v", "qk", "qv", "kv", "qkv")
 
     def __init__(self, num_tokens, token_size, num_classes, d_model=64, heads=4, blocks=1, mlp_ratio=2,
                  bias_block=0, bias_mode=BIAS_WHERE, bias_scale=math.log(4.0)):
         super().__init__()
-        if bias_mode not in (self.BIAS_WHERE, self.BIAS_WHAT) + self.BIAS_QKV:
+        if bias_mode not in (self.BIAS_WHERE, self.BIAS_WHAT, self.BIAS_WHAT_WHERE) + self.BIAS_QKV:
             raise ValueError(f"unknown bias mode {bias_mode}")
         if not 0 <= bias_block < blocks:
             raise ValueError(f"bias_block {bias_block} outside 0..{blocks - 1}")
@@ -94,6 +97,8 @@ class BiasableTransformer(nn.Module):
             return self.num_tokens
         if self.bias_mode in self.BIAS_QKV:
             return self.d_model * len(self.bias_mode)
+        if self.bias_mode == self.BIAS_WHAT_WHERE:
+            return self.d_model + self.num_tokens
         return self.d_model
 
     def tokens(self, x):
@@ -112,6 +117,9 @@ class BiasableTransformer(nn.Module):
                     bounded = self.bias_scale * torch.tanh(bias)
                     if self.bias_mode == self.BIAS_WHERE:
                         key_bias = F.pad(bounded, (1, 0))   # CLS key unbiased
+                    elif self.bias_mode == self.BIAS_WHAT_WHERE:
+                        gain = torch.exp(bounded[:, :self.d_model])
+                        key_bias = F.pad(bounded[:, self.d_model:], (1, 0))
                     elif self.bias_mode in self.BIAS_QKV:
                         parts = torch.exp(bounded).split(self.d_model, dim=1)
                         qkv_gain = dict(zip(self.bias_mode, parts))

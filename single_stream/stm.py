@@ -21,6 +21,8 @@ inputs instead of updating; `group_update` then takes one step on a group of epi
 image, never mixed with other images' episodes) with advantage (G - group mean) / max(group std, floor) per step,
 in place of the critic baseline. The critic still regresses on the returns.
 """
+import math
+
 import torch
 
 from environment.mnist.mnist_model import MnistModel
@@ -33,6 +35,23 @@ def grid_basis(grid, side=7):
     cell = (torch.arange(side) * grid) // side
     idx = (cell[:, None] * grid + cell[None, :]).flatten()
     return torch.nn.functional.one_hot(idx, grid * grid).T.float()
+
+
+def coarse_basis(net, grid):
+    """The fixed action basis for a coarse "where" bias (`grid` x `grid` cells upsampled to the token grid) under
+    the net's bias mode: where -> grid_basis; what+where -> the identity on the what part, grid_basis on the where
+    part (block diagonal). None when grid is 0 (the actor emits the full bias)."""
+    if not grid:
+        return None
+    side = math.isqrt(net.num_tokens)
+    if side * side != net.num_tokens or grid > side:
+        raise ValueError(f"coarse where grid {grid} needs a square token grid of side >= {grid}")
+    where = grid_basis(grid, side)
+    if net.bias_mode == "where":
+        return where
+    if net.bias_mode == "what+where":
+        return torch.block_diag(torch.eye(net.d_model), where)
+    raise ValueError("a coarse where grid needs the where or what+where bias")
 
 
 class RLSTM:
