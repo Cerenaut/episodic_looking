@@ -122,46 +122,51 @@ def main():
         model.observe(x_tr[r:r + 1], y_tr[r:r + 1])
         if t not in stops:
             continue
-        ltm = model.net
-        net = BiasableTransformer(pre.num_tokens, pre.channels, 2, d_model=args.d_model, heads=args.heads,
-                                  blocks=args.blocks, mlp_ratio=args.mlp_ratio, bias_block=args.bias_block,
-                                  bias_mode="what+where", bias_scale=args.bias_scale)
-        net.load_state_dict(ltm.state_dict())
-        net.eval()
-        for q in net.parameters():
-            q.requires_grad_(False)
-        seen = sorted({int(fine[i]) for i in stream[:t]})
-        m = torch.from_numpy(np.isin(f_ev, seen))
-        x, y, f = x_ev[m], y_ev[m], f_ev[m.numpy()]
-        with torch.no_grad():
-            pred = net(x).argmax(1)
-        acc = float((pred == y).float().mean())
-        logged = [e for e in evals if e["t"] == t and e.get("phase", 0) >= 0]
-        check = None
-        if logged:  # the run's own record at t: the replay must reproduce it
-            e = logged[-1]
-            check = max(abs(e["acc"][str(c)] - float((pred[torch.from_numpy(f == c)] == y[torch.from_numpy(f == c)])
-                                                       .float().mean())) for c in seen)
-        wrong = pred != y
-        rec = {"t": t, "seen": seen, "images": int(len(y)), "ltm_acc": acc, "wrong": int(wrong.sum()),
-               "replay_check_max_diff": check, "families": {}}
-        side = int(round(pre.num_tokens ** 0.5))
-        for k in (float(v) for v in o.scales.split(",")):
-            net.bias_scale = args.bias_scale * k
-            for name, b in bases(args.d_model, side).items():
-                rec["families"][f"{name}@{k:g}"] = optimise(net, x[wrong], y[wrong], b, steps=o.steps)
-        report.append(rec)
-        line = f"t {t}: {len(seen)} classes, {len(y)} images, LTM acc {acc:.3f}, wrong {int(wrong.sum())}" + \
-               (f", replay check {check:.4f}" if check is not None else "")
-        print(line, flush=True)
-        for name, fam in rec["families"].items():
-            c = fam["curve"]
-            print(f"   {name:16s} ({fam['action_size']:3d}) flipped " +
-                  " ".join(f"{s}:{c[s]['flip']:.2f}" for s in RECORD[1:] if s in c) +
-                  f"  p(y) {c[max(c)]['p']:.2f}  keep-top " +
-                  " ".join(f"{k}:{v:.2f}" for k, v in fam["keep_top"].items()) + f"  sat {fam['saturated']:.2f}",
-                  flush=True)
+        with torch.random.fork_rng(devices=[]):  # the test must not move the LTM's later random draws
+            report.append(test_point(args, o, model.net, pre, t, stream, fine, x_ev, f_ev, y_ev, evals))
     json.dump(report, open(f"{o.out}/oracle.json", "w"), indent=1)
+
+
+def test_point(args, o, ltm, pre, t, stream, fine, x_ev, f_ev, y_ev, evals):
+    """One test point: the LTM at exposure t, every bias family and range on its wrong validation images."""
+    net = BiasableTransformer(pre.num_tokens, pre.channels, 2, d_model=args.d_model, heads=args.heads,
+                              blocks=args.blocks, mlp_ratio=args.mlp_ratio, bias_block=args.bias_block,
+                              bias_mode="what+where", bias_scale=args.bias_scale)
+    net.load_state_dict(ltm.state_dict())
+    net.eval()
+    for q in net.parameters():
+        q.requires_grad_(False)
+    seen = sorted({int(fine[i]) for i in stream[:t]})
+    m = torch.from_numpy(np.isin(f_ev, seen))
+    x, y, f = x_ev[m], y_ev[m], f_ev[m.numpy()]
+    with torch.no_grad():
+        pred = net(x).argmax(1)
+    acc = float((pred == y).float().mean())
+    logged = [e for e in evals if e["t"] == t and e.get("phase", 0) >= 0]
+    check = None
+    if logged:  # the run's own record at t: the replay must reproduce it
+        e = logged[-1]
+        check = max(abs(e["acc"][str(c)] - float((pred[torch.from_numpy(f == c)] == y[torch.from_numpy(f == c)])
+                                                   .float().mean())) for c in seen)
+    wrong = pred != y
+    rec = {"t": t, "seen": seen, "images": int(len(y)), "ltm_acc": acc, "wrong": int(wrong.sum()),
+           "replay_check_max_diff": check, "families": {}}
+    side = int(round(pre.num_tokens ** 0.5))
+    for k in (float(v) for v in o.scales.split(",")):
+        net.bias_scale = args.bias_scale * k
+        for name, b in bases(args.d_model, side).items():
+            rec["families"][f"{name}@{k:g}"] = optimise(net, x[wrong], y[wrong], b, steps=o.steps)
+    line = f"t {t}: {len(seen)} classes, {len(y)} images, LTM acc {acc:.3f}, wrong {int(wrong.sum())}" + \
+           (f", replay check {check:.4f}" if check is not None else "")
+    print(line, flush=True)
+    for name, fam in rec["families"].items():
+        c = fam["curve"]
+        print(f"   {name:16s} ({fam['action_size']:3d}) flipped " +
+              " ".join(f"{s}:{c[s]['flip']:.2f}" for s in RECORD[1:] if s in c) +
+              f"  p(y) {c[max(c)]['p']:.2f}  keep-top " +
+              " ".join(f"{k}:{v:.2f}" for k, v in fam["keep_top"].items()) + f"  sat {fam['saturated']:.2f}",
+              flush=True)
+    return rec
 
 
 if __name__ == "__main__":
