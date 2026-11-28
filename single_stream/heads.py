@@ -42,6 +42,12 @@ class Head:
     def num_values(self):
         return 0
 
+    def observe_input(self, f):
+        """Once per live exposure, before fitting (label-free input statistics; default: none)."""
+
+    def inherit(self, old):
+        """After a reset: carry over label-free input statistics from the head being replaced (default: none)."""
+
 
 class KNNHead(Head):
     """k nearest neighbours (cosine) over the stored samples; scores = votes per class (ties: the nearest wins)."""
@@ -125,10 +131,17 @@ class SDMLPHead(Head):
     SDMLP, as cifar_main_head_baselines.SDMLPHead (Bricken's CIFAR settings: no biases, all weights >= 0, fc1 rows
     L2-normalised, Top-K with the GABA switch, gradient clip 1, plain SGD): f -> ReLU -> L2-normalise -> fc1 -> Top-K
     -> purkinje -> logits. GABA counters count activations in training only.
+
+    `centre` > 0 (Dave 28 Nov 2026; CIFAR diagnosis: after sleeps the LTM's features share one dominant direction, so
+    Top-K picks the same neurons for every image): f is first centred on a running mean of the live inputs, updated
+    once per live exposure at rate max(centre, 1/n) (the plain mean until n = 1/centre, then exponential). Label-free
+    and phase-blind; kept across head resets (`inherit`), as it describes the LTM's features, not the head's memory.
     """
     name = "sdmlp"
 
-    def __init__(self, dim, num_classes, nneurons=1000, k=32, gaba_switch=100, lr=0.05, grad_clip=1.0, seed=0):
+    def __init__(self, dim, num_classes, nneurons=1000, k=32, gaba_switch=100, lr=0.05, grad_clip=1.0, seed=0,
+                 centre=0.0):
+        self.centre, self.mu, self.n = centre, torch.zeros(1, dim), 0
         g = torch.random.fork_rng(devices=[])
         with g:
             torch.manual_seed(seed)
@@ -151,7 +164,18 @@ class SDMLPHead(Head):
             p.clamp_(0)
         self.fc1.weight /= torch.norm(self.fc1.weight, dim=1, keepdim=True).clamp_min(1e-12)
 
+    def observe_input(self, f):
+        if self.centre > 0:
+            for row in f:
+                self.n += 1
+                self.mu += max(self.centre, 1.0 / self.n) * (row[None] - self.mu)
+
+    def inherit(self, old):
+        self.mu, self.n = old.mu.clone(), old.n
+
     def _forward(self, f, training):
+        if self.centre > 0:
+            f = f - self.mu
         f = F.relu(f)
         f = f / torch.norm(f, dim=1, keepdim=True).clamp_min(1e-12)
         a = F.relu(self.fc1(f))
@@ -175,7 +199,7 @@ class SDMLPHead(Head):
         return self._forward(f, False)
 
     def num_values(self):
-        return sum(p.numel() for p in self.params) + self.counters.numel()
+        return sum(p.numel() for p in self.params) + self.counters.numel() + (self.mu.numel() if self.centre > 0 else 0)
 
 
 def make_head(args, dim, num_classes):
@@ -189,7 +213,7 @@ def make_head(args, dim, num_classes):
                        lr=args.fly_lr, seed=seed)
     if args.head == "sdmlp":
         return SDMLPHead(dim, num_classes, nneurons=args.sdmlp_neurons, k=args.sdmlp_k, gaba_switch=args.sdmlp_gaba,
-                         lr=args.sdmlp_lr, seed=seed)
+                         lr=args.sdmlp_lr, seed=seed, centre=getattr(args, "sdmlp_centre", 0.0))
     raise ValueError(f"unknown head {args.head}")
 
 
@@ -242,6 +266,7 @@ class HeadModel(StreamModel):
         with side_context(self.side):
             pred = self.predict(x).argmax(1)
             f = self._features(x)
+            self.head.observe_input(f)
             for _ in range(self.repeats):
                 self.head.fit(f, y)
             self.replay_pending += self.replay
@@ -254,7 +279,9 @@ class HeadModel(StreamModel):
         before = self.ltm.updates
         self.ltm.observe(x, y)
         if self.reset_on_sleep and self.ltm.updates > before:
-            self.head = copy.deepcopy(self.initial)
+            new = copy.deepcopy(self.initial)
+            new.inherit(self.head)
+            self.head = new
             self.resets += 1
         return pred
 

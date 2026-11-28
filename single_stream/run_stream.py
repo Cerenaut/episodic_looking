@@ -151,6 +151,8 @@ def build_parser(description=__doc__):
     p.add_argument("--sdmlp-k", type=int, default=32, help="sdmlp head: Top-K")
     p.add_argument("--sdmlp-gaba", type=int, default=100, help="sdmlp head: activations per neuron to switch GABA")
     p.add_argument("--sdmlp-lr", type=float, default=0.05, help="sdmlp head: SGD lr")
+    p.add_argument("--sdmlp-centre", type=float, default=0.0,
+                   help="sdmlp head: centre its input on a running mean of the live features at this rate (0 = off)")
     p.add_argument("--stm-rng", default="shared", choices=["shared", "separate"],
                    help="cls, head: separate = the STM or head draws its own random numbers (SideRNG), so the LTM "
                         "follows the same trajectory as the LTM alone (buffered, same sleeps) at the same seed")

@@ -3,6 +3,7 @@ import types
 import unittest
 
 import torch
+import torch.nn.functional as F
 
 from model.transformer import BiasableTransformer
 from single_stream.buffers import PriorityBuffer, part_specs
@@ -100,6 +101,43 @@ class TestHeadModel(unittest.TestCase):
             self.assertIsInstance(model, HeadModel)
             self.assertIsInstance(model.head, cls)
             self.assertEqual(model.repeats, 2)
+    def test_sdmlp_centre(self):
+        h = SDMLPHead(16, 2, nneurons=50, k=4, centre=0.5)
+        h.observe_input(torch.ones(1, 16))
+        self.assertTrue(torch.allclose(h.mu, torch.ones(1, 16)))          # n = 1: the plain mean
+        h.observe_input(torch.zeros(1, 16))
+        self.assertTrue(torch.allclose(h.mu, torch.full((1, 16), .5)))    # rate max(.5, 1/2)
+        h.observe_input(torch.zeros(1, 16))
+        self.assertTrue(torch.allclose(h.mu, torch.full((1, 16), .25)))   # then exponential at .5
+        self.assertEqual(SDMLPHead(16, 2, nneurons=50, k=4).num_values() + 16, h.num_values())
+        # a shared dominant direction: without centring the same neurons win for both classes, with it they differ
+        g = torch.Generator().manual_seed(0)
+        common = 50 * torch.rand(1, 16, generator=g)                     # cosine across the classes ~.999
+        a, b = torch.randn(1, 16, generator=g), torch.randn(1, 16, generator=g)
+        xa = common + a + .05 * torch.randn(20, 16, generator=g)
+        xb = common + b + .05 * torch.randn(20, 16, generator=g)
+
+        def overlap(head):
+            sets = []
+            for x in (xa, xb):
+                with torch.no_grad():
+                    f = x - head.mu if head.centre > 0 else x
+                    f = F.relu(f); f = f / f.norm(dim=1, keepdim=True)
+                    sets.append(set(torch.topk(head.fc1(f), head.k, dim=1).indices.flatten().tolist()))
+            return len(sets[0] & sets[1]) / len(sets[0] | sets[1])
+        plain, centred = SDMLPHead(16, 2, nneurons=200, k=8), SDMLPHead(16, 2, nneurons=200, k=8, centre=.01)
+        centred.observe_input(torch.cat([xa, xb]))
+        self.assertGreater(overlap(plain), 0.5)
+        self.assertLess(overlap(centred), overlap(plain) / 2)
+
+    def test_reset_keeps_input_statistics(self):
+        model = HeadModel(make_ltm(period=4), SDMLPHead(16, 10, nneurons=50, k=4, centre=.1), replay=0)
+        for i in range(5):
+            model.observe(torch.rand(1, 49 * 8), torch.tensor([i % 10]))
+        self.assertEqual(model.resets, 1)
+        self.assertEqual(model.head.n, 5)          # the mean saw every live input, across the reset
+        self.assertEqual(model.head.seen, 1)       # the head itself restarted
+
 
 class TestSideRNG(unittest.TestCase):
     """--stm-rng separate (Dave 27 Nov 2026): the fast learner's random numbers leave the LTM's trajectory as the LTM
